@@ -48,18 +48,26 @@ def send_message(chat_id, text, reply_markup=None):
     if len(text) > 4000: text = text[:4000] + "\n..."
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup: payload["reply_markup"] = reply_markup
-    try: requests.post(BASE_URL + "/sendMessage", json=payload, timeout=15)
-    except: pass
+    try: 
+        requests.post(BASE_URL + "/sendMessage", json=payload, timeout=15)
+    except Exception as e:
+        print(f"[SEND ERROR] {e}", flush=True)
 
 def answer_callback(callback_id, text=""):
     try: requests.post(BASE_URL + "/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text}, timeout=10)
     except: pass
 
+# 🔍 دستور دیباگ برای دریافت پیام‌ها
 def get_updates(offset):
     try:
         r = requests.get(BASE_URL + "/getUpdates", params={"timeout": 30, "offset": offset}, timeout=40)
-        return r.json()
-    except: return {"ok": False}
+        data = r.json()
+        if data.get("result"):
+            print("[NEW UPDATE RECEIVED]", flush=True)
+        return data
+    except Exception as e:
+        print(f"[POLL ERROR] {e}", flush=True)
+        return {"ok": False}
 
 def is_valid_persian(text):
     if not text: return False
@@ -121,11 +129,15 @@ def handle_callback(cb):
     elif data == "creator": send_message(chat_id, "👨‍💻 سازنده: Nepton\n@t91m62")
     answer_callback(cb.get("id"), "")
 
+# 🔍 دستور دیباگ برای پیام‌های دریافتی
 def handle_message(update):
     msg = update.get("message")
     if not msg: return
     chat_id, user_id, text = msg.get("chat", {}).get("id"), msg.get("from", {}).get("id"), (msg.get("text") or "").strip()
     if not chat_id or not user_id: return
+    
+    print(f"[MSG] Received: {text} from {user_id}", flush=True)
+    
     now = time.time()
     if str(user_id) in LAST_REQUEST and now - LAST_REQUEST[str(user_id)] < 2: return 
     LAST_REQUEST[str(user_id)] = now

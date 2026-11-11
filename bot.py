@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import requests, time, json, os, random, threading, re
 from flask import Flask
+from bs4 import BeautifulSoup
 
 # ==========================================================
 # ⚠️ توکن ربات سروش پلاس رو دقیقاً بین دو تا "" بذار
@@ -11,7 +12,7 @@ BASE_URL = "https://api.splus.ir/bot" + BOT_TOKEN if BOT_TOKEN else ""
 HISTORY_FILE = "bot_history.json"
 LOCK = threading.Lock() 
 
-# 🌍 دیکشنری شهرهای مهم ایران (برای اینکه سایت هواشناسی گیج نشه)
+# 🌍 دیکشنری شهرهای مهم ایران
 IRAN_CITIES = {
     "تهران": (35.6892, 51.3890), "مشهد": (36.2972, 59.6067), "اصفهان": (32.6546, 51.6680),
     "شیراز": (29.5918, 52.5837), "تبریز": (38.0962, 46.2738), "کرج": (35.8400, 50.9391),
@@ -31,7 +32,7 @@ IRAN_CITIES = {
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Nepton Bot is alive and smarter!"
+def home(): return "Nepton Bot is alive and connected to the web!"
 
 def run_web(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -41,14 +42,13 @@ WAITING_FOR_CITY = {}
 LAST_REQUEST = {} 
 SEEN_UPDATES = set() 
 
-# 🧠 پرامپت جدید و صمیمی‌تر (به جای اینکه خشک بگه منظورت چیه)
 SYSTEM_PROMPT = (
     "تو یک دستیار هوش مصنوعی فارسی‌زبان، باهوش، صمیمی و خودمونی هستی. "
     "قوانین: ۱. فقط و به زبان فارسی روان و محاوره‌ای جواب بده. "
-    "۲. اگر کلمه‌ای یا سوالی را متوجه نشدی، مثل یک دوست بپرس «دقیقاً منظورت چیه؟» یا «یه کم واضح‌تر می‌گی؟». "
-    "۳. پاسخ‌ها را کوتاه و در حد ۲ تا ۴ جمله نگه دار. "
-    "۴. از مارک‌داون (ستاره، بک‌تیک) استفاده نکن. "
-    "۵. اگر کاربر اسم یک شهر را پرسید، خیلی طبیعی جواب بده."
+    "۲. اگر در پیام‌های سیستمی اطلاعاتی از جستجوی وب به تو داده شد، حتماً بر اساس آن اطلاعات پاسخ بده. "
+    "۳. اگر اطلاعات وب موجود نبود، از دانش خودت استفاده کن. "
+    "۴. اگر سوال نامفهوم بود، مثل یک دوست بپرس «دقیقاً منظورت چیه؟». "
+    "۵. پاسخ‌ها کوتاه و در حد ۲ تا ۴ جمله باشه."
 )
 
 def load_history():
@@ -61,8 +61,7 @@ def load_history():
 def save_history(h):
     try:
         with LOCK: 
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f: 
-                json.dump(h, f, ensure_ascii=False)
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f: json.dump(h, f, ensure_ascii=False)
     except Exception as e: print(f"[SAVE ERROR] {e}", flush=True)
 
 HISTORY = load_history()
@@ -71,8 +70,7 @@ def send_message(chat_id, text, reply_markup=None):
     if len(text) > 4000: text = text[:4000] + "\n..."
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup: payload["reply_markup"] = reply_markup
-    try: 
-        requests.post(BASE_URL + "/sendMessage", json=payload, timeout=15)
+    try: requests.post(BASE_URL + "/sendMessage", json=payload, timeout=15)
     except Exception as e: print(f"[SEND ERROR] {e}", flush=True)
 
 def answer_callback(callback_id, text=""):
@@ -94,21 +92,36 @@ def is_valid_persian(text):
     invalid_chars = re.findall(r'[\u0400-\u04FF\u0530-\u058F\u0900-\u097F\u0D00-\u0D7F\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]', text)
     return len(invalid_chars) <= 2
 
-# 🌤️ تابع هواشناسی ضدضربه (اصلاح حروف عربی و حذف فاصله‌ها)
+# 🔍 تابع جستجوی اینترنت (DuckDuckGo)
+def search_web(query):
+    try:
+        url = "https://html.duckduckgo.com/html/"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        r = requests.post(url, data={'q': query}, headers=headers, timeout=15)
+        
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            results = []
+            for item in soup.select('.result__body')[:3]:
+                title_tag = item.select_one('.result__a')
+                snippet_tag = item.select_one('.result__snippet')
+                if title_tag and snippet_tag:
+                    results.append(f"{title_tag.get_text(strip=True)}: {snippet_tag.get_text(strip=True)}")
+            return "\n\n".join(results)
+    except Exception as e: print(f"[SEARCH ERROR] {e}", flush=True)
+    return ""
+
+# 🌤️ تابع هواشناسی
 def get_weather(city_name):
-    # ۱. تمیزکاری اسم شهر (تبدیل ي به ی، ك به ک و حذف فاصله‌ها)
     cleaned_input = city_name.strip().replace("ي", "ی").replace("ك", "ک").replace(" ", "")
-    
     lat, lon, official_name = None, None, city_name
     
-    # ۲. چک کردن دیکشنری داخلی با اسم تمیز شده
     for name, coords in IRAN_CITIES.items():
         if cleaned_input == name.replace(" ", ""):
             lat, lon = coords
             official_name = name
             break
             
-    # ۳. اگر توی دیکشنری نبود، برو سراغ سایت (با اسم اصلی)
     if not lat:
         headers = {'User-Agent': 'Mozilla/5.0'}
         try:
@@ -117,19 +130,15 @@ def get_weather(city_name):
                 loc = geo_res['results'][0]
                 lat, lon = loc['latitude'], loc['longitude']
                 official_name = loc['name']
-            else:
-                return f"❌ شهر «{city_name}» رو پیدا نکردم. اسمش رو دقیق‌تر بنویس."
-        except:
-            return "❌ خطا در ارتباط با سرور هواشناسی."
+            else: return f"❌ شهر «{city_name}» رو پیدا نکردم."
+        except: return "❌ خطا در ارتباط با سرور هواشناسی."
             
-    # ۴. دریافت هوا با مختصات پیدا شده
     try:
         w_res = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min&timezone=auto", headers={'User-Agent': 'Mozilla/5.0'}, timeout=10).json()
         cur, day = w_res["current"], w_res["daily"]
         cond = {0: "صاف ☀️", 1: "تقریباً صاف 🌤️", 2: "نیمه ابری ⛅", 3: "ابری ☁️", 45: "مه 🌫️", 61: "باران 🌧️", 71: "برف ❄️", 95: "رعد و برق ⛈️"}.get(cur["weather_code"], "نامشخص")
         return f"🌤️ هوای {official_name}:\nوضعیت: {cond}\n🌡️ دما: {cur['temperature_2m']}°C\n📈 بیشینه: {day['temperature_2m_max'][0]}°C | 📉 کمینه: {day['temperature_2m_min'][0]}°C\n💧 رطوبت: {cur['relative_humidity_2m']}% | 💨 باد: {cur['wind_speed_10m']} km/h"
-    except:
-        return "❌ خطا در دریافت اطلاعات هواشناسی."
+    except: return "❌ خطا در دریافت اطلاعات هواشناسی."
 
 def get_dollar_price():
     try:
@@ -140,20 +149,31 @@ def get_dollar_price():
     except: pass
     return "❌ سرور قیمت دلار پاسخ نمی‌دهد."
 
+# 🧠 هوش مصنوعی با قابلیت جستجو
 def ask_ai(user_id, text):
     history = HISTORY.get(str(user_id), [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": text}]
     
+    search_keywords = ["قیمت", "چنده", "چقدره", "اخبار", "امروز", "الان", "بیت کوین", "دلار", "طلا", "بورس", "جدید"]
+    if any(kw in text for kw in search_keywords):
+        print(f"[SEARCHING] {text}", flush=True)
+        web_results = search_web(text)
+        if web_results:
+            messages.append({
+                "role": "system", 
+                "content": f"اطلاعات زیر از جستجوی زنده اینترنت به دست آمده است. بر اساس این اطلاعات به کاربر جواب بده:\n{web_results}"
+            })
+
     providers = [
-        {"url": "https://api.kilo.ai/api/gateway/chat/completions", "json": {"model": "minimax/minimax-m2.1:free", "messages": messages, "max_tokens": 200}, "headers": {}},
-        {"url": "https://text.pollinations.ai/openai", "json": {"model": "openai", "messages": messages, "max_tokens": 200}, "headers": {}},
-        {"url": "https://api.llm7.io/v1/chat/completions", "json": {"model": "default", "messages": messages, "max_tokens": 200}, "headers": {"Authorization": "Bearer unused"}},
-        {"url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions", "json": {"model": "Qwen3Guard-Gen-0.6B", "messages": messages, "max_tokens": 200}, "headers": {}}
+        {"url": "https://api.kilo.ai/api/gateway/chat/completions", "json": {"model": "minimax/minimax-m2.1:free", "messages": messages, "max_tokens": 250}, "headers": {}},
+        {"url": "https://text.pollinations.ai/openai", "json": {"model": "openai", "messages": messages, "max_tokens": 250}, "headers": {}},
+        {"url": "https://api.llm7.io/v1/chat/completions", "json": {"model": "default", "messages": messages, "max_tokens": 250}, "headers": {"Authorization": "Bearer unused"}},
+        {"url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions", "json": {"model": "Qwen3Guard-Gen-0.6B", "messages": messages, "max_tokens": 250}, "headers": {}}
     ]
     
     for p in providers:
         try:
-            r = requests.post(p["url"], json=p["json"], headers=p["headers"], timeout=15)
+            r = requests.post(p["url"], json=p["json"], headers=p["headers"], timeout=20)
             if r.status_code == 200:
                 reply = r.json()["choices"][0]["message"]["content"]
                 if is_valid_persian(reply):
@@ -197,13 +217,13 @@ def handle_message(update):
         send_message(chat_id, "🧹 حافظه پاک شد.")
         return
     if text == "/help":
-        send_message(chat_id, "📖 راهنما:\n• هر سوالی داری بپرس\n• برای هواشناسی از دکمه‌ها استفاده کن\n• برای قیمت دلار بنویس «دلار»\n• /clear برای پاک کردن حافظه")
+        send_message(chat_id, "📖 راهنما:\n• هر سوالی داری بپرس (حتی اخبار و قیمت‌های روز)\n• برای هواشناسی از دکمه‌ها استفاده کن\n• /clear برای پاک کردن حافظه")
         return
     if "سازندت" in text or "کی ساختت" in text: 
         WAITING_FOR_CITY[str(user_id)] = False
         send_message(chat_id, "سازنده من Nepton است. 👨‍💻")
         return
-    if "دلار" in text: 
+    if "دلار" in text and len(text) < 15:
         WAITING_FOR_CITY[str(user_id)] = False
         threading.Thread(target=lambda: send_message(chat_id, get_dollar_price())).start()
         return

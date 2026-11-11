@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 import requests, time, json, os, random, threading, re
 from flask import Flask
-from dotenv import load_dotenv
 
-# خواندن توکن از محیط (Render)
-load_dotenv()
-BOT_TOKEN = os.environ.get("70955089:Eg66Kyf45u1tchK7O5wMzXiwy2-TIe3gTYc")
+# ==========================================================
+# ⚠️ توکن ربات سروش پلاس رو دقیقاً بین دو تا "" بذار
+BOT_TOKEN = "70955089:Eg66Kyf45u1tchK7O5wMzXiwy2-TIe3gTYc" 
+# ==========================================================
 
 BASE_URL = "https://api.splus.ir/bot" + BOT_TOKEN if BOT_TOKEN else ""
 HISTORY_FILE = "bot_history.json"
@@ -57,6 +57,7 @@ def answer_callback(callback_id, text=""):
     try: requests.post(BASE_URL + "/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text}, timeout=10)
     except: pass
 
+# 🔍 دستور دیباگ برای دریافت پیام‌ها
 def get_updates(offset):
     try:
         r = requests.get(BASE_URL + "/getUpdates", params={"timeout": 30, "offset": offset}, timeout=40)

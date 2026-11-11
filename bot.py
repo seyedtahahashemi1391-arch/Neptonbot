@@ -57,7 +57,6 @@ def answer_callback(callback_id, text=""):
     try: requests.post(BASE_URL + "/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text}, timeout=10)
     except: pass
 
-# 🔍 دستور دیباگ برای دریافت پیام‌ها
 def get_updates(offset):
     try:
         r = requests.get(BASE_URL + "/getUpdates", params={"timeout": 30, "offset": offset}, timeout=40)
@@ -129,7 +128,6 @@ def handle_callback(cb):
     elif data == "creator": send_message(chat_id, "👨‍💻 سازنده: Nepton\n@t91m62")
     answer_callback(cb.get("id"), "")
 
-# 🔍 دستور دیباگ برای پیام‌های دریافتی
 def handle_message(update):
     msg = update.get("message")
     if not msg: return

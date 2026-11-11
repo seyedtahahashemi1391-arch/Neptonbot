@@ -9,10 +9,11 @@ BOT_TOKEN = "70955089:Eg66Kyf45u1tchK7O5wMzXiwy2-TIe3gTYc"
 
 BASE_URL = "https://api.splus.ir/bot" + BOT_TOKEN if BOT_TOKEN else ""
 HISTORY_FILE = "bot_history.json"
+LOCK = threading.Lock() # 🛡️ برای جلوگیری از خرابی فایل حافظه
 
 app = Flask(__name__)
 @app.route('/')
-def home(): return "Bot is alive!"
+def home(): return "Nepton Bot is alive and breathing!"
 
 def run_web(): 
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -22,12 +23,14 @@ WAITING_FOR_CITY = {}
 LAST_REQUEST = {} 
 SEEN_UPDATES = set() 
 
+# 🧠 پرامپت حرفه‌ای‌تر برای هوش مصنوعی
 SYSTEM_PROMPT = (
-    "تو یک دستیار هوش مصنوعی فارسی‌زبان هستی. "
+    "تو یک دستیار هوش مصنوعی فارسی‌زبان، باهوش و صمیمی هستی. "
     "قوانین: ۱. فقط و فقط به زبان فارسی روان و محاوره‌ای جواب بده. "
-    "۲. هرگز از کلمات یا حروف زبان‌های دیگر استفاده نکن. "
-    "۳. اگر سوال نامفهوم بود، به فارسی بپرس «منظورت چیست؟». "
-    "۴. پاسخ‌ها کوتاه و بدون مارک‌داون باشند."
+    "۲. هرگز از کلمات یا حروف زبان‌های دیگر (مثل انگلیسی، هندی، عربی) در جوابت استفاده نکن. "
+    "۳. پاسخ‌ها را کوتاه و در حد ۲ تا ۴ جمله نگه دار. "
+    "۴. از مارک‌داون (ستاره، بک‌تیک، جدول) استفاده نکن. "
+    "۵. اگر سوال کاربر نامفهوم بود، به فارسی بپرس «منظورت چیست؟»."
 )
 
 def load_history():
@@ -39,8 +42,11 @@ def load_history():
 
 def save_history(h):
     try:
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f: json.dump(h, f, ensure_ascii=False)
-    except: pass
+        with LOCK: # 🛡️ قفل کردن فایل موقع ذخیره
+            with open(HISTORY_FILE, "w", encoding="utf-8") as f: 
+                json.dump(h, f, ensure_ascii=False)
+    except Exception as e: 
+        print(f"[SAVE ERROR] {e}", flush=True)
 
 HISTORY = load_history()
 
@@ -57,7 +63,6 @@ def answer_callback(callback_id, text=""):
     try: requests.post(BASE_URL + "/answerCallbackQuery", json={"callback_query_id": callback_id, "text": text}, timeout=10)
     except: pass
 
-# 🔍 دستور دیباگ برای دریافت پیام‌ها
 def get_updates(offset):
     try:
         r = requests.get(BASE_URL + "/getUpdates", params={"timeout": 30, "offset": offset}, timeout=40)
@@ -100,11 +105,15 @@ def get_dollar_price():
 def ask_ai(user_id, text):
     history = HISTORY.get(str(user_id), [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history + [{"role": "user", "content": text}]
+    
+    # ۴ سرویس هوش مصنوعی برای پایداری بیشتر
     providers = [
         {"url": "https://api.kilo.ai/api/gateway/chat/completions", "json": {"model": "minimax/minimax-m2.1:free", "messages": messages, "max_tokens": 200}, "headers": {}},
         {"url": "https://text.pollinations.ai/openai", "json": {"model": "openai", "messages": messages, "max_tokens": 200}, "headers": {}},
         {"url": "https://api.llm7.io/v1/chat/completions", "json": {"model": "default", "messages": messages, "max_tokens": 200}, "headers": {"Authorization": "Bearer unused"}},
+        {"url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions", "json": {"model": "Qwen3Guard-Gen-0.6B", "messages": messages, "max_tokens": 200}, "headers": {}}
     ]
+    
     for p in providers:
         try:
             r = requests.post(p["url"], json=p["json"], headers=p["headers"], timeout=15)
@@ -115,7 +124,9 @@ def ask_ai(user_id, text):
                     HISTORY[str(user_id)] = history[-4:]
                     save_history(HISTORY)
                     return reply
-        except: pass
+        except Exception as e: 
+            print(f"[AI ERROR] {e}", flush=True)
+            
     return "⚠️ متأسفانه الان نمی‌تونم جواب بدم. یه بار دیگه امتحان کن."
 
 MAIN_MENU = {"inline_keyboard": [[{"text": "🌤️ هواشناسی", "callback_data": "weather"}, {"text": "🎲 تاس", "callback_data": "dice"}], [{"text": "🧹 حافظه", "callback_data": "clear"}, {"text": "👨‍💻 سازنده", "callback_data": "creator"}]]}
@@ -140,11 +151,34 @@ def handle_message(update):
     now = time.time()
     if str(user_id) in LAST_REQUEST and now - LAST_REQUEST[str(user_id)] < 2: return 
     LAST_REQUEST[str(user_id)] = now
-    if text == "/start": WAITING_FOR_CITY[str(user_id)] = False; send_message(chat_id, "سلام👋 چطور کمکت کنم؟", reply_markup=MAIN_MENU); return
-    if text == "/clear": WAITING_FOR_CITY[str(user_id)] = False; HISTORY[str(user_id)] = []; save_history(HISTORY); send_message(chat_id, "🧹 پاک شد."); return
-    if "سازندت" in text: WAITING_FOR_CITY[str(user_id)] = False; send_message(chat_id, "سازنده من Nepton است. 👨‍💻"); return
-    if "دلار" in text: WAITING_FOR_CITY[str(user_id)] = False; threading.Thread(target=lambda: send_message(chat_id, get_dollar_price())).start(); return
-    if WAITING_FOR_CITY.get(str(user_id)): WAITING_FOR_CITY[str(user_id)] = False; send_message(chat_id, "⏳ در حال دریافت..."); threading.Thread(target=lambda: send_message(chat_id, get_weather(text))).start(); return
+    
+    if text == "/start": 
+        WAITING_FOR_CITY[str(user_id)] = False
+        send_message(chat_id, "سلام👋 چطور کمکت کنم؟\n\nدستورات:\n/start شروع مجدد\n/clear پاک کردن حافظه", reply_markup=MAIN_MENU)
+        return
+    if text == "/clear": 
+        WAITING_FOR_CITY[str(user_id)] = False
+        HISTORY[str(user_id)] = []
+        save_history(HISTORY)
+        send_message(chat_id, "🧹 حافظه پاک شد.")
+        return
+    if text == "/help":
+        send_message(chat_id, "📖 راهنما:\n• هر سوالی داری بپرس\n• برای هواشناسی از دکمه‌ها استفاده کن\n• برای قیمت دلار بنویس «دلار»\n• /clear برای پاک کردن حافظه")
+        return
+    if "سازندت" in text or "کی ساختت" in text: 
+        WAITING_FOR_CITY[str(user_id)] = False
+        send_message(chat_id, "سازنده من Nepton است. 👨‍💻")
+        return
+    if "دلار" in text: 
+        WAITING_FOR_CITY[str(user_id)] = False
+        threading.Thread(target=lambda: send_message(chat_id, get_dollar_price())).start()
+        return
+    if WAITING_FOR_CITY.get(str(user_id)): 
+        WAITING_FOR_CITY[str(user_id)] = False
+        send_message(chat_id, "⏳ در حال دریافت...")
+        threading.Thread(target=lambda: send_message(chat_id, get_weather(text))).start()
+        return
+    
     threading.Thread(target=lambda: send_message(chat_id, ask_ai(user_id, text))).start()
 
 def main():
@@ -160,8 +194,10 @@ def main():
                     SEEN_UPDATES.add(update_id)
                     if len(SEEN_UPDATES) > 1000: SEEN_UPDATES.clear()
                     offset = update_id + 1
-                    if "callback_query" in update: threading.Thread(target=handle_callback, args=(update["callback_query"],)).start()
-                    else: threading.Thread(target=handle_message, args=(update,)).start()
+                    if "callback_query" in update: 
+                        threading.Thread(target=handle_callback, args=(update["callback_query"],)).start()
+                    else: 
+                        threading.Thread(target=handle_message, args=(update,)).start()
             time.sleep(1)
         except KeyboardInterrupt: break
         except Exception as e: 

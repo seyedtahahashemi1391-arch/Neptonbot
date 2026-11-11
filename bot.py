@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SUPER BOT (Private Edition) - Fixed
+SUPER BOT (Private Edition) - Final Stable
 Dependencies: requests, flask
 Run:
     BOT_TOKEN=70955089:Eg66Kyf45u1tchK7O5wMzXiwy2-TIe3gTYc python bot.py
@@ -86,7 +86,6 @@ def load_json(path, default_type):
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # بررسی اینکه آیا نوع داده با نوع پیش‌فرض همخوانی دارد یا نه
             if not isinstance(data, type(default_type)):
                 return default_type
             return data
@@ -101,7 +100,7 @@ def save_json(path, data):
                 json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
             os.replace(temp, path)
         except Exception:
-            pass # اگر ذخیره‌سازی خطا داد، ربات کرش نکند
+            pass
 
 HISTORY = load_json(HISTORY_FILE, {})
 STATS = load_json(STATS_FILE, {})
@@ -130,7 +129,6 @@ def remember_update(update_id):
 def get_history(user_id):
     with memory_lock:
         item = HISTORY.get(str(user_id), {})
-        # اگر از نسخه قبلی به صورت لیست ذخیره شده بود، تبدیل به دیکشنری کن
         if isinstance(item, list):
             item = {"messages": item, "summary": "", "turns": len(item)//2, "updated": time.time()}
             HISTORY[str(user_id)] = item
@@ -148,10 +146,13 @@ def update_history(user_id, role, content):
     uid = str(user_id)
     with memory_lock:
         item = get_history(uid)
+        if "messages" not in item or not isinstance(item["messages"], list):
+            item["messages"] = []
+            
         item["messages"].append({"role": role, "content": str(content)[:MAX_TEXT]})
         item["messages"] = item["messages"][-MAX_HISTORY_MESSAGES:]
         if role == "user":
-            item["turns"] += 1
+            item["turns"] = item.get("turns", 0) + 1
         item["updated"] = time.time()
         HISTORY[uid] = item
         if len(HISTORY) > MAX_HISTORY_USERS:
@@ -180,6 +181,9 @@ def http_request(method, url, *, timeout=REQUEST_TIMEOUT, attempts=3, **kwargs):
             return response
         except requests.RequestException as exc:
             last_error = exc
+            # فقط برای خطاهای شبکه یا سرور تلاش مجدد میکنیم
+            if isinstance(exc, requests.HTTPError):
+                raise RuntimeError(f"HTTP Error {exc.response.status_code}")
             if attempt + 1 < attempts:
                 time.sleep(min(0.7 * (2 ** attempt), 6))
     raise RuntimeError(f"HTTP request failed: {type(last_error).__name__}")
@@ -204,7 +208,11 @@ def send_message(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": str(text)[:MAX_TEXT]}
     if keyboard:
         payload["reply_markup"] = keyboard
-    return splus_call("sendMessage", payload)
+    try:
+        return splus_call("sendMessage", payload)
+    except Exception as e:
+        logger.exception("Failed to send message to Soroush")
+        return None
 
 def answer_callback(callback_id, text=""):
     try:
@@ -212,35 +220,32 @@ def answer_callback(callback_id, text=""):
     except Exception:
         pass
 
-def send_keyboard(chat_id, text, buttons):
-    return send_message(chat_id, text, {"inline_keyboard": buttons})
+def send_keyboard(chat_id, text, buttons_list):
+    # دکمه‌ها باید به صورت لیست لیست‌ها پاس داده شوند
+    return send_message(chat_id, text, {"inline_keyboard": buttons_list})
 
 # =========================================================
-# 7. MENUS (منوها)
+# 7. MENUS (منوها) - خروجی این توابع باید "لیست" باشد
 # =========================================================
 def main_menu():
-    return {
-        "inline_keyboard": [
-            [{"text": "🤖 هوش مصنوعی", "callback_data": "menu:ai"}, {"text": "🌤 هواشناسی", "callback_data": "menu:weather"}],
-            [{"text": "🔎 جستجوی وب", "callback_data": "menu:search"}, {"text": "🌐 ترجمه", "callback_data": "menu:translate"}],
-            [{"text": "⏰ یادآور", "callback_data": "menu:reminder"}, {"text": "📊 آمار", "callback_data": "menu:stats"}],
-            [{"text": "⚙️ تنظیمات", "callback_data": "menu:settings"}, {"text": "🧠 حافظه", "callback_data": "menu:memory"}],
-            [{"text": "🎲 تاس", "callback_data": "menu:dice"}, {"text": "👨‍💻 سازنده", "callback_data": "menu:creator"}]
-        ]
-    }
+    return [
+        [{"text": "🤖 هوش مصنوعی", "callback_data": "menu:ai"}, {"text": "🌤 هواشناسی", "callback_data": "menu:weather"}],
+        [{"text": "🔎 جستجوی وب", "callback_data": "menu:search"}, {"text": "🌐 ترجمه", "callback_data": "menu:translate"}],
+        [{"text": "⏰ یادآور", "callback_data": "menu:reminder"}, {"text": "📊 آمار", "callback_data": "menu:stats"}],
+        [{"text": "⚙️ تنظیمات", "callback_data": "menu:settings"}, {"text": "🧠 حافظه", "callback_data": "menu:memory"}],
+        [{"text": "🎲 تاس", "callback_data": "menu:dice"}, {"text": "👨‍💻 سازنده", "callback_data": "menu:creator"}]
+    ]
 
 def settings_menu(user_id):
     pref = SETTINGS.get(str(user_id), {})
     style = pref.get("style", "short")
     web_enabled = pref.get("web", True)
-    return {
-        "inline_keyboard": [
-            [{"text": "سبک پاسخ: " + ("کوتاه" if style == "short" else "مفصل"), "callback_data": "settings:style"}],
-            [{"text": "جستجو: " + ("روشن" if web_enabled else "خاموش"), "callback_data": "settings:web"}],
-            [{"text": "🗑 پاک کردن حافظه", "callback_data": "settings:clear"}],
-            [{"text": "↩️ بازگشت", "callback_data": "menu:home"}]
-        ]
-    }
+    return [
+        [{"text": "سبک پاسخ: " + ("کوتاه" if style == "short" else "مفصل"), "callback_data": "settings:style"}],
+        [{"text": "جستجو: " + ("روشن" if web_enabled else "خاموش"), "callback_data": "settings:web"}],
+        [{"text": "🗑 پاک کردن حافظه", "callback_data": "settings:clear"}],
+        [{"text": "↩️ بازگشت", "callback_data": "menu:home"}]
+    ]
 
 # =========================================================
 # 8. AI PROVIDER ROUTER (مدیریت هوش مصنوعی)
@@ -763,8 +768,7 @@ def worker():
                 if "callback_query" in update: handle_callback(update)
                 elif "message" in update: process_message(update["message"])
             except Exception:
-                traceback.print_exc() # چاپ دقیق خطا در لاگ‌ها
-                logger.exception("Update processing failed")
+                traceback.print_exc() # چاپ خطا در لاگ‌ها
                 message = update.get("message", {})
                 chat_id = message.get("chat", {}).get("id")
                 if chat_id:

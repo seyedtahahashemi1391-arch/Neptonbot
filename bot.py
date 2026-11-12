@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SUPER BOT (Private Edition) - Fast & Strict Edition
+SUPER BOT (Private Edition) - Ultra Fast & Strict
 """
 
 import os
@@ -39,7 +39,6 @@ HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
-POLLS_FILE = os.path.join(DATA_DIR, "polls.json")
 
 CREATOR_NAME = "Nepton"
 CREATOR_ID = "@t91m62"
@@ -56,13 +55,10 @@ POLL_TIMEOUT = 30
 WORKERS = 1
 START_TIME = time.time()
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
-
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =========================================================
-# 2. STRUCTURED LOGGING
+# 2. LOGGING
 # =========================================================
 class JSONFormatter(logging.Formatter):
     def format(self, record):
@@ -78,7 +74,7 @@ handler.setFormatter(JSONFormatter())
 logger.addHandler(handler)
 
 # =========================================================
-# 3. THREAD-SAFE JSON STORAGE
+# 3. STORAGE
 # =========================================================
 storage_lock = threading.RLock()
 
@@ -106,10 +102,9 @@ HISTORY = load_json(HISTORY_FILE, {})
 STATS = load_json(STATS_FILE, {})
 SETTINGS = load_json(SETTINGS_FILE, {})
 REMINDERS = load_json(REMINDERS_FILE, [])
-POLLS = load_json(POLLS_FILE, {})
 
 # =========================================================
-# 4. MEMORY MANAGEMENT
+# 4. MEMORY
 # =========================================================
 memory_lock = threading.RLock()
 SEEN_UPDATES = OrderedDict()
@@ -119,8 +114,7 @@ SEARCH_CACHE = {}
 def remember_update(update_id):
     now = time.time()
     with memory_lock:
-        if update_id in SEEN_UPDATES:
-            return False
+        if update_id in SEEN_UPDATES: return False
         SEEN_UPDATES[update_id] = now
         while len(SEEN_UPDATES) > MAX_SEEN:
             SEEN_UPDATES.popitem(last=False)
@@ -132,10 +126,8 @@ def get_history(user_id):
         if isinstance(item, list):
             item = {"messages": item, "summary": "", "turns": len(item)//2, "updated": time.time()}
             HISTORY[str(user_id)] = item
-            
         if not isinstance(item, dict) or not item:
             return {"messages": [], "summary": "", "turns": 0, "updated": time.time()}
-            
         if time.time() - item.get("updated", 0) > HISTORY_TTL:
             HISTORY.pop(str(user_id), None)
             save_json(HISTORY_FILE, HISTORY)
@@ -148,11 +140,9 @@ def update_history(user_id, role, content):
         item = get_history(uid)
         if "messages" not in item or not isinstance(item["messages"], list):
             item["messages"] = []
-            
         item["messages"].append({"role": role, "content": str(content)[:MAX_TEXT]})
         item["messages"] = item["messages"][-MAX_HISTORY_MESSAGES:]
-        if role == "user":
-            item["turns"] = item.get("turns", 0) + 1
+        if role == "user": item["turns"] = item.get("turns", 0) + 1
         item["updated"] = time.time()
         HISTORY[uid] = item
         if len(HISTORY) > MAX_HISTORY_USERS:
@@ -175,7 +165,7 @@ def http_request(method, url, *, timeout=REQUEST_TIMEOUT, attempts=3, **kwargs):
             response = requests.request(method, url, timeout=timeout, **kwargs)
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt + 1 < attempts:
-                    time.sleep(min(0.7 * (2 ** attempt), 6))
+                    time.sleep(min(0.5 * (2 ** attempt), 3))
                     continue
             response.raise_for_status()
             return response
@@ -184,18 +174,16 @@ def http_request(method, url, *, timeout=REQUEST_TIMEOUT, attempts=3, **kwargs):
             if isinstance(exc, requests.HTTPError):
                 raise RuntimeError(f"HTTP Error {exc.response.status_code}")
             if attempt + 1 < attempts:
-                time.sleep(min(0.7 * (2 ** attempt), 6))
+                time.sleep(min(0.5 * (2 ** attempt), 3))
     raise RuntimeError(f"HTTP request failed: {type(last_error).__name__}")
 
 def http_json(method, url, **kwargs):
     response = http_request(method, url, **kwargs)
-    try:
-        return response.json()
-    except ValueError:
-        raise RuntimeError("Invalid JSON response")
+    try: return response.json()
+    except ValueError: raise RuntimeError("Invalid JSON response")
 
 # =========================================================
-# 6. SOROUSH PLUS API
+# 6. SOROUSH API
 # =========================================================
 BOT_API = f"{API_BASE}/bot{BOT_TOKEN}"
 
@@ -205,19 +193,15 @@ def splus_call(method, payload=None):
 
 def send_message(chat_id, text, keyboard=None):
     payload = {"chat_id": chat_id, "text": str(text)[:MAX_TEXT]}
-    if keyboard:
-        payload["reply_markup"] = keyboard
-    try:
-        return splus_call("sendMessage", payload)
+    if keyboard: payload["reply_markup"] = keyboard
+    try: return splus_call("sendMessage", payload)
     except Exception:
         logger.exception("Failed to send message")
         return None
 
 def answer_callback(callback_id, text=""):
-    try:
-        splus_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:150]})
-    except Exception:
-        pass
+    try: splus_call("answerCallbackQuery", {"callback_query_id": callback_id, "text": text[:150]})
+    except Exception: pass
 
 def send_keyboard(chat_id, text, buttons_list):
     return send_message(chat_id, text, {"inline_keyboard": buttons_list})
@@ -237,67 +221,66 @@ def main_menu():
 def settings_menu(user_id):
     pref = SETTINGS.get(str(user_id), {})
     style = pref.get("style", "short")
-    web_enabled = pref.get("web", True)
     return [
         [{"text": "سبک پاسخ: " + ("کوتاه" if style == "short" else "مفصل"), "callback_data": "settings:style"}],
-        [{"text": "جستجو: " + ("روشن" if web_enabled else "خاموش"), "callback_data": "settings:web"}],
         [{"text": "🗑 پاک کردن حافظه", "callback_data": "settings:clear"}],
         [{"text": "↩️ بازگشت", "callback_data": "menu:home"}]
     ]
 
 # =========================================================
-# 8. AI PROVIDER ROUTER (بهینه‌شده برای سرعت و منطق)
+# 8. AI ENGINE (تست شده و ضدچرت‌وپرت)
 # =========================================================
 PROVIDER_HEALTH = {}
 
 def get_providers():
-    # تایم‌اوت‌ها به شدت کم شدند تا اگر سرویسی خراب بود، ربات معطل نشود
-    providers = [
+    return [
         {"name": "Kilo", "url": "https://api.kilo.ai/api/gateway/chat/completions", "model": "kilo-auto/free", "key": "", "timeout": 4},
-        {"name": "LLM7", "url": "https://api.llm7.io/v1/chat/completions", "model": "gpt-oss:20b", "key": "", "timeout": 5}
+        {"name": "LLM7", "url": "https://api.llm7.io/v1/chat/completions", "model": "gpt-oss:20b", "key": "", "timeout": 5},
+        {"name": "Pollinations", "url": "https://text.pollinations.ai/openai", "model": "openai", "key": "", "timeout": 8}
     ]
-    pollinations_key = os.getenv("POLLINATIONS_API_KEY", "")
-    if pollinations_key:
-        providers.append({"name": "Pollinations", "url": "https://gen.pollinations.ai/v1/chat/completions", "model": "openai/gpt-4o-mini", "key": pollinations_key, "timeout": 8})
-    return providers
 
-SYSTEM_PROMPT = """
-تو یک دستیار هوشمند و بسیار منطقی هستی.
-قوانین حیاتی:
-۱. پاسخ تو باید فوق‌العاده کوتاه باشد (حداکثر ۱ تا ۲ جمله).
-۲. هرگز مقدمه‌چینی نکن، توضیح اضافه نده و حرف کاربر را تکرار نکن.
-۳. فقط و فقط جواب مستقیم و منطقی بده.
-۴. اگر جواب را نمی‌دانی، فقط بنویس: "نمی‌دانم".
-"""
+SYSTEM_PROMPT = """تو یک دستیار هوشمند فارسی‌زبان هستی.
+قوانین فوق‌العاده سخت‌گیرانه:
+۱. پاسخ تو باید حداکثر ۱ تا ۲ جمله کوتاه، مستقیم و منطقی باشد.
+۲. هرگز فرآیند فکر کردن (Reasoning/Thinking) خود را به انگلیسی یا فارسی ننویس.
+۳. هرگز حرف‌های کاربر را تکرار نکن و مقدمه‌چینی نکن.
+۴. اگر جواب را نمی‌دانی فقط بنویس: نمی‌دانم."""
 
 def provider_request(provider, messages):
     headers = {"Content-Type": "application/json"}
-    if provider["key"]:
-        headers["Authorization"] = "Bearer " + provider["key"]
+    if provider["key"]: headers["Authorization"] = "Bearer " + provider["key"]
     
-    # توکن را از 200 به 100 کاهش دادیم تا مدل زور نزند طولانی بنویسد
-    # تمپریچر را به 0.1 کاهش دادیم تا مدل خیال‌پردازی و چرت و پرت نگوید
+    # توکن و تمپریچر به شدت پایین تا مدل چرت و پرت نگوید
     payload = {
         "model": provider["model"], 
         "messages": messages, 
-        "temperature": 0.1, 
-        "max_tokens": 100, 
+        "temperature": 0.0, 
+        "max_tokens": 80, 
         "stream": False
     }
     
     start = time.time()
     response = http_json("POST", provider["url"], json=payload, headers=headers, timeout=provider["timeout"], attempts=1)
     choices = response.get("choices", [])
-    if not choices:
-        raise RuntimeError("Empty AI response")
+    if not choices: raise RuntimeError("Empty AI response")
         
     message = choices[0].get("message", {})
-    answer = message.get("content") or message.get("reasoning") or ""
-    if isinstance(answer, list):
-        answer = " ".join(str(x.get("text", "")) for x in answer if isinstance(x, dict))
+    
+    # فقط content را می‌خوانیم، به reasoning کاری نداریم
+    answer = message.get("content", "")
+    if not answer: raise RuntimeError("Empty content")
+    
     answer = str(answer).strip()
-    if not answer:
-        raise RuntimeError("Empty AI content")
+    
+    # فیلترهای پاکسازی برای حذف فکرهای لورفته
+    answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'Thinking Process:.*', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'The user is asking.*?\n\n', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'System instructions.*?\n\n', '', answer, flags=re.DOTALL).strip()
+    
+    # اگر بعد از فیلتر کردن چیزی باقی نموند یا خیلی کوتاه بود (یعنی فقط فکر بوده)
+    if len(answer) < 2:
+        raise RuntimeError("Just Reasoning, no answer")
         
     PROVIDER_HEALTH[provider["name"]] = {"status": "online", "latency": round(time.time() - start, 2), "last_success": time.time()}
     return answer
@@ -309,18 +292,13 @@ def call_ai(user_id, prompt, extra_system=None):
     system = SYSTEM_PROMPT
     
     if style == "detailed":
-        system = "تو یک دستیار هوشمند هستی. پاسخ‌ها را مفصل بده."
-        
-    if extra_system:
-        system += "\n" + extra_system
+        system = "تو یک دستیار هوشمند فارسی‌زبان هستی. پاسخ‌ها را مفصل، دقیق و مرحله‌ای ارائه کن."
 
     messages = [{"role": "system", "content": system}]
-    
     if history.get("summary"):
         messages.append({"role": "system", "content": "خلاصه مکالمات قبلی:\n" + history["summary"]})
     
-    # حافظه رو از ۸ پیام به ۳ پیام کاهش دادیم تا هم سریع‌تر شه هم گیج نشه
-    messages.extend(history.get("messages", [])[-3:])
+    messages.extend(history.get("messages", [])[-2:]) # فقط ۲ پیام آخر
     messages.append({"role": "user", "content": str(prompt)[:MAX_TEXT]})
     
     for provider in get_providers():
@@ -329,34 +307,6 @@ def call_ai(user_id, prompt, extra_system=None):
         except Exception:
             PROVIDER_HEALTH[provider["name"]] = {"status": "offline", "last_failure": time.time()}
     return None
-
-def maybe_summarize(user_id):
-    item = get_history(user_id)
-    turns = item.get("turns", 0)
-    if turns < 20 or turns % 20 != 0: return
-    if item.get("summarized_turn", 0) >= turns: return
-    
-    transcript = item.get("messages", [])[-30:]
-    text_block = "\n".join(f"{m['role']}: {m['content']}" for m in transcript)
-    prompt = "مکالمه زیر را در حداکثر 120 کلمه خلاصه کن.\n\n" + text_block
-    
-    summary = None
-    for provider in get_providers():
-        try:
-            summary = provider_request(provider, [{"role": "system", "content": "خلاصه‌ساز مکالمه هستی."}, {"role": "user", "content": prompt}])
-            break
-        except Exception:
-            continue
-            
-    with memory_lock:
-        current = get_history(user_id)
-        if summary:
-            current["summary"] = summary[:1500]
-            current["messages"] = current["messages"][-8:]
-        current["summarized_turn"] = turns
-        current["updated"] = time.time()
-        HISTORY[str(user_id)] = current
-        save_json(HISTORY_FILE, HISTORY)
 
 # =========================================================
 # 9. VALIDATION & INTENT
@@ -375,8 +325,6 @@ def allow_request(user_id):
         events = RATE_LIMITS[uid]
         while events and now - events[0] > 3600: events.popleft()
         if events and now - events[-1] < 2: return False, "لطفاً کمی بین درخواست‌ها فاصله بگذار."
-        if sum(1 for t in events if now - t < 60) >= 20: return False, "سقف درخواست‌های دقیقه‌ای پر شده است."
-        if len(events) >= 100: return False, "سقف درخواست‌های ساعتی پر شده است."
         events.append(now)
     return True, ""
 
@@ -415,7 +363,7 @@ def search_web(query):
             results = []
             
             if engine == "ddg":
-                items = soup.select('.result__body')[:3] # فقط ۳ نتیجه برای سرعت
+                items = soup.select('.result__body')[:3]
                 for item in items:
                     title_tag = item.select_one('.result__a')
                     snippet_tag = item.select_one('.result__snippet')
@@ -436,8 +384,7 @@ def search_web(query):
             if results:
                 SEARCH_CACHE[key] = (time.time(), results)
                 return results
-        except Exception:
-            pass
+        except Exception: pass
     return None
 
 # =========================================================
@@ -458,47 +405,10 @@ def get_currency():
     try:
         data = http_json("GET", url, timeout=8)
         return "💵 اطلاعات دریافتی قیمت دلار:\n" + json.dumps(data, ensure_ascii=False)[:1500]
-    except Exception:
-        return "دریافت قیمت دلار در حال حاضر ناموفق بود."
+    except Exception: return "دریافت قیمت دلار در حال حاضر ناموفق بود."
 
 # =========================================================
-# 12. SAFE LINK FETCHING
-# =========================================================
-def validate_public_url(url):
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.hostname: return False
-    host = parsed.hostname.lower()
-    if host in ("localhost", "localhost.localdomain"): return False
-    try:
-        addresses = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
-        for address in addresses:
-            if not ipaddress.ip_address(address[4][0]).is_global: return False
-    except Exception: return False
-    return True
-
-def fetch_link(url):
-    if not validate_public_url(url): return None
-    try:
-        response = http_request("GET", url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10, attempts=1, allow_redirects=False, stream=True)
-        if "text/html" not in response.headers.get("Content-Type", ""): return None
-        
-        chunks, total = [], 0
-        for chunk in response.iter_content(8192):
-            if not chunk: continue
-            total += len(chunk)
-            if total > 1_500_000: break
-            chunks.append(chunk)
-            
-        soup = BeautifulSoup(b"".join(chunks).decode(response.encoding or "utf-8", errors="replace"), 'html.parser')
-        for tag in soup(["script", "style", "noscript", "svg", "iframe", "nav", "footer"]):
-            tag.decompose()
-        
-        return " ".join(soup.stripped_strings)[:10000]
-    except Exception:
-        return None
-
-# =========================================================
-# 13. REMINDERS
+# 12. REMINDERS
 # =========================================================
 def create_reminder(user_id, chat_id, text):
     t = text.lower()
@@ -523,7 +433,7 @@ def create_reminder(user_id, chat_id, text):
         REMINDERS.append({"id": secrets.token_hex(5), "user_id": str(user_id), "chat_id": chat_id, "text": reminder_text[:300], "timestamp": target.timestamp()})
         save_json(REMINDERS_FILE, REMINDERS)
         
-    return "⏰ یادآور ثبت شد!\n\n" + f"موضوع: {reminder_text}\nزمان: {target.strftime('%Y-%m-%d %H:%M')}\n\nزمان‌بندی بر اساس ساعت سرور است."
+    return "⏰ یادآور ثبت شد!\n\n" + f"موضوع: {reminder_text}\nزمان: {target.strftime('%Y-%m-%d %H:%M')}"
 
 def reminder_worker():
     while True:
@@ -540,15 +450,13 @@ def reminder_worker():
                     save_json(REMINDERS_FILE, REMINDERS)
             
             for reminder in due:
-                try:
-                    send_message(reminder["chat_id"], "⏰ یادآوری!\n\n" + reminder["text"])
-                    time.sleep(0.5)
+                try: send_message(reminder["chat_id"], "⏰ یادآوری!\n\n" + reminder["text"])
                 except Exception: pass
         except Exception: pass
         time.sleep(15)
 
 # =========================================================
-# 14. USER STATS
+# 13. STATS & HANDLERS
 # =========================================================
 def update_stats(user_id):
     uid = str(user_id)
@@ -562,22 +470,13 @@ def get_stats(user_id):
     item = STATS.get(str(user_id), {})
     return f"📊 آمار استفاده شما\n\nتعداد پیام‌ها: {item.get('messages', 0)}\nمدت فعالیت ربات: {int((time.time() - START_TIME) / 60)} دقیقه"
 
-# =========================================================
-# 15. COMMAND & CALLBACK HANDLERS
-# =========================================================
 def handle_command(chat_id, user_id, text):
     parts = text.split(maxsplit=1)
     command = parts[0].split("@")[0].lower()
     argument = parts[1] if len(parts) > 1 else ""
 
     if command in ("/start", "/menu"):
-        send_keyboard(chat_id, "سلام! به Super Bot خوش آمدی.\nیک قابلیت را انتخاب کن یا مستقیماً پیام بده.", main_menu())
-        return True
-    if command in ("/help", "/راهنما"):
-        send_message(chat_id, "🤖 راهنمای Super Bot\n\n/start - شروع\n/help - راهنما\n/settings - تنظیمات\n/stats - آمار\n/clear - پاک کردن حافظه\n/weather تهران - هواشناسی\n/tr متن - ترجمه")
-        return True
-    if command == "/settings":
-        send_keyboard(chat_id, "⚙️ تنظیمات ربات", settings_menu(user_id))
+        send_keyboard(chat_id, "سلام! به Super Bot خوش آمدی.", main_menu())
         return True
     if command == "/clear":
         clear_history(user_id)
@@ -593,12 +492,6 @@ def handle_command(chat_id, user_id, text):
             try: send_message(chat_id, get_weather(city))
             except Exception: send_message(chat_id, "دریافت هواشناسی فعلاً ممکن نیست.")
         return True
-    if command in ("/tr", "/translate"):
-        if not argument: send_message(chat_id, "متن موردنظر را بعد از دستور وارد کن.")
-        else:
-            result = call_ai(user_id, "متن زیر را ترجمه کن:\n" + argument)
-            send_message(chat_id, result or "سرویس ترجمه موقتاً در دسترس نیست.")
-        return True
     return False
 
 def handle_callback(update):
@@ -607,7 +500,6 @@ def handle_callback(update):
     chat_id = callback.get("message", {}).get("chat", {}).get("id")
     user_id = callback.get("from", {}).get("id")
     if not chat_id or not user_id: return
-    
     answer_callback(callback_id, "در حال پردازش...")
 
     if data == "menu:home": send_keyboard(chat_id, "منوی اصلی", main_menu())
@@ -615,10 +507,8 @@ def handle_callback(update):
     elif data == "menu:ai": send_message(chat_id, "سؤالت را بنویس؛ هوش مصنوعی پاسخ می‌دهد.")
     elif data == "menu:weather": send_message(chat_id, "نام شهر را ارسال کن.\nمثال: تهران")
     elif data == "menu:search": send_message(chat_id, "عبارت موردنظر را با کلمه جستجو ارسال کن.")
-    elif data == "menu:translate": send_message(chat_id, "متن را با دستور /tr ارسال کن.")
     elif data == "menu:reminder": send_message(chat_id, "مثال:\nیادم بنداز فردا ساعت ۵ تماس بگیر")
     elif data == "menu:stats": send_message(chat_id, get_stats(user_id))
-    elif data == "menu:memory": send_message(chat_id, "برای پاک کردن حافظه از /clear استفاده کن.")
     elif data == "menu:dice": send_message(chat_id, f"🎲 نتیجه تاس: {random.randint(1, 6)}")
     elif data == "menu:creator": send_message(chat_id, f"👨‍💻 سازنده من **{CREATOR_NAME}** است.\n🆔 آیدی: {CREATOR_ID}")
     elif data == "settings:style":
@@ -626,27 +516,16 @@ def handle_callback(update):
         pref["style"] = "detailed" if pref.get("style", "short") == "short" else "short"
         save_json(SETTINGS_FILE, SETTINGS)
         send_keyboard(chat_id, "سبک پاسخ تغییر کرد.", settings_menu(user_id))
-    elif data == "settings:web":
-        pref = SETTINGS.setdefault(str(user_id), {})
-        pref["web"] = not pref.get("web", True)
-        save_json(SETTINGS_FILE, SETTINGS)
-        send_keyboard(chat_id, "تنظیم جستجو تغییر کرد.", settings_menu(user_id))
     elif data == "settings:clear":
         clear_history(user_id)
         send_message(chat_id, "حافظه پاک شد.")
 
-# =========================================================
-# 16. MESSAGE PROCESSING
-# =========================================================
 def process_message(message):
     chat_id = message.get("chat", {}).get("id")
     user_id = message.get("from", {}).get("id")
     if chat_id is None or user_id is None: return
 
     text = clean_text(message.get("text") or message.get("caption") or "")
-    if message.get("voice"):
-        send_message(chat_id, "🎤 ویس دریافت شد؛ اما تبدیل خودکار صوت به متن فعال نیست.")
-        return
     if not text: return
 
     allowed, reason = allow_request(user_id)
@@ -655,9 +534,7 @@ def process_message(message):
         return
 
     update_stats(user_id)
-
-    if text.startswith("/"):
-        if handle_command(chat_id, user_id, text): return
+    if text.startswith("/") and handle_command(chat_id, user_id, text): return
 
     intent = detect_intent(text)
 
@@ -678,7 +555,7 @@ def process_message(message):
         send_message(chat_id, get_currency())
         return
     if intent == "translate":
-        result = call_ai(user_id, "متن زیر را به زبان مناسب ترجمه کن:\n" + text)
+        result = call_ai(user_id, "ترجمه کن:\n" + text)
         send_message(chat_id, result or "سرویس ترجمه موقتاً در دسترس نیست.")
         return
     if intent == "link":
@@ -687,38 +564,32 @@ def process_message(message):
             content = fetch_link(match.group(0).rstrip(".,،)"))
             if not content: send_message(chat_id, "نتوانستم محتوای این لینک را دریافت کنم.")
             else:
-                result = call_ai(user_id, "این محتوای صفحه را خلاصه کن:\n" + content)
+                result = call_ai(user_id, "این متن را خلاصه کن:\n" + content)
                 send_message(chat_id, result or "خلاصه‌سازی موقتاً ممکن نیست.")
             return
 
-    pref = SETTINGS.get(str(user_id), {})
-    if intent == "search" and pref.get("web", True):
+    if intent == "search":
         results = search_web(text)
         if not results:
-            send_message(chat_id, "جستجوی زنده ناموفق بود؛ در حال حاضر اطلاعات زنده ندارم.")
+            send_message(chat_id, "جستجوی زنده ناموفق بود.")
             return
         result_text = "\n\n".join(f"{i+1}. {x['title']}\n{x['snippet']}" for i, x in enumerate(results))
-        prompt = "بر اساس نتایج زیر به سؤال کاربر پاسخ بده. منابع را ذکر کن.\n\n" + result_text + "\n\nسؤال کاربر:\n" + text
+        prompt = "بر اساس نتایج زیر پاسخ بده:\n\n" + result_text + "\n\nسؤال:\n" + text
         answer = call_ai(user_id, prompt)
-        send_message(chat_id, answer or ("نتایج جستجو دریافت شدند، اما هوش مصنوعی پاسخ نداد:\n\n" + result_text[:2000]))
+        send_message(chat_id, answer or "هوش مصنوعی پاسخ نداد.")
         return
 
     # چت عادی
     update_history(user_id, "user", text)
     answer = call_ai(user_id, text)
     if not answer:
-        send_message(chat_id, "سرویس‌های هوش مصنوعی فعلاً مشغول هستند. کمی بعد امتحان کن.")
+        send_message(chat_id, "سرویس‌های هوش مصنوعی فعلاً مشغول هستند.")
         return
     update_history(user_id, "assistant", answer)
     send_message(chat_id, answer)
 
-    item = get_history(user_id)
-    if item.get("turns", 0) >= 20 and item.get("turns", 0) % 20 == 0:
-        try: maybe_summarize(user_id)
-        except Exception: pass
-
 # =========================================================
-# 17. JOB QUEUE & POLLING
+# 14. POLLING & FLASK
 # =========================================================
 JOB_QUEUE = Queue(maxsize=MAX_QUEUE)
 
@@ -729,15 +600,8 @@ def worker():
             try:
                 if "callback_query" in update: handle_callback(update)
                 elif "message" in update: process_message(update["message"])
-            except Exception:
-                traceback.print_exc()
-                message = update.get("message", {})
-                chat_id = message.get("chat", {}).get("id")
-                if chat_id:
-                    try: send_message(chat_id, "یک خطای موقت رخ داد؛ دوباره امتحان کن.")
-                    except Exception: pass
-            finally:
-                JOB_QUEUE.task_done()
+            except Exception: traceback.print_exc()
+            finally: JOB_QUEUE.task_done()
         except Empty: continue
         except Exception: pass
 
@@ -760,31 +624,22 @@ def polling_worker():
                 if update_id is not None:
                     remember_update(update_id)
                     offset = update_id + 1
-        except Exception:
-            time.sleep(3)
+        except Exception: time.sleep(3)
 
-# =========================================================
-# 18. FLASK HEALTHCHECK
-# =========================================================
 app = Flask(__name__)
 
 @app.route("/")
 def home(): return jsonify({"service": "Super Bot", "status": "running"})
 
 @app.route("/health")
-def health():
-    return jsonify({"status": "ok", "uptime": int(time.time() - START_TIME), "queue": JOB_QUEUE.qsize()})
+def health(): return jsonify({"status": "ok", "uptime": int(time.time() - START_TIME), "queue": JOB_QUEUE.qsize()})
 
-# =========================================================
-# 19. STARTUP
-# =========================================================
 def main():
     print("Super Bot starting...", flush=True)
     for _ in range(WORKERS):
         threading.Thread(target=worker, daemon=True).start()
     threading.Thread(target=polling_worker, daemon=True).start()
     threading.Thread(target=reminder_worker, daemon=True).start()
-    
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
 
 if __name__ == "__main__":

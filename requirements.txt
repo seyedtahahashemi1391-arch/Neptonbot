@@ -1,4 +1,4 @@
-aiohttp
 requests
+flask
+python-dotenv
 beautifulsoup4
-Flask

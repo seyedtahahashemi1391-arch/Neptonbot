@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SUPER BOT (Private Edition) - Final Stable for Render
+SUPER BOT (Private Edition) - Fast & Strict Edition
 """
 
 import os
@@ -30,7 +30,6 @@ load_dotenv()
 # =========================================================
 # 1. CONFIG (تنظیمات)
 # =========================================================
-# ⚠️ توکن ربات شما
 BOT_TOKEN = "70955089:I0xa1mOtAb90m_qlX0SNCDNfPFc-jZzL8ec"
 PORT = int(os.getenv("PORT", "8080"))
 API_BASE = os.getenv("SPLUS_API", "https://api.splus.ir").rstrip("/")
@@ -42,7 +41,6 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
 POLLS_FILE = os.path.join(DATA_DIR, "polls.json")
 
-# اطلاعات سازنده
 CREATOR_NAME = "Nepton"
 CREATOR_ID = "@t91m62"
 
@@ -248,26 +246,28 @@ def settings_menu(user_id):
     ]
 
 # =========================================================
-# 8. AI PROVIDER ROUTER
+# 8. AI PROVIDER ROUTER (بهینه‌شده برای سرعت و منطق)
 # =========================================================
 PROVIDER_HEALTH = {}
 
 def get_providers():
+    # تایم‌اوت‌ها به شدت کم شدند تا اگر سرویسی خراب بود، ربات معطل نشود
     providers = [
-        {"name": "Kilo", "url": "https://api.kilo.ai/api/gateway/chat/completions", "model": "kilo-auto/free", "key": "", "timeout": 9},
-        {"name": "LLM7", "url": "https://api.llm7.io/v1/chat/completions", "model": "gpt-oss:20b", "key": "", "timeout": 11}
+        {"name": "Kilo", "url": "https://api.kilo.ai/api/gateway/chat/completions", "model": "kilo-auto/free", "key": "", "timeout": 4},
+        {"name": "LLM7", "url": "https://api.llm7.io/v1/chat/completions", "model": "gpt-oss:20b", "key": "", "timeout": 5}
     ]
     pollinations_key = os.getenv("POLLINATIONS_API_KEY", "")
     if pollinations_key:
-        providers.append({"name": "Pollinations", "url": "https://gen.pollinations.ai/v1/chat/completions", "model": "openai/gpt-4o-mini", "key": pollinations_key, "timeout": 12})
+        providers.append({"name": "Pollinations", "url": "https://gen.pollinations.ai/v1/chat/completions", "model": "openai/gpt-4o-mini", "key": pollinations_key, "timeout": 8})
     return providers
 
 SYSTEM_PROMPT = """
-تو یک دستیار هوشمند فارسی‌زبان هستی.
-قوانین سخت‌گیرانه:
-- پاسخ تو باید فوق‌العاده کوتاه، تمیز و مستقیم باشد (حداکثر ۲ تا ۳ جمله).
-- هرگز مقدمه‌چینی نکن (مثلاً نگو 'سوال خوبی پرسیدی').
-- بلافاصله به اصل جواب بده.
+تو یک دستیار هوشمند و بسیار منطقی هستی.
+قوانین حیاتی:
+۱. پاسخ تو باید فوق‌العاده کوتاه باشد (حداکثر ۱ تا ۲ جمله).
+۲. هرگز مقدمه‌چینی نکن، توضیح اضافه نده و حرف کاربر را تکرار نکن.
+۳. فقط و فقط جواب مستقیم و منطقی بده.
+۴. اگر جواب را نمی‌دانی، فقط بنویس: "نمی‌دانم".
 """
 
 def provider_request(provider, messages):
@@ -275,11 +275,13 @@ def provider_request(provider, messages):
     if provider["key"]:
         headers["Authorization"] = "Bearer " + provider["key"]
     
+    # توکن را از 200 به 100 کاهش دادیم تا مدل زور نزند طولانی بنویسد
+    # تمپریچر را به 0.1 کاهش دادیم تا مدل خیال‌پردازی و چرت و پرت نگوید
     payload = {
         "model": provider["model"], 
         "messages": messages, 
-        "temperature": 0.2, 
-        "max_tokens": 200, 
+        "temperature": 0.1, 
+        "max_tokens": 100, 
         "stream": False
     }
     
@@ -307,15 +309,18 @@ def call_ai(user_id, prompt, extra_system=None):
     system = SYSTEM_PROMPT
     
     if style == "detailed":
-        system = "تو یک دستیار هوشمند فارسی‌زبان هستی. پاسخ‌ها را مفصل، دقیق و مرحله‌ای ارائه کن."
+        system = "تو یک دستیار هوشمند هستی. پاسخ‌ها را مفصل بده."
         
     if extra_system:
         system += "\n" + extra_system
 
     messages = [{"role": "system", "content": system}]
+    
     if history.get("summary"):
         messages.append({"role": "system", "content": "خلاصه مکالمات قبلی:\n" + history["summary"]})
-    messages.extend(history.get("messages", [])[-8:])
+    
+    # حافظه رو از ۸ پیام به ۳ پیام کاهش دادیم تا هم سریع‌تر شه هم گیج نشه
+    messages.extend(history.get("messages", [])[-3:])
     messages.append({"role": "user", "content": str(prompt)[:MAX_TEXT]})
     
     for provider in get_providers():
@@ -333,7 +338,7 @@ def maybe_summarize(user_id):
     
     transcript = item.get("messages", [])[-30:]
     text_block = "\n".join(f"{m['role']}: {m['content']}" for m in transcript)
-    prompt = "مکالمه زیر را در حداکثر 120 کلمه خلاصه کن. فقط علایق و اطلاعات لازم برای ادامه گفتگو را نگه دار.\n\n" + text_block
+    prompt = "مکالمه زیر را در حداکثر 120 کلمه خلاصه کن.\n\n" + text_block
     
     summary = None
     for provider in get_providers():
@@ -387,7 +392,7 @@ def detect_intent(text):
     return "chat"
 
 # =========================================================
-# 10. WEB SEARCH (با BeautifulSoup)
+# 10. WEB SEARCH
 # =========================================================
 def search_web(query):
     key = hashlib.sha256(query.lower().encode("utf-8")).hexdigest()
@@ -410,7 +415,7 @@ def search_web(query):
             results = []
             
             if engine == "ddg":
-                items = soup.select('.result__body')[:5]
+                items = soup.select('.result__body')[:3] # فقط ۳ نتیجه برای سرعت
                 for item in items:
                     title_tag = item.select_one('.result__a')
                     snippet_tag = item.select_one('.result__snippet')
@@ -421,7 +426,7 @@ def search_web(query):
                             url = unquote(dict(x.split("=", 1) for x in parsed.query.split("&") if "=" in x).get("uddg", url))
                         results.append({"title": title_tag.text.strip(), "snippet": snippet_tag.text.strip(), "url": url})
             else:
-                items = soup.select('.b_algo')[:5]
+                items = soup.select('.b_algo')[:3]
                 for item in items:
                     title_tag = item.select_one('h2 a')
                     snippet_tag = item.select_one('.b_caption p')
@@ -692,17 +697,17 @@ def process_message(message):
         if not results:
             send_message(chat_id, "جستجوی زنده ناموفق بود؛ در حال حاضر اطلاعات زنده ندارم.")
             return
-        result_text = "\n\n".join(f"{i+1}. {x['title']}\n{x['snippet']}\n{x['url']}" for i, x in enumerate(results))
+        result_text = "\n\n".join(f"{i+1}. {x['title']}\n{x['snippet']}" for i, x in enumerate(results))
         prompt = "بر اساس نتایج زیر به سؤال کاربر پاسخ بده. منابع را ذکر کن.\n\n" + result_text + "\n\nسؤال کاربر:\n" + text
         answer = call_ai(user_id, prompt)
-        send_message(chat_id, answer or ("نتایج جستجو دریافت شدند، اما سرویس هوش مصنوعی پاسخ نداد:\n\n" + result_text[:2500]))
+        send_message(chat_id, answer or ("نتایج جستجو دریافت شدند، اما هوش مصنوعی پاسخ نداد:\n\n" + result_text[:2000]))
         return
 
     # چت عادی
     update_history(user_id, "user", text)
     answer = call_ai(user_id, text)
     if not answer:
-        send_message(chat_id, "فعلاً همه سرویس‌های هوش مصنوعی مشغول هستند. کمی بعد امتحان کن.")
+        send_message(chat_id, "سرویس‌های هوش مصنوعی فعلاً مشغول هستند. کمی بعد امتحان کن.")
         return
     update_history(user_id, "assistant", answer)
     send_message(chat_id, answer)
@@ -759,7 +764,7 @@ def polling_worker():
             time.sleep(3)
 
 # =========================================================
-# 18. FLASK HEALTHCHECK (برای Render)
+# 18. FLASK HEALTHCHECK
 # =========================================================
 app = Flask(__name__)
 

@@ -31,7 +31,7 @@ from urllib3.util.retry import Retry
 # 1. CONFIGURATION
 # =========================================================
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "70955089:I0xa1mOtAb90m_qlX0SNCDNfPFc-jZzL8ec").strip()
 API_BASE = os.getenv("SPLUS_API_BASE", "https://api.splus.ir").rstrip("/")
 BOT_API = f"{API_BASE}/bot{BOT_TOKEN}" if BOT_TOKEN else ""
 

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SUPER BOT - Final Complete Edition
+SUPER BOT - Final Complete Edition (Fixed AI Providers)
 """
 
 import os
@@ -54,30 +54,25 @@ HISTORY = load_json(HISTORY_FILE, {})
 REMINDERS = load_json(REMINDERS_FILE, [])
 
 # =========================================================
-# 3. AI ENGINE (سریع، دقیق، بدون چرت و پرت)
+# 3. AI ENGINE (سرویس‌های جدید و پایدار)
 # =========================================================
 def get_providers():
     return [
-        {
-            "name": "Pollinations",
-            "url": "https://text.pollinations.ai/openai",
-            "model": "openai",
-            "headers": {"Content-Type": "application/json"},
-            "timeout": 5
-        },
-        {
-            "name": "OVHcloud",
-            "url": "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions",
-            "model": "Qwen3Guard-Gen-0.6B",
-            "headers": {"Content-Type": "application/json", "Authorization": "Bearer unused"},
-            "timeout": 5
-        },
+        # ۱. KeylessAI (بدون کلید، پایداری بالا)
         {
             "name": "KeylessAI",
             "url": "https://keylessai.thryx.workers.dev/v1/chat/completions",
-            "model": "gpt-4o",
+            "model": "gpt-4o-mini",
             "headers": {"Content-Type": "application/json"},
-            "timeout": 6
+            "timeout": 7
+        },
+        # ۲. LLMF (بدون کلید، دارای Fallback داخلی)
+        {
+            "name": "LLMF",
+            "url": "https://llmf.ai/v1/chat/completions",
+            "model": "auto",
+            "headers": {"Content-Type": "application/json"},
+            "timeout": 8
         }
     ]
 

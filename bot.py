@@ -10,11 +10,8 @@ from flask import Flask, jsonify
 # =========================================================
 # 1. CONFIG (تنظیمات)
 # =========================================================
-# ⚠️ توکن سروش پلاس رو دقیقاً بین دو تا "" زیر بذار
+# ⚠️ فقط توکن ربات سروش رو بین دو تا "" زیر بذار (دیگه هیچ کلید دیگه‌ای لازم نیست)
 BOT_TOKEN = "70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0"
-
-# ⚠️ توکن گیت‌هاب (که با ghp_ شروع میشه) رو دقیقاً بین دو تا "" زیر بذار
-GITHUB_TOKEN = "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"
 
 PORT = int(os.getenv("PORT", "8080"))
 API_BASE = "https://api.splus.ir"
@@ -27,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("superbot")
 
 # =========================================================
-# 2. AI ENGINE (GitHub Models -> Pollinations)
+# 2. AI ENGINE (استفاده از جدیدترین API رایگان)
 # =========================================================
 def call_ai(prompt):
     messages = [
@@ -35,36 +32,29 @@ def call_ai(prompt):
         {"role": "user", "content": prompt}
     ]
     
-    # اولویت اول: GitHub Models
-    if GITHUB_TOKEN and GITHUB_TOKEN != "توکن_گیت_هاب_رو_اینجا_بذار":
-        try:
-            logger.info("Trying GitHub Models...")
-            url = "https://models.inference.ai.azure.com/chat/completions"
-            headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "application/json"}
-            payload = {"model": "gpt-4o-mini", "messages": messages, "temperature": 0.1, "max_tokens": 150}
-            
-            resp = requests.post(url, json=payload, headers=headers, timeout=15)
-            logger.info(f"GitHub Status: {resp.status_code}")
-            if resp.status_code == 200:
-                answer = resp.json()["choices"][0]["message"]["content"].strip()
-                answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
-                return answer
-        except Exception as e:
-            logger.error(f"GitHub Error: {e}")
-
-    # اولویت دوم: Pollinations (بدون کلید)
+    # استفاده از درگاه جدید و پایدار Pollinations
+    url = "https://gen.pollinations.ai/v1/chat/completions"
+    payload = {
+        "model": "openai",
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 150
+    }
+    
     try:
-        logger.info("Trying Pollinations...")
-        url = "https://text.pollinations.ai/openai"
-        payload = {"model": "openai", "messages": messages}
-        resp = requests.post(url, json=payload, timeout=15)
-        logger.info(f"Pollinations Status: {resp.status_code}")
+        logger.info("در حال ارسال به هوش مصنوعی...")
+        resp = requests.post(url, json=payload, timeout=20)
+        logger.info(f"وضعیت پاسخ: {resp.status_code}")
+        
         if resp.status_code == 200:
             answer = resp.json()["choices"][0]["message"]["content"].strip()
+            # پاکسازی فکرهای لورفته
             answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
             return answer
+        else:
+            logger.error(f"خطای سرور: {resp.text[:200]}")
     except Exception as e:
-        logger.error(f"Pollinations Error: {e}")
+        logger.error(f"خطای شبکه: {e}")
 
     return "⚠️ هوش مصنوعی فعلاً در دسترس نیست. لطفاً بعداً امتحان کنید."
 

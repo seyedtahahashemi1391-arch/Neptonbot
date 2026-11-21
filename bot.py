@@ -1,342 +1,75 @@
 # -*- coding: utf-8 -*-
-"""
-SUPER BOT - Resilient Edition (Final Secure)
-"""
-
-import os
-import re
-import json
-import time
-import logging
-import threading
-import random
-from datetime import datetime, timedelta
+import os, re, json, time, logging, threading
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, jsonify
 
-# =========================================================
-# 1. CONFIG (خواندن امن از Render)
-# =========================================================
-# مقادیر از بخش Environment در Render خوانده می‌شوند
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+# ⚠️⚠️⚠️ توکن ربات رو دقیقاً بین دو تا "" زیر بذار ⚠️⚠️⚠️
+BOT_TOKEN = "70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0" 
 
 PORT = int(os.getenv("PORT", "8080"))
 API_BASE = "https://api.splus.ir"
 BOT_API = f"{API_BASE}/bot{BOT_TOKEN}"
-DATA_DIR = os.getenv("DATA_DIR", ".")
-
-HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
-REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
-
-CREATOR_NAME = "Nepton"
-CREATOR_ID = "@t91m62"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("superbot")
-os.makedirs(DATA_DIR, exist_ok=True)
 
-if not BOT_TOKEN:
-    logger.error("⚠️ BOT_TOKEN در Render تنظیم نشده است!")
-
-# =========================================================
-# 2. STORAGE
-# =========================================================
-def load_json(path, default):
+def call_ai(prompt):
+    url = "https://text.pollinations.ai/openai"
+    payload = {
+        "model": "openai", 
+        "messages": [
+            {"role": "system", "content": "پاسخ کوتاه و فارسی بده."},
+            {"role": "user", "content": prompt}
+        ]
+    }
     try:
-        with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except: return default
+        logger.info("Sending request to Pollinations...")
+        response = requests.post(url, json=payload, timeout=15)
+        logger.info(f"Pollinations Status: {response.status_code}")
+        response.raise_for_status()
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"Pollinations Error: {e}")
+        return "خطا در اتصال به هوش مصنوعی."
 
-def save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False)
-    except Exception as e: logger.error(f"Save error: {e}")
-
-HISTORY = load_json(HISTORY_FILE, {})
-REMINDERS = load_json(REMINDERS_FILE, [])
-
-# =========================================================
-# 3. AI ENGINE (مقاوم و ضدچرت‌وپرت)
-# =========================================================
-class CircuitBreaker:
-    def __init__(self, failure_threshold=3, recovery_time=300):
-        self.failure_threshold, self.recovery_time = failure_threshold, recovery_time
-        self.failures, self.last_failure_time = 0, 0
-    def is_open(self):
-        if self.failures >= self.failure_threshold:
-            if time.time() - self.last_failure_time > self.recovery_time:
-                self.failures = 0
-                return False
-            return True
-        return False
-    def record_failure(self):
-        self.failures += 1
-        self.last_failure_time = time.time()
-    def record_success(self):
-        self.failures = 0
-
-breakers = {}
-
-def get_providers():
-    p = []
-    if GROQ_API_KEY:
-        p.append({
-            "name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions",
-            "headers": {"Authorization": f"Bearer {GROQ_API_KEY}"},
-            "model": "llama-3.3-70b-versatile", "timeout": 6
-        })
-    if GEMINI_API_KEY:
-        p.append({
-            "name": "Gemini", "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-            "headers": {"Authorization": f"Bearer {GEMINI_API_KEY}"},
-            "model": "gemini-2.5-flash", "timeout": 8
-        })
-    if OPENROUTER_API_KEY:
-        p.append({
-            "name": "OpenRouter", "url": "https://openrouter.ai/api/v1/chat/completions",
-            "headers": {"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
-            "model": "deepseek/deepseek-r1-0528:free", "timeout": 10
-        })
-    # همیشه Pollinations (بدون کلید) به عنوان آخرین راه‌حل
-    p.append({
-        "name": "Pollinations", "url": "https://text.pollinations.ai/openai",
-        "headers": {"Content-Type": "application/json"},
-        "model": "openai", "timeout": 8
-    })
-    return p
-
-SYSTEM_PROMPT = """تو یک دستیار هوشمند فارسی‌زبان هستی.
-قوانین فوق‌العاده سخت‌گیرانه:
-۱. پاسخ تو باید حداکثر ۱ تا ۲ جمله کوتاه، مستقیم و منطقی باشد.
-۲. هرگز فرآیند فکر کردن (Reasoning/Thinking) خود را به هیچ زبانی ننویس.
-۳. هرگز حرف‌های کاربر را تکرار نکن و مقدمه‌چینی نکن.
-۴. اگر جواب را نمی‌دانی فقط بنویس: نمی‌دانم."""
-
-def call_provider_with_retry(provider, messages, max_retries=2):
-    name = provider["name"]
-    if name not in breakers: breakers[name] = CircuitBreaker()
-    if breakers[name].is_open(): raise Exception(f"Circuit open for {name}")
-    
-    for attempt in range(max_retries):
-        try:
-            payload = {"model": provider["model"], "messages": messages, "temperature": 0.1, "max_tokens": 100}
-            resp = requests.post(provider["url"], json=payload, headers=provider["headers"], timeout=provider["timeout"])
-            if resp.status_code == 429:
-                time.sleep(2 ** attempt + random.uniform(0, 1))
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            answer = data["choices"][0]["message"]["content"].strip()
-            
-            # فیلتر پاکسازی توهمات
-            answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
-            answer = re.sub(r'Thinking Process:.*', '', answer, flags=re.DOTALL).strip()
-            
-            if not answer or len(answer) < 2: raise Exception("Empty")
-            breakers[name].record_success()
-            return answer
-        except Exception as e:
-            if attempt == max_retries - 1: breakers[name].record_failure()
-            time.sleep(0.5 * (2 ** attempt))
-    raise Exception(f"All retries failed for {name}")
-
-def call_ai(user_id, prompt):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    hist = HISTORY.get(str(user_id), [])
-    messages.extend(hist[-3:])
-    messages.append({"role": "user", "content": prompt})
-    
-    for p in get_providers():
-        try:
-            answer = call_provider_with_retry(p, messages)
-            hist.extend([{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}])
-            HISTORY[str(user_id)] = hist[-10:]
-            save_json(HISTORY_FILE, HISTORY)
-            logger.info(f"✅ پاسخ از {p['name']}")
-            return answer
-        except Exception:
-            logger.warning(f"❌ {p['name']} شکست خورد.")
-            continue
-    return "⚠️ متأسفانه در حال حاضر تمام سرویس‌های هوش مصنوعی پاسخ نمی‌دهند."
-
-# =========================================================
-# 4. SOROUSH HELPERS
-# =========================================================
 def splus_call(method, payload):
-    for attempt in range(3):
-        try:
-            r = requests.post(f"{BOT_API}/{method}", json=payload, timeout=20)
-            if r.status_code == 429:
-                time.sleep(2 ** attempt)
-                continue
-            return r.json()
-        except Exception:
-            time.sleep(1)
-    return {}
-
-def send_message(chat_id, text, keyboard=None):
-    payload = {"chat_id": chat_id, "text": str(text)[:4000]}
-    if keyboard: payload["reply_markup"] = keyboard
-    return splus_call("sendMessage", payload)
-
-def send_keyboard(chat_id, text, buttons_list):
-    return send_message(chat_id, text, {"inline_keyboard": buttons_list})
-
-# =========================================================
-# 5. MENUS & TOOLS
-# =========================================================
-def main_menu():
-    return [
-        [{"text": "🤖 هوش مصنوعی", "callback_data": "menu:ai"}, {"text": "🌤 هواشناسی", "callback_data": "menu:weather"}],
-        [{"text": "🔎 جستجوی وب", "callback_data": "menu:search"}, {"text": "🧹 پاک کردن حافظه", "callback_data": "settings:clear"}],
-        [{"text": "👨‍💻 سازنده", "callback_data": "menu:creator"}]
-    ]
-
-def get_weather(city):
     try:
-        geo = requests.get(f"https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=fa", timeout=5).json()
-        if not geo.get("results"): return "شهر موردنظر پیدا نشد."
-        loc = geo["results"][0]
-        w = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={loc['latitude']}&longitude={loc['longitude']}&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m&timezone=auto", timeout=5).json()
-        cur = w["current"]
-        return f"🌤 هوای {loc['name']}:\n🌡 دما: {cur.get('temperature_2m', '?')}°C\n💧 رطوبت: {cur.get('relative_humidity_2m', '?')}%\n💨 باد: {cur.get('wind_speed_10m', '?')} km/h"
-    except Exception:
-        return "خطا در دریافت هواشناسی."
+        r = requests.post(f"{BOT_API}/{method}", json=payload, timeout=20)
+        return r.json()
+    except Exception: return {}
 
-def search_web(query):
-    try:
-        res = requests.post("https://html.duckduckgo.com/html/", data={"q": query}, headers={"User-Agent": "Mozilla/5.0"}, timeout=7)
-        soup = BeautifulSoup(res.text, 'html.parser')
-        results = []
-        for item in soup.select('.result__body')[:3]:
-            title = item.select_one('.result__a')
-            snippet = item.select_one('.result__snippet')
-            if title and snippet:
-                results.append(f"{title.text.strip()}: {snippet.text.strip()}")
-        return "\n\n".join(results)
-    except Exception:
-        return None
+def send_message(chat_id, text):
+    return splus_call("sendMessage", {"chat_id": chat_id, "text": text})
 
-def create_reminder(user_id, chat_id, text):
-    t = text.lower()
-    now = datetime.now()
-    if "پس‌فردا" in t: day = now.date() + timedelta(days=2)
-    elif "فردا" in t: day = now.date() + timedelta(days=1)
-    else: day = now.date()
-    
-    match = re.search(r"ساعت\s*(\d{1,2})(?:[:٫.](\d{1,2}))?", t)
-    if not match: return "زمان مشخص نیست.\nمثال: یادم بنداز فردا ساعت ۵ زنگ بزن"
-    
-    hour, minute = int(match.group(1)), int(match.group(2) or 0)
-    rem_text = re.sub(r"یادم بنداز|یادآور|یادآوری کن|فردا|پس.?فردا|امروز|ساعت\s*\d{1,2}(?:[:٫.]\d{1,2})?", "", text, flags=re.IGNORECASE).strip(" ،,؛;")
-    
-    target = datetime.combine(day, datetime.min.time()).replace(hour=hour, minute=minute)
-    if target <= now: return "زمان باید در آینده باشد."
-    
-    REMINDERS.append({"user_id": str(user_id), "chat_id": chat_id, "text": rem_text, "timestamp": target.timestamp()})
-    save_json(REMINDERS_FILE, REMINDERS)
-    return f"⏰ یادآور ثبت شد!\nموضوع: {rem_text}\nزمان: {target.strftime('%Y-%m-%d %H:%M')}"
-
-# =========================================================
-# 6. UPDATE HANDLERS
-# =========================================================
-def process_update(update):
-    if "message" in update:
-        msg = update["message"]
-        chat_id = msg["chat"]["id"]
-        user_id = msg["from"]["id"]
-        text = (msg.get("text") or "").strip()
-        if not text: return
-
-        if text == "/start":
-            send_keyboard(chat_id, "سلام! به Super Bot خوش آمدی.", main_menu())
-            return
-        if text == "/clear":
-            HISTORY[str(user_id)] = []
-            save_json(HISTORY_FILE, HISTORY)
-            send_message(chat_id, "🧹 حافظه پاک شد.")
-            return
-
-        t_lower = text.lower()
-        if "سازندت" in t_lower or "کی ساختت" in t_lower:
-            send_message(chat_id, f"👨‍💻 سازنده من **{CREATOR_NAME}** است.\n🆔 آیدی: {CREATOR_ID}")
-            return
-        if "یادم بنداز" in t_lower or "یادآور" in t_lower:
-            send_message(chat_id, create_reminder(user_id, chat_id, text))
-            return
-        if "هواشناسی" in t_lower:
-            city = re.sub(r"هواشناسی|آب.?وهوا|دمای هوا", "", text, flags=re.IGNORECASE).strip(" ؟?،")
-            send_message(chat_id, get_weather(city) if city else "نام شهر را هم بنویس.")
-            return
-        if "جستجو" in t_lower or "بگرد" in t_lower:
-            send_message(chat_id, "🔍 در حال جستجو...")
-            results = search_web(text)
-            if results:
-                answer = call_ai(user_id, f"بر اساس نتایج زیر پاسخ بده:\n{results}\n\nسوال: {text}")
-                send_message(chat_id, answer)
-            else: send_message(chat_id, "جستجو ناموفق بود.")
-            return
-
-        # چت عادی
-        send_message(chat_id, "⏳ در حال پردازش...")
-        answer = call_ai(user_id, text)
-        send_message(chat_id, answer)
-
-    elif "callback_query" in update:
-        cb = update["callback_query"]
-        chat_id = cb["message"]["chat"]["id"]
-        user_id = cb["from"]["id"]
-        data = cb["data"]
-        if data == "menu:ai": send_message(chat_id, "سؤالت را بنویس.")
-        elif data == "menu:weather": send_message(chat_id, "نام شهر را بنویس (مثلاً: تهران)")
-        elif data == "menu:search": send_message(chat_id, "عبارت موردنظر را با کلمه جستجو بفرست.")
-        elif data == "menu:creator": send_message(chat_id, f"👨‍💻 سازنده من **{CREATOR_NAME}** است.\n🆔 آیدی: {CREATOR_ID}")
-        elif data == "settings:clear":
-            HISTORY[str(user_id)] = []
-            save_json(HISTORY_FILE, HISTORY)
-            send_message(chat_id, "🧹 حافظه پاک شد.")
-
-# =========================================================
-# 7. WORKERS & FLASK
-# =========================================================
 def polling_worker():
     offset = None
     while True:
         try:
-            payload = {"timeout": 30, "limit": 20}
+            payload = {"timeout": 30}
             if offset is not None: payload["offset"] = offset
             res = splus_call("getUpdates", payload)
             for update in res.get("result", []):
                 offset = update["update_id"] + 1
-                threading.Thread(target=process_update, args=(update,), daemon=True).start()
-        except Exception: time.sleep(3)
-
-def reminder_worker():
-    while True:
-        try:
-            now = time.time()
-            due = [r for r in REMINDERS if r["timestamp"] <= now]
-            if due:
-                REMINDERS[:] = [r for r in REMINDERS if r["timestamp"] > now]
-                save_json(REMINDERS_FILE, REMINDERS)
-                for r in due: send_message(r["chat_id"], f"⏰ یادآوری:\n{r['text']}")
-        except Exception: pass
-        time.sleep(10)
+                if "message" in update:
+                    msg = update["message"]
+                    chat_id = msg["chat"]["id"]
+                    text = msg.get("text", "")
+                    if text == "/start":
+                        send_message(chat_id, "ربات روشن است.")
+                    else:
+                        send_message(chat_id, "در حال فکر کردن...")
+                        answer = call_ai(text)
+                        send_message(chat_id, answer)
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(3)
 
 app = Flask(__name__)
 
 @app.route("/")
-@app.route("/health")
-def health(): return jsonify({"status": "ok"}), 200
-
-def main():
-    print("Super Bot starting...", flush=True)
-    threading.Thread(target=polling_worker, daemon=True).start()
-    threading.Thread(target=reminder_worker, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
+def home(): return "Alive", 200
 
 if __name__ == "__main__":
-    main()
+    threading.Thread(target=polling_worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=Pتوکن

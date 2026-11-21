@@ -10,7 +10,7 @@ from flask import Flask, jsonify
 # =========================================================
 # 1. CONFIG (تنظیمات)
 # =========================================================
-# ⚠️ فقط توکن ربات سروش رو بین دو تا "" زیر بذار (دیگه هیچ کلید دیگه‌ای لازم نیست)
+# ⚠️ فقط توکن ربات سروش رو اینجا بذار (هیچ کلید دیگه‌ای لازم نیست)
 BOT_TOKEN = "70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0"
 
 PORT = int(os.getenv("PORT", "8080"))
@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger("superbot")
 
 # =========================================================
-# 2. AI ENGINE (استفاده از جدیدترین API رایگان)
+# 2. AI ENGINE (بدون کلید - متصل به LLM7)
 # =========================================================
 def call_ai(prompt):
     messages = [
@@ -32,18 +32,18 @@ def call_ai(prompt):
         {"role": "user", "content": prompt}
     ]
     
-    # استفاده از درگاه جدید و پایدار Pollinations
-    url = "https://gen.pollinations.ai/v1/chat/completions"
+    # استفاده از API رایگان و بدون کلید LLM7
+    url = "https://api.llm7.io/v1/chat/completions"
     payload = {
-        "model": "openai",
+        "model": "gpt-4o-mini",
         "messages": messages,
         "temperature": 0.1,
         "max_tokens": 150
     }
     
     try:
-        logger.info("در حال ارسال به هوش مصنوعی...")
-        resp = requests.post(url, json=payload, timeout=20)
+        logger.info("در حال ارسال به هوش مصنوعی (LLM7)...")
+        resp = requests.post(url, json=payload, timeout=15)
         logger.info(f"وضعیت پاسخ: {resp.status_code}")
         
         if resp.status_code == 200:
@@ -56,7 +56,18 @@ def call_ai(prompt):
     except Exception as e:
         logger.error(f"خطای شبکه: {e}")
 
-    return "⚠️ هوش مصنوعی فعلاً در دسترس نیست. لطفاً بعداً امتحان کنید."
+    # اگر LLM7 خطا داد، برو سراغ Pollinations
+    try:
+        logger.info("تلاش مجدد با Pollinations...")
+        url = "https://text.pollinations.ai/openai"
+        payload = {"model": "openai", "messages": messages}
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"خطای Pollinations: {e}")
+
+    return "⚠️ هوش مصنوعی فعلاً در دسترس نیست."
 
 # =========================================================
 # 3. SOROUSH HELPERS
@@ -66,7 +77,7 @@ def splus_call(method, payload):
         r = requests.post(f"{BOT_API}/{method}", json=payload, timeout=20)
         return r.json()
     except Exception as e:
-        logger.error(f"Soroush API Error: {e}")
+        logger.error(f"خطای سروش: {e}")
         return {}
 
 def send_message(chat_id, text):
@@ -104,7 +115,7 @@ def polling_worker():
                 offset = update["update_id"] + 1
                 threading.Thread(target=process_update, args=(update,), daemon=True).start()
         except Exception as e:
-            logger.error(f"Polling Error: {e}")
+            logger.error(f"خطای دریافت پیام: {e}")
             time.sleep(3)
 
 # =========================================================

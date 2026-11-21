@@ -7,55 +7,84 @@ import requests
 
 from flask import Flask, jsonify
 
-# ---------------- CONFIG ----------------
+# ================= CONFIG =================
 
-BOT_TOKEN = os.getenv("70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0")
-
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
 
-BOT_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
-
-AI_API = (
-    f"https://api.cloudflare.com/client/v4/accounts/"
-    f"{CF_ACCOUNT_ID}/ai/v1/chat/completions"
-)
-
-SYSTEM_PROMPT = """
-تو یک دستیار هوش مصنوعی فارسی‌زبان به نام Nepton هستی.
-به زبان کاربر پاسخ بده.
-پاسخ‌ها دقیق، مفید، حرفه‌ای و قابل فهم باشند.
-در صورت نیاز توضیحات را مرحله‌بندی کن.
-از اطلاعات ساختگی خودداری کن.
-"""
+# ================= LOGGING =================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-app = Flask(__name__)
+logger = logging.getLogger("Nepton")
 
+app = Flask(__name__)
 session = requests.Session()
 
-# Conversation memory
 histories = {}
 history_lock = threading.Lock()
 
-# ---------------- CLOUDFLARE AI ----------------
+SYSTEM_PROMPT = """
+تو Nepton هستی، یک دستیار هوش مصنوعی حرفه‌ای.
+به زبان کاربر پاسخ بده.
+پاسخ‌ها دقیق، واضح و مفید باشند.
+اطلاعات نامطمئن را قطعی بیان نکن.
+"""
+
+# ================= ENV CHECK =================
+
+def check_environment():
+
+    variables = {
+        "BOT_TOKEN": BOT_TOKEN,
+        "CLOUDFLARE_ACCOUNT_ID": CF_ACCOUNT_ID,
+        "CLOUDFLARE_API_TOKEN": CF_API_TOKEN
+    }
+
+    missing = [
+        name for name, value in variables.items()
+        if not value or not value.strip()
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Missing environment variables: "
+            + ", ".join(missing)
+        )
+
+
+# ================= API URLS =================
+
+BOT_API = (
+    f"https://api.splus.ir/bot{BOT_TOKEN}"
+    if BOT_TOKEN else ""
+)
+
+AI_API = (
+    f"https://api.cloudflare.com/client/v4/accounts/"
+    f"{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    if CF_ACCOUNT_ID else ""
+)
+
+
+# ================= CLOUDFLARE AI =================
 
 def call_ai(chat_id, prompt):
 
     with history_lock:
-        history = histories.get(chat_id, [])
+        history = list(histories.get(chat_id, []))
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ] + history + [
-            {"role": "user", "content": prompt}
-        ]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ] + history + [
+        {"role": "user", "content": prompt}
+    ]
 
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
@@ -76,6 +105,13 @@ def call_ai(chat_id, prompt):
         timeout=90
     )
 
+    if not response.ok:
+        logger.error(
+            "Cloudflare error: HTTP %s - %s",
+            response.status_code,
+            response.text[:1500]
+        )
+
     response.raise_for_status()
 
     data = response.json()
@@ -86,29 +122,24 @@ def call_ai(chat_id, prompt):
         raise ValueError("Empty AI response")
 
     with history_lock:
-        history.append({
-            "role": "user",
-            "content": prompt
-        })
+        history = histories.get(chat_id, [])
 
-        history.append({
-            "role": "assistant",
-            "content": answer
-        })
+        history.extend([
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": answer}
+        ])
 
         histories[chat_id] = history[-20:]
 
     return answer
 
 
-# ---------------- SOROUSH API ----------------
+# ================= SOROUSH API =================
 
 def splus_call(method, data=None):
 
-    url = f"{BOT_API}/{method}"
-
     response = session.post(
-        url,
+        f"{BOT_API}/{method}",
         json=data or {},
         timeout=40
     )
@@ -123,23 +154,20 @@ def splus_call(method, data=None):
     return result
 
 
-def send_message(chat_id, text):
+def send_message(chat_id, message):
 
-    # Soroush message length protection
-    for i in range(0, len(text), 3500):
-
-        chunk = text[i:i + 3500]
+    for start in range(0, len(message), 3500):
 
         splus_call(
             "sendMessage",
             {
                 "chat_id": chat_id,
-                "text": chunk
+                "text": message[start:start + 3500]
             }
         )
 
 
-# ---------------- MESSAGE PROCESSING ----------------
+# ================= MESSAGE HANDLER =================
 
 def process_update(update):
 
@@ -159,7 +187,7 @@ def process_update(update):
     chat_id = chat.get("id") or sender.get("id")
 
     if not chat_id:
-        logging.warning("Chat ID not found")
+        logger.warning("Chat ID not found")
         return
 
     text = text.strip()
@@ -168,55 +196,71 @@ def process_update(update):
         return
 
     if text == "/start":
+
         send_message(
             chat_id,
             "سلام! من Nepton هستم.\n"
-            "دستیار هوش مصنوعی شما با قدرت Cloudflare AI."
+            "چطور می‌توانم کمکت کنم؟"
         )
+
         return
 
     if text == "/reset":
+
         with history_lock:
             histories.pop(chat_id, None)
 
         send_message(chat_id, "حافظه مکالمه پاک شد.")
+
         return
 
     try:
-        logging.info("Processing message from %s", chat_id)
+
+        logger.info("New message received")
 
         answer = call_ai(chat_id, text)
 
         send_message(chat_id, answer)
 
-        logging.info("AI response sent successfully")
+        logger.info("Message sent successfully")
 
-    except requests.HTTPError as e:
-        logging.exception("HTTP error: %s", e)
-        send_message(
-            chat_id,
-            "خطا در ارتباط با سرویس هوش مصنوعی. لطفاً دوباره تلاش کن."
-        )
+    except requests.HTTPError as error:
+
+        logger.exception("HTTP error")
+
+        try:
+            send_message(
+                chat_id,
+                "خطا در ارتباط با سرویس هوش مصنوعی."
+            )
+        except Exception:
+            logger.exception("Failed to send error message")
 
     except Exception:
-        logging.exception("Message processing failed")
-        send_message(
-            chat_id,
-            "در پردازش پیام مشکلی پیش آمد."
-        )
+
+        logger.exception("Message processing error")
+
+        try:
+            send_message(
+                chat_id,
+                "در پردازش پیام مشکلی پیش آمد."
+            )
+        except Exception:
+            logger.exception("Failed to send error message")
 
 
-# ---------------- POLLING ----------------
+# ================= POLLING =================
 
 def polling_worker():
 
     offset = None
 
-    logging.info("Soroush polling started")
+    logger.info("Soroush polling started")
 
     while True:
 
         try:
+
             params = {}
 
             if offset is not None:
@@ -235,9 +279,7 @@ def polling_worker():
             if data.get("ok") is False:
                 raise RuntimeError(str(data))
 
-            updates = data.get("result", [])
-
-            for update in updates:
+            for update in data.get("result", []):
 
                 update_id = update.get("update_id")
 
@@ -247,30 +289,37 @@ def polling_worker():
                 process_update(update)
 
         except Exception:
-            logging.exception("Polling error")
+
+            logger.exception("Polling error")
+
             time.sleep(5)
 
 
-# ---------------- FLASK ----------------
+# ================= FLASK =================
 
 @app.route("/")
 def home():
-    return "Nepton AI Bot is running"
+
+    return "Nepton AI is running"
 
 
 @app.route("/health")
 def health():
+
     return jsonify({
         "status": "online",
-        "ai_provider": "Cloudflare Workers AI",
+        "provider": "Cloudflare Workers AI",
         "model": MODEL
     })
 
 
-# ---------------- START ----------------
+# ================= START =================
 
-if not BOT_TOKEN or not CF_ACCOUNT_ID or not CF_API_TOKEN:
-    raise RuntimeError("Missing required environment variables")
+check_environment()
+
+logger.info("Environment variables verified")
+logger.info("AI provider: Cloudflare Workers AI")
+logger.info("Model: %s", MODEL)
 
 threading.Thread(
     target=polling_worker,

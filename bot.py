@@ -7,7 +7,7 @@ import requests
 
 from flask import Flask, jsonify
 
-# ================= CONFIG =================
+# ================ CONFIG ================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
@@ -15,7 +15,14 @@ CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
 
-# ================= LOGGING =================
+SYSTEM_PROMPT = """
+تو Nepton هستی، یک دستیار هوش مصنوعی فارسی زبان.
+به زبان کاربر پاسخ بده.
+پاسخ‌ها دقیق، حرفه‌ای و قابل فهم باشند.
+از اطلاعات ساختگی خودداری کن.
+"""
+
+# ================ LOGGING ================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,14 +37,7 @@ session = requests.Session()
 histories = {}
 history_lock = threading.Lock()
 
-SYSTEM_PROMPT = """
-تو Nepton هستی، یک دستیار هوش مصنوعی حرفه‌ای.
-به زبان کاربر پاسخ بده.
-پاسخ‌ها دقیق، واضح و مفید باشند.
-اطلاعات نامطمئن را قطعی بیان نکن.
-"""
-
-# ================= ENV CHECK =================
+# ================ ENVIRONMENT ================
 
 def check_environment():
 
@@ -54,12 +54,9 @@ def check_environment():
 
     if missing:
         raise RuntimeError(
-            "Missing environment variables: "
-            + ", ".join(missing)
+            "Missing variables: " + ", ".join(missing)
         )
 
-
-# ================= API URLS =================
 
 BOT_API = (
     f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -68,12 +65,11 @@ BOT_API = (
 
 AI_API = (
     f"https://api.cloudflare.com/client/v4/accounts/"
-    f"{CF_ACCOUNT_ID}/ai/v1/chat/completions"
+    f"{CF_ACCOUNT_ID}/ai/run/{MODEL}"
     if CF_ACCOUNT_ID else ""
 )
 
-
-# ================= CLOUDFLARE AI =================
+# ================ CLOUDFLARE AI ================
 
 def call_ai(chat_id, prompt):
 
@@ -92,56 +88,86 @@ def call_ai(chat_id, prompt):
     }
 
     payload = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.7,
-        "max_tokens": 1500
+        "messages": messages
     }
 
-    response = session.post(
-        AI_API,
-        headers=headers,
-        json=payload,
-        timeout=90
-    )
+    for attempt in range(2):
 
-    if not response.ok:
-        logger.error(
-            "Cloudflare error: HTTP %s - %s",
-            response.status_code,
-            response.text[:1500]
-        )
+        try:
 
-    response.raise_for_status()
+            logger.info(
+                "Cloudflare request attempt %s",
+                attempt + 1
+            )
 
-    data = response.json()
+            response = session.post(
+                AI_API,
+                headers=headers,
+                json=payload,
+                timeout=(15, 180)
+            )
 
-    answer = data["choices"][0]["message"]["content"]
+            if not response.ok:
+                logger.error(
+                    "Cloudflare HTTP %s: %s",
+                    response.status_code,
+                    response.text[:1000]
+                )
 
-    if not answer:
-        raise ValueError("Empty AI response")
+            response.raise_for_status()
 
-    with history_lock:
-        history = histories.get(chat_id, [])
+            data = response.json()
 
-        history.extend([
-            {"role": "user", "content": prompt},
-            {"role": "assistant", "content": answer}
-        ])
+            if not data.get("success", True):
+                raise RuntimeError(
+                    "Cloudflare API error: "
+                    + str(data.get("errors", []))
+                )
 
-        histories[chat_id] = history[-20:]
+            result = data.get("result", {})
+            answer = result.get("response")
 
-    return answer
+            if not answer:
+                raise ValueError(
+                    "Cloudflare returned an empty response"
+                )
+
+            with history_lock:
+
+                history = histories.get(chat_id, [])
+
+                history.extend([
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer}
+                ])
+
+                histories[chat_id] = history[-20:]
+
+            return answer
+
+        except requests.exceptions.Timeout:
+
+            logger.warning(
+                "Cloudflare timeout on attempt %s",
+                attempt + 1
+            )
+
+            if attempt == 1:
+                raise
+
+            time.sleep(3)
+
+    raise RuntimeError("Cloudflare request failed")
 
 
-# ================= SOROUSH API =================
+# ================ SOROUSH API ================
 
 def splus_call(method, data=None):
 
     response = session.post(
         f"{BOT_API}/{method}",
         json=data or {},
-        timeout=40
+        timeout=(15, 40)
     )
 
     response.raise_for_status()
@@ -167,7 +193,7 @@ def send_message(chat_id, message):
         )
 
 
-# ================= MESSAGE HANDLER =================
+# ================ MESSAGE HANDLER ================
 
 def process_update(update):
 
@@ -187,7 +213,6 @@ def process_update(update):
     chat_id = chat.get("id") or sender.get("id")
 
     if not chat_id:
-        logger.warning("Chat ID not found")
         return
 
     text = text.strip()
@@ -210,7 +235,10 @@ def process_update(update):
         with history_lock:
             histories.pop(chat_id, None)
 
-        send_message(chat_id, "حافظه مکالمه پاک شد.")
+        send_message(
+            chat_id,
+            "حافظه مکالمه پاک شد."
+        )
 
         return
 
@@ -222,34 +250,35 @@ def process_update(update):
 
         send_message(chat_id, answer)
 
-        logger.info("Message sent successfully")
+        logger.info("Response sent successfully")
 
-    except requests.HTTPError as error:
+    except requests.exceptions.Timeout:
 
-        logger.exception("HTTP error")
+        logger.exception("Request timeout")
 
         try:
             send_message(
                 chat_id,
-                "خطا در ارتباط با سرویس هوش مصنوعی."
+                "سرویس هوش مصنوعی دیر پاسخ داد. "
+                "لطفاً چند لحظه دیگر دوباره تلاش کن."
             )
         except Exception:
-            logger.exception("Failed to send error message")
+            logger.exception("Failed to send timeout message")
 
     except Exception:
 
-        logger.exception("Message processing error")
+        logger.exception("Message processing failed")
 
         try:
             send_message(
                 chat_id,
-                "در پردازش پیام مشکلی پیش آمد."
+                "در پردازش پیام مشکلی ایجاد شد."
             )
         except Exception:
             logger.exception("Failed to send error message")
 
 
-# ================= POLLING =================
+# ================ POLLING ================
 
 def polling_worker():
 
@@ -269,7 +298,7 @@ def polling_worker():
             response = session.get(
                 f"{BOT_API}/getUpdates",
                 params=params,
-                timeout=40
+                timeout=(15, 40)
             )
 
             response.raise_for_status()
@@ -291,11 +320,10 @@ def polling_worker():
         except Exception:
 
             logger.exception("Polling error")
-
             time.sleep(5)
 
 
-# ================= FLASK =================
+# ================ FLASK ================
 
 @app.route("/")
 def home():
@@ -313,7 +341,7 @@ def health():
     })
 
 
-# ================= START =================
+# ================ START ================
 
 check_environment()
 

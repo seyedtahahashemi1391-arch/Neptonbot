@@ -1,380 +1,279 @@
 
-# -*- coding: utf-8 -*-
-
 import os
-import re
 import time
 import logging
+import threading
 import requests
 
 from flask import Flask, jsonify
 
-# =========================================================
-# 1. CONFIG
-# =========================================================
+# ---------------- CONFIG ----------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0")
+BOT_TOKEN = os.getenv("70955089:Ia9F-M498sILiCXKaY3tV716x1MgUQw2HE0")
 
-PORT = int(os.getenv("PORT", "8080"))
+CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CF_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 
-API_BASE = "https://api.splus.ir"
-BOT_API = f"{API_BASE}/bot{BOT_TOKEN}"
+MODEL = "@cf/zai-org/glm-4.7-flash"
 
-# LLM7 + DeepSeek
-LLM7_URL = "https://api.llm7.io/v1/chat/completions"
+BOT_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 
-# قابل تغییر از تنظیمات Render
-LLM7_MODEL = os.getenv(
-    "LLM7_MODEL",
-    "deepseek-v4-flash:0731"
+AI_API = (
+    f"https://api.cloudflare.com/client/v4/accounts/"
+    f"{CF_ACCOUNT_ID}/ai/v1/chat/completions"
 )
 
-CREATOR_NAME = "Nepton"
-CREATOR_ID = "@t91m62"
-
-# =========================================================
-# 2. LOGGING
-# =========================================================
+SYSTEM_PROMPT = """
+تو یک دستیار هوش مصنوعی فارسی‌زبان به نام Nepton هستی.
+به زبان کاربر پاسخ بده.
+پاسخ‌ها دقیق، مفید، حرفه‌ای و قابل فهم باشند.
+در صورت نیاز توضیحات را مرحله‌بندی کن.
+از اطلاعات ساختگی خودداری کن.
+"""
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-logger = logging.getLogger("superbot")
-
-# =========================================================
-# 3. HTTP SESSION
-# =========================================================
+app = Flask(__name__)
 
 session = requests.Session()
 
-session.headers.update({
-    "Content-Type": "application/json",
-    "User-Agent": "Nepton-Soroush-Bot/2.0"
-})
+# Conversation memory
+histories = {}
+history_lock = threading.Lock()
 
-# =========================================================
-# 4. AI ENGINE - DEEPSEEK
-# =========================================================
+# ---------------- CLOUDFLARE AI ----------------
 
-def call_ai(prompt):
+def call_ai(chat_id, prompt):
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "تو یک دستیار فارسی زبان هستی. "
-                "پاسخ‌ها باید دقیق، صحیح، واضح و مفید باشند. "
-                "به زبان کاربر پاسخ بده. "
-                "از ارائه اطلاعات ساختگی خودداری کن."
-            )
-        },
-        {
-            "role": "user",
-            "content": prompt
-        }
-    ]
+    with history_lock:
+        history = histories.get(chat_id, [])
 
-    payload = {
-        "model": LLM7_MODEL,
-        "messages": messages,
-        "temperature": 0.2,
-        "max_tokens": 500
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ] + history + [
+            {"role": "user", "content": prompt}
+        ]
+
+    headers = {
+        "Authorization": f"Bearer {CF_API_TOKEN}",
+        "Content-Type": "application/json"
     }
 
-    for attempt in range(1, 4):
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1500
+    }
 
-        try:
-            logger.info(
-                f"DeepSeek request | Attempt {attempt}/3"
-            )
-
-            response = session.post(
-                LLM7_URL,
-                json=payload,
-                timeout=(10, 45)
-            )
-
-            logger.info(
-                f"LLM7 HTTP Status: {response.status_code}"
-            )
-
-            if response.status_code == 200:
-
-                data = response.json()
-
-                answer = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content")
-                )
-
-                if isinstance(answer, str) and answer.strip():
-
-                    answer = re.sub(
-                        r"<thought>.*?</thought>",
-                        "",
-                        answer,
-                        flags=re.DOTALL
-                    ).strip()
-
-                    if answer:
-                        logger.info("DeepSeek response received")
-                        return answer
-
-                logger.error("Empty or invalid AI response")
-
-                return "پاسخ معتبری از هوش مصنوعی دریافت نشد."
-
-            # خطاهای موقت
-            if response.status_code in (408, 429, 500, 502, 503, 504):
-
-                logger.warning(
-                    f"Temporary API error: {response.text[:300]}"
-                )
-
-                if attempt < 3:
-                    time.sleep(attempt * 2)
-                    continue
-
-            # خطاهای دائمی یا تنظیمات اشتباه
-            logger.error(
-                f"LLM7 API Error: {response.text[:500]}"
-            )
-
-            return "ارتباط با هوش مصنوعی با خطا مواجه شد."
-
-        except requests.exceptions.Timeout:
-
-            logger.warning(
-                f"DeepSeek timeout | Attempt {attempt}/3"
-            )
-
-        except requests.exceptions.ConnectionError:
-
-            logger.warning(
-                f"Network error | Attempt {attempt}/3"
-            )
-
-        except (ValueError, KeyError, IndexError) as e:
-
-            logger.exception(f"Invalid AI response: {e}")
-
-            return "پاسخ دریافتی از هوش مصنوعی معتبر نیست."
-
-        except Exception as e:
-
-            logger.exception(f"Unexpected AI error: {e}")
-
-            return "خطای غیرمنتظره در هوش مصنوعی رخ داد."
-
-        if attempt < 3:
-            time.sleep(attempt * 2)
-
-    logger.error("All AI attempts failed")
-
-    return "هوش مصنوعی فعلاً پاسخگو نیست. کمی بعد دوباره امتحان کن."
-
-# =========================================================
-# 5. SOROUSH API
-# =========================================================
-
-def splus_call(method, payload):
-
-    try:
-
-        response = session.post(
-            f"{BOT_API}/{method}",
-            json=payload,
-            timeout=(10, 40)
-        )
-
-        if response.status_code != 200:
-
-            logger.error(
-                f"Soroush HTTP Error: {response.status_code}"
-            )
-
-            return {}
-
-        data = response.json()
-
-        if data.get("ok") is False:
-            logger.error(f"Soroush API Error: {data}")
-
-        return data
-
-    except Exception as e:
-
-        logger.exception(f"Soroush connection error: {e}")
-
-        return {}
-
-
-def send_message(chat_id, message):
-
-    return splus_call(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": str(message)[:4000]
-        }
+    response = session.post(
+        AI_API,
+        headers=headers,
+        json=payload,
+        timeout=90
     )
 
-# =========================================================
-# 6. MESSAGE HANDLER
-# =========================================================
+    response.raise_for_status()
+
+    data = response.json()
+
+    answer = data["choices"][0]["message"]["content"]
+
+    if not answer:
+        raise ValueError("Empty AI response")
+
+    with history_lock:
+        history.append({
+            "role": "user",
+            "content": prompt
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        histories[chat_id] = history[-20:]
+
+    return answer
+
+
+# ---------------- SOROUSH API ----------------
+
+def splus_call(method, data=None):
+
+    url = f"{BOT_API}/{method}"
+
+    response = session.post(
+        url,
+        json=data or {},
+        timeout=40
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if result.get("ok") is False:
+        raise RuntimeError(str(result))
+
+    return result
+
+
+def send_message(chat_id, text):
+
+    # Soroush message length protection
+    for i in range(0, len(text), 3500):
+
+        chunk = text[i:i + 3500]
+
+        splus_call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": chunk
+            }
+        )
+
+
+# ---------------- MESSAGE PROCESSING ----------------
 
 def process_update(update):
 
+    message = update.get("message")
+
+    if not message:
+        return
+
+    text = message.get("text")
+
+    if not text:
+        return
+
+    chat = message.get("chat") or {}
+    sender = message.get("from") or {}
+
+    chat_id = chat.get("id") or sender.get("id")
+
+    if not chat_id:
+        logging.warning("Chat ID not found")
+        return
+
+    text = text.strip()
+
+    if not text:
+        return
+
+    if text == "/start":
+        send_message(
+            chat_id,
+            "سلام! من Nepton هستم.\n"
+            "دستیار هوش مصنوعی شما با قدرت Cloudflare AI."
+        )
+        return
+
+    if text == "/reset":
+        with history_lock:
+            histories.pop(chat_id, None)
+
+        send_message(chat_id, "حافظه مکالمه پاک شد.")
+        return
+
     try:
+        logging.info("Processing message from %s", chat_id)
 
-        if "message" not in update:
-            return
+        answer = call_ai(chat_id, text)
 
-        msg = update["message"]
+        send_message(chat_id, answer)
 
-        chat_id = msg["chat"]["id"]
+        logging.info("AI response sent successfully")
 
-        text = (msg.get("text") or "").strip()
-
-        if not text:
-            return
-
-        logger.info(f"New message received: {text[:100]}")
-
-        # Start command
-        if text == "/start":
-
-            send_message(
-                chat_id,
-                "سلام! ربات Nepton روشن است.\nهر سوالی داری بپرس."
-            )
-
-            return
-
-        # Creator information
-        if "سازندت" in text or "کی ساختت" in text:
-
-            send_message(
-                chat_id,
-                f"سازنده من {CREATOR_NAME} است.\nآیدی: {CREATOR_ID}"
-            )
-
-            return
-
-        # Processing message
+    except requests.HTTPError as e:
+        logging.exception("HTTP error: %s", e)
         send_message(
             chat_id,
-            "⏳ در حال پردازش..."
+            "خطا در ارتباط با سرویس هوش مصنوعی. لطفاً دوباره تلاش کن."
         )
 
-        answer = call_ai(text)
-
+    except Exception:
+        logging.exception("Message processing failed")
         send_message(
             chat_id,
-            answer
+            "در پردازش پیام مشکلی پیش آمد."
         )
 
-        logger.info("Message processed successfully")
 
-    except Exception as e:
-
-        logger.exception(f"Message processing error: {e}")
-
-# =========================================================
-# 7. POLLING WORKER
-# =========================================================
+# ---------------- POLLING ----------------
 
 def polling_worker():
 
     offset = None
 
-    logger.info("Soroush polling started")
+    logging.info("Soroush polling started")
 
     while True:
 
         try:
-
-            payload = {
-                "timeout": 30
-            }
+            params = {}
 
             if offset is not None:
-                payload["offset"] = offset
+                params["offset"] = offset
 
-            result = splus_call(
-                "getUpdates",
-                payload
+            response = session.get(
+                f"{BOT_API}/getUpdates",
+                params=params,
+                timeout=40
             )
 
-            updates = result.get("result", [])
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("ok") is False:
+                raise RuntimeError(str(data))
+
+            updates = data.get("result", [])
 
             for update in updates:
 
                 update_id = update.get("update_id")
 
-                if update_id is None:
-                    continue
-
-                # ثبت شناسه قبل از پردازش
-                offset = update_id + 1
+                if update_id is not None:
+                    offset = update_id + 1
 
                 process_update(update)
 
-        except Exception as e:
-
-            logger.exception(
-                f"Polling error: {e}"
-            )
-
+        except Exception:
+            logging.exception("Polling error")
             time.sleep(5)
 
-# =========================================================
-# 8. FLASK SERVER
-# =========================================================
 
-app = Flask(__name__)
-
+# ---------------- FLASK ----------------
 
 @app.route("/")
+def home():
+    return "Nepton AI Bot is running"
+
+
 @app.route("/health")
 def health():
-
     return jsonify({
-        "status": "ok",
-        "bot": "Nepton",
-        "ai": "DeepSeek via LLM7",
-        "model": LLM7_MODEL
-    }), 200
+        "status": "online",
+        "ai_provider": "Cloudflare Workers AI",
+        "model": MODEL
+    })
 
 
-# =========================================================
-# 9. STARTUP
-# =========================================================
+# ---------------- START ----------------
 
-if __name__ == "__main__":
+if not BOT_TOKEN or not CF_ACCOUNT_ID or not CF_API_TOKEN:
+    raise RuntimeError("Missing required environment variables")
 
-    logger.info("Starting Nepton Bot...")
-
-    if not BOT_TOKEN:
-
-        logger.critical("BOT_TOKEN is missing!")
-
-        raise SystemExit(1)
-
-    import threading
-
-    worker = threading.Thread(
-        target=polling_worker,
-        daemon=True
-    )
-
-    worker.start()
-
-    app.run(
-        host="0.0.0.0",
-        port=PORT,
-        threaded=True
-    )
+threading.Thread(
+    target=polling_worker,
+    daemon=True,
+    name="soroush-polling"
+).start()

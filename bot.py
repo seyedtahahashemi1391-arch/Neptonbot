@@ -1,4 +1,6 @@
+
 import os
+import re
 import time
 import logging
 import threading
@@ -17,25 +19,33 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.2.5"
-ADMIN_USERNAME = "t91m62"  # Username only; never use it as chat_id.
+VERSION = "2.2.6"
+ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 CLOUDFLARE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
+
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
+
 MAX_HISTORY_MESSAGES = 12
 MAX_CONVERSATIONS = 500
 MAX_MESSAGE_LENGTH = 3500
 MAX_PARALLEL_CHATS = 3
 MAX_QUEUED_MESSAGES = 1000
+
 POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
 MAX_WORKER_RETRIES = 2
+
+CREATOR_ANSWER = (
+    "من توسط نپتون ساخته شدم. "
+    "آیدی سازنده‌ام در بیوگرافی من قرار دارد."
+)
 
 SYSTEM_PROMPT = (
     "تو دستیار هوش مصنوعی Nepton هستی. "
@@ -46,7 +56,9 @@ SYSTEM_PROMPT = (
     "اطلاعات متغیر مانند قیمت، رتبه‌بندی و وضعیت روز را بدون منبع به‌روز قطعی اعلام نکن. "
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
     "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
-    "اگر کاربر پرسید چه کسی تو را ساخته یا سازنده‌ات کیست، پاسخ بده: «من نپتون هستم و توسط نپتون ساخته شده‌ام.» "
+    "اگر کاربر پرسید چه کسی تو را ساخته یا سازنده‌ات کیست، "
+    "پاسخ بده: «من توسط نپتون ساخته شدم. "
+    "آیدی سازنده‌ام در بیوگرافی من قرار دارد.» "
     "در پاسخ به این سؤال هرگز از عبارت «تیم نپتون» استفاده نکن."
 )
 
@@ -59,13 +71,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("NeptonBot")
 
-_missing = [name for name, value in (
-    ("BOT_TOKEN", BOT_TOKEN),
-    ("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID),
-    ("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN),
-) if not value]
+_missing = [
+    name
+    for name, value in (
+        ("BOT_TOKEN", BOT_TOKEN),
+        ("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID),
+        ("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN),
+    )
+    if not value
+]
+
 if _missing:
-    raise RuntimeError("Missing environment variables: " + ", ".join(_missing))
+    raise RuntimeError(
+        "Missing environment variables: " + ", ".join(_missing)
+    )
 
 logger.info("Environment variables verified")
 logger.info("NeptonBot version: %s", VERSION)
@@ -73,37 +92,48 @@ logger.info("AI provider: Cloudflare Workers AI")
 logger.info("Model: %s", MODEL)
 
 # =========================================================
-# HTTP sessions (one session per thread)
+# HTTP sessions
 # =========================================================
 _thread_local = threading.local()
 
 
 def _new_session():
     session = requests.Session()
+
     adapter = HTTPAdapter(
         pool_connections=4,
         pool_maxsize=4,
         max_retries=0,
         pool_block=True,
     )
+
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    session.headers.update({"User-Agent": f"NeptonBot/{VERSION}", "Accept": "application/json"})
+
+    session.headers.update({
+        "User-Agent": f"NeptonBot/{VERSION}",
+        "Accept": "application/json",
+    })
+
     return session
 
 
 def get_http_session(name):
     session = getattr(_thread_local, name, None)
+
     if session is None:
         session = _new_session()
         setattr(_thread_local, name, session)
+
     return session
 
+
 # =========================================================
-# In-memory conversation history and admin identity
+# Conversation history and admin identity
 # =========================================================
 conversation_history = OrderedDict()
 history_lock = threading.Lock()
+
 admin_lock = threading.Lock()
 admin_chat_id = None
 
@@ -111,8 +141,10 @@ admin_chat_id = None
 def get_history(chat_id):
     with history_lock:
         history = conversation_history.get(chat_id)
+
         if history is None:
             return []
+
         conversation_history.move_to_end(chat_id)
         return list(history)
 
@@ -120,12 +152,23 @@ def get_history(chat_id):
 def save_turn(chat_id, user_text, assistant_text):
     with history_lock:
         history = conversation_history.get(chat_id)
+
         if history is None:
             history = deque(maxlen=MAX_HISTORY_MESSAGES)
             conversation_history[chat_id] = history
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": assistant_text})
+
+        history.append({
+            "role": "user",
+            "content": user_text,
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": assistant_text,
+        })
+
         conversation_history.move_to_end(chat_id)
+
         while len(conversation_history) > MAX_CONVERSATIONS:
             conversation_history.popitem(last=False)
 
@@ -137,11 +180,17 @@ def reset_history(chat_id):
 
 def set_admin_chat_id(chat_id):
     global admin_chat_id
+
     if chat_id is None:
         return False
+
     with admin_lock:
         admin_chat_id = str(chat_id)
-    logger.info("Admin chat registered from verified sender username")
+
+    logger.info(
+        "Admin chat registered from verified sender username"
+    )
+
     return True
 
 
@@ -149,10 +198,12 @@ def get_admin_chat_id():
     with admin_lock:
         return admin_chat_id
 
+
 # =========================================================
 # Flask application
 # =========================================================
 app = Flask(__name__)
+
 _polling_thread = None
 _polling_stop = threading.Event()
 
@@ -171,12 +222,19 @@ def home():
 @app.get("/health")
 def health():
     thread = _polling_thread
+
     if thread is None or not thread.is_alive():
-        return jsonify({"status": "degraded", "polling": "stopped", "version": VERSION}), 503
+        return jsonify({
+            "status": "degraded",
+            "polling": "stopped",
+            "version": VERSION,
+        }), 503
+
     with _chat_queue_lock:
         pending = _pending_message_count
         chat_count = len(_chat_messages)
         waiting = _chat_queue.qsize()
+
     return jsonify({
         "status": "healthy",
         "polling": "running",
@@ -191,6 +249,7 @@ def health():
 
 class UserVisibleError(Exception):
     pass
+
 
 # =========================================================
 # Cloudflare Workers AI
@@ -212,81 +271,184 @@ def cloudflare_post_with_retry(session, payload):
                 timeout=AI_TIMEOUT,
                 allow_redirects=False,
             )
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ):
             if attempt == 0:
-                logger.warning("Temporary Cloudflare network failure; retrying once")
+                logger.warning(
+                    "Temporary Cloudflare network failure; retrying once"
+                )
                 continue
+
             raise
+
         if response.status_code in (500, 502, 503, 504) and attempt == 0:
             status = response.status_code
             response.close()
-            logger.warning("Cloudflare HTTP %s; retrying once", status)
+
+            logger.warning(
+                "Cloudflare HTTP %s; retrying once",
+                status,
+            )
+
             continue
+
         return response
-    raise requests.exceptions.ConnectionError("Cloudflare request failed after retry")
+
+    raise requests.exceptions.ConnectionError(
+        "Cloudflare request failed after retry"
+    )
 
 
 def call_ai(chat_id, user_text):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
+
     messages.extend(get_history(chat_id))
-    messages.append({"role": "user", "content": user_text})
+
+    messages.append({
+        "role": "user",
+        "content": user_text,
+    })
+
     payload = {
         "model": MODEL,
         "messages": messages,
         "temperature": 0.5,
         "max_completion_tokens": 2048,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
         "stream": False,
     }
+
     session = get_http_session("cloudflare_session")
     started = time.perf_counter()
+
     try:
-        with cloudflare_post_with_retry(session, payload) as response:
+        with cloudflare_post_with_retry(
+            session,
+            payload,
+        ) as response:
+
             if not 200 <= response.status_code < 300:
-                logger.error("Cloudflare HTTP error: status=%s", response.status_code)
+                logger.error(
+                    "Cloudflare HTTP error: status=%s",
+                    response.status_code,
+                )
+
                 if response.status_code == 429:
-                    raise UserVisibleError("تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. کمی بعد دوباره تلاش کن.")
-                raise UserVisibleError("سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست.")
+                    raise UserVisibleError(
+                        "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
+                        "کمی بعد دوباره تلاش کن."
+                    )
+
+                raise UserVisibleError(
+                    "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
+                )
+
             try:
                 data = response.json()
+
             except ValueError as exc:
-                logger.error("Cloudflare returned invalid JSON")
-                raise UserVisibleError("پاسخ سرویس هوش مصنوعی قابل پردازش نبود.") from exc
+                logger.error(
+                    "Cloudflare returned invalid JSON"
+                )
+
+                raise UserVisibleError(
+                    "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
+                ) from exc
+
     except UserVisibleError:
         raise
+
     except requests.exceptions.Timeout as exc:
         logger.warning("Cloudflare request timed out")
-        raise UserVisibleError("زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید.") from exc
+
+        raise UserVisibleError(
+            "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
+        ) from exc
+
     except requests.exceptions.RequestException as exc:
-        logger.error("Cloudflare network error: type=%s", type(exc).__name__)
-        raise UserVisibleError("ارتباط با سرویس هوش مصنوعی برقرار نشد.") from exc
+        logger.error(
+            "Cloudflare network error: type=%s",
+            type(exc).__name__,
+        )
+
+        raise UserVisibleError(
+            "ارتباط با سرویس هوش مصنوعی برقرار نشد."
+        ) from exc
+
     finally:
-        logger.info("TIMING cloudflare_request_ms=%.0f", (time.perf_counter() - started) * 1000)
+        logger.info(
+            "TIMING cloudflare_request_ms=%.0f",
+            (time.perf_counter() - started) * 1000,
+        )
 
     if not isinstance(data, dict):
-        raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
+        raise UserVisibleError(
+            "ساختار پاسخ هوش مصنوعی نامعتبر است."
+        )
+
     choices = data.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        logger.error("Cloudflare response has no valid choices")
-        raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
+
+    if (
+        not isinstance(choices, list)
+        or not choices
+        or not isinstance(choices[0], dict)
+    ):
+        logger.error(
+            "Cloudflare response has no valid choices"
+        )
+
+        raise UserVisibleError(
+            "مدل نتوانست پاسخ معتبری تولید کند."
+        )
+
     message = choices[0].get("message")
+
     if not isinstance(message, dict):
-        raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
+        raise UserVisibleError(
+            "ساختار پیام خروجی مدل نامعتبر است."
+        )
+
     content = message.get("content")
+
     if isinstance(content, str):
         answer = content.strip()
+
     elif isinstance(content, list):
         answer = "\n".join(
             item.get("text", "").strip()
             for item in content
-            if isinstance(item, dict) and isinstance(item.get("text"), str) and item.get("text").strip()
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("text"), str)
+                and item.get("text").strip()
+            )
         ).strip()
+
     else:
         answer = ""
+
     if not answer:
-        logger.error("Empty AI content; finish_reason=%r", choices[0].get("finish_reason"))
-        raise UserVisibleError("مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن.")
+        logger.error(
+            "Empty AI content; finish_reason=%r",
+            choices[0].get("finish_reason"),
+        )
+
+        raise UserVisibleError(
+            "مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن."
+        )
+
     return answer
+
 
 # =========================================================
 # Soroush Plus API
@@ -294,94 +456,188 @@ def call_ai(chat_id, user_text):
 def soroush_request(method, payload=None):
     url = f"{SOROUSH_API}/{method}"
     session = get_http_session("soroush_session")
+
     try:
-        with session.post(url, json=payload or {}, timeout=SOROUSH_TIMEOUT, allow_redirects=False) as response:
+        with session.post(
+            url,
+            json=payload or {},
+            timeout=SOROUSH_TIMEOUT,
+            allow_redirects=False,
+        ) as response:
+
             if not 200 <= response.status_code < 300:
-                logger.error("Soroush HTTP error: method=%s status=%s", method, response.status_code)
+                logger.error(
+                    "Soroush HTTP error: method=%s status=%s",
+                    method,
+                    response.status_code,
+                )
                 return None
+
             try:
                 return response.json()
+
             except ValueError:
-                logger.error("Soroush invalid JSON: method=%s", method)
+                logger.error(
+                    "Soroush invalid JSON: method=%s",
+                    method,
+                )
                 return None
+
     except requests.exceptions.RequestException as exc:
-        # The request URL contains the bot token; never log it.
-        logger.error("Soroush network error: method=%s type=%s", method, type(exc).__name__)
+        logger.error(
+            "Soroush network error: method=%s type=%s",
+            method,
+            type(exc).__name__,
+        )
+
         return None
 
 
 def split_message(text):
-    return [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+    return [
+        text[i:i + MAX_MESSAGE_LENGTH]
+        for i in range(0, len(text), MAX_MESSAGE_LENGTH)
+    ]
 
 
 def send_message(chat_id, text):
     if not isinstance(text, str) or not text:
         return False
+
     started = time.perf_counter()
     success = True
+
     try:
         for chunk in split_message(text):
-            result = soroush_request("sendMessage", {"chat_id": chat_id, "text": chunk})
-            if result is None or (isinstance(result, dict) and result.get("ok") is False):
-                logger.error("Soroush sendMessage failed or was rejected")
+            result = soroush_request(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                },
+            )
+
+            if (
+                result is None
+                or (
+                    isinstance(result, dict)
+                    and result.get("ok") is False
+                )
+            ):
+                logger.error(
+                    "Soroush sendMessage failed or was rejected"
+                )
+
                 success = False
                 break
+
         return success
+
     finally:
-        logger.info("TIMING send_message_ms=%.0f success=%s", (time.perf_counter() - started) * 1000, success)
+        logger.info(
+            "TIMING send_message_ms=%.0f success=%s",
+            (time.perf_counter() - started) * 1000,
+            success,
+        )
+
 
 # =========================================================
-# Update parsing and exact admin identification
+# Update parsing and admin identification
 # =========================================================
 def extract_updates(data):
     if isinstance(data, list):
         return data
+
     if not isinstance(data, dict):
         return []
+
     for key in ("result", "updates", "data"):
         value = data.get(key)
+
         if isinstance(value, list):
             return value
+
         if isinstance(value, dict):
-            for nested_key in ("updates", "messages", "result"):
+            for nested_key in (
+                "updates",
+                "messages",
+                "result",
+            ):
                 nested = value.get(nested_key)
+
                 if isinstance(nested, list):
                     return nested
+
     return []
 
 
 def has_update_container(data):
     if isinstance(data, list):
         return True
+
     if not isinstance(data, dict) or data.get("ok") is False:
         return False
+
     for key in ("result", "updates", "data"):
         value = data.get(key)
+
         if isinstance(value, list):
             return True
-        if isinstance(value, dict) and any(isinstance(value.get(k), list) for k in ("updates", "messages", "result")):
-            return True
+
+        if isinstance(value, dict):
+            if any(
+                isinstance(value.get(k), list)
+                for k in ("updates", "messages", "result")
+            ):
+                return True
+
     return False
 
 
 def extract_message(update):
     if not isinstance(update, dict):
         return None
-    message = update.get("message") or update.get("edited_message") or update.get("new_message") or update
+
+    message = (
+        update.get("message")
+        or update.get("edited_message")
+        or update.get("new_message")
+        or update
+    )
+
     if not isinstance(message, dict):
         return None
-    text = message.get("text") or message.get("body") or message.get("message_text")
+
+    text = (
+        message.get("text")
+        or message.get("body")
+        or message.get("message_text")
+    )
+
     chat = message.get("chat")
     sender = message.get("from")
 
-    # In private bot chats, chat.id is the destination used for sendMessage.
-    chat_id = chat.get("id") if isinstance(chat, dict) else message.get("chat_id")
+    chat_id = (
+        chat.get("id")
+        if isinstance(chat, dict)
+        else message.get("chat_id")
+    )
+
     if chat_id is None and isinstance(sender, dict):
         chat_id = sender.get("id")
 
-    # Admin privileges are granted only from the sender's username, never chat.username.
-    sender_username = sender.get("username") if isinstance(sender, dict) else None
-    normalized_username = sender_username.strip().lstrip("@").lower() if isinstance(sender_username, str) else None
+    sender_username = (
+        sender.get("username")
+        if isinstance(sender, dict)
+        else None
+    )
+
+    normalized_username = (
+        sender_username.strip().lstrip("@").lower()
+        if isinstance(sender_username, str)
+        else None
+    )
+
     is_admin = normalized_username == ADMIN_USERNAME.lower()
 
     if is_admin and chat_id is not None:
@@ -389,30 +645,47 @@ def extract_message(update):
 
     if text is None or chat_id is None:
         return None
+
     if not isinstance(text, str):
         text = str(text)
+
     return str(chat_id), text
 
 
 def get_update_id(update):
     if not isinstance(update, dict):
         return None
+
     for key in ("update_id", "updateId", "id"):
         value = update.get(key)
+
         if isinstance(value, int) and not isinstance(value, bool):
             return value
+
     return None
 
+
 # =========================================================
-# Message processing
+# Creator question detection
 # =========================================================
 def is_creator_question(user_text):
-    """Recognize common Persian questions about the bot's creator."""
     normalized = user_text.strip().lower()
-    normalized = normalized.replace("ي", "ی").replace("ك", "ک")
+
+    normalized = normalized.replace("ي", "ی")
+    normalized = normalized.replace("ك", "ک")
     normalized = normalized.replace("\u200c", " ")
-    normalized = re.sub(r"[؟?!.,،؛:]+", "", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    normalized = re.sub(
+        r"[؟?!.,،؛:]+",
+        "",
+        normalized,
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized,
+    ).strip()
 
     exact_phrases = {
         "سازندت کیه",
@@ -428,6 +701,7 @@ def is_creator_question(user_text):
         "چه کسی تو رو ساخته",
         "تو توسط چه کسی ساخته شدی",
     }
+
     if normalized in exact_phrases:
         return True
 
@@ -436,62 +710,154 @@ def is_creator_question(user_text):
         r"^(چه کسی|کی) .{0,8} (ساختت|ساخته|ساخته است)$",
         r"^(توسعه دهنده) .{0,12} کیه$",
     )
-    return any(re.search(pattern, normalized) for pattern in patterns)
+
+    return any(
+        re.search(pattern, normalized)
+        for pattern in patterns
+    )
 
 
+# =========================================================
+# Message processing
+# =========================================================
 def process_message(chat_id, text, queued_at):
     started = time.perf_counter()
-    queue_wait_ms = max(0, (started - queued_at) * 1000)
+
+    queue_wait_ms = max(
+        0,
+        (started - queued_at) * 1000,
+    )
+
     text = text.strip()
+
     if not text:
         return True
+
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
     if command == "/start":
-        send_ok = send_message(chat_id, "سلام! من نپتون هستم.\nبه هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم.")
-        logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f type=start", queue_wait_ms, (time.perf_counter() - started) * 1000)
+        send_ok = send_message(
+            chat_id,
+            "سلام! من نپتون هستم.\n"
+            "به هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم.",
+        )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=start",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+
         return send_ok
 
     if command == "/reset":
         reset_history(chat_id)
-        send_ok = send_message(chat_id, "حافظه گفت‌وگوی شما پاک شد.")
-        logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset", queue_wait_ms, (time.perf_counter() - started) * 1000)
+
+        send_ok = send_message(
+            chat_id,
+            "حافظه گفت‌وگوی شما پاک شد.",
+        )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+
         return send_ok
 
-    # Answer creator questions deterministically so the model cannot vary the wording.
+    # پاسخ سازنده به‌صورت قطعی و مستقل از مدل
     if is_creator_question(text):
-        answer = "من توسط نپتون ساخته شدم. آیدی سازنده‌ام در بیوگرافی من قرار دارد."
-        send_ok = send_message(chat_id, answer)
+        send_ok = send_message(
+            chat_id,
+            CREATOR_ANSWER,
+        )
+
         if send_ok:
-            save_turn(chat_id, text, answer)
-        logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f type=creator result=%s",
-                    queue_wait_ms, (time.perf_counter() - started) * 1000,
-                    "sent" if send_ok else "send_failed")
+            save_turn(
+                chat_id,
+                text,
+                CREATOR_ANSWER,
+            )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f "
+            "type=creator result=%s",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+            "sent" if send_ok else "send_failed",
+        )
+
         return send_ok
 
     text = text[:MAX_MESSAGE_LENGTH]
+
     try:
         answer = call_ai(chat_id, text)
-        send_ok = send_message(chat_id, answer)
+
+        send_ok = send_message(
+            chat_id,
+            answer,
+        )
+
         if send_ok:
-            save_turn(chat_id, text, answer)
-        logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f result=%s", queue_wait_ms, (time.perf_counter() - started) * 1000, "sent" if send_ok else "send_failed")
+            save_turn(
+                chat_id,
+                text,
+                answer,
+            )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=%s",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+            "sent" if send_ok else "send_failed",
+        )
+
         return send_ok
+
     except UserVisibleError as exc:
-        send_ok = send_message(chat_id, str(exc))
-        logger.warning("TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error", queue_wait_ms, (time.perf_counter() - started) * 1000)
-        # AI errors are reported to the user; do not endlessly retry the same request.
+        send_ok = send_message(
+            chat_id,
+            str(exc),
+        )
+
+        logger.warning(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+
         return True if send_ok else False
+
     except Exception as exc:
-        logger.error("Message processing failed: type=%s", type(exc).__name__)
-        send_ok = send_message(chat_id, "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن.")
-        logger.error("TIMING message queue_wait_ms=%.0f total_ms=%.0f result=internal_error", queue_wait_ms, (time.perf_counter() - started) * 1000)
+        logger.error(
+            "Message processing failed: type=%s",
+            type(exc).__name__,
+        )
+
+        send_ok = send_message(
+            chat_id,
+            "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن.",
+        )
+
+        logger.error(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f "
+            "result=internal_error",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+        )
+
         return send_ok
+
 
 # =========================================================
 # Per-chat asynchronous queue
 # =========================================================
-_chat_queue = queue.Queue(maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS)
+_chat_queue = queue.Queue(
+    maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS
+)
+
 _chat_queue_lock = threading.Lock()
 _chat_messages = {}
 _pending_message_count = 0
@@ -500,70 +866,128 @@ _worker_threads = []
 
 def enqueue_chat_messages(grouped_messages):
     global _pending_message_count
+
     if not grouped_messages:
         return True
+
     with _chat_queue_lock:
-        incoming = sum(len(items) for items in grouped_messages.values())
-        new_chats = [cid for cid in grouped_messages if cid not in _chat_messages]
+        incoming = sum(
+            len(items)
+            for items in grouped_messages.values()
+        )
+
+        new_chats = [
+            cid
+            for cid in grouped_messages
+            if cid not in _chat_messages
+        ]
+
         if _pending_message_count + incoming > MAX_QUEUED_MESSAGES:
             logger.warning("Message queue is full")
             return False
+
         if len(_chat_messages) + len(new_chats) > MAX_CONVERSATIONS:
             logger.warning("Conversation queue capacity reached")
             return False
+
         for chat_id, messages in grouped_messages.items():
             if chat_id not in _chat_messages:
                 _chat_messages[chat_id] = deque()
                 _chat_queue.put_nowait(chat_id)
+
             received_at = time.perf_counter()
+
             for message_text in messages:
-                _chat_messages[chat_id].append({"text": message_text, "queued_at": received_at, "attempts": 0})
+                _chat_messages[chat_id].append({
+                    "text": message_text,
+                    "queued_at": received_at,
+                    "attempts": 0,
+                })
+
         _pending_message_count += incoming
+
     return True
 
 
 def chat_worker():
     global _pending_message_count
+
     while True:
         chat_id = _chat_queue.get()
+
         try:
             with _chat_queue_lock:
                 messages = _chat_messages.get(chat_id)
                 item = messages[0] if messages else None
+
             if item is not None:
                 try:
-                    completed = process_message(chat_id, item["text"], item["queued_at"])
+                    completed = process_message(
+                        chat_id,
+                        item["text"],
+                        item["queued_at"],
+                    )
+
                 except Exception as exc:
-                    logger.error("Worker processing failed: type=%s", type(exc).__name__)
+                    logger.error(
+                        "Worker processing failed: type=%s",
+                        type(exc).__name__,
+                    )
                     completed = False
+
                 with _chat_queue_lock:
                     messages = _chat_messages.get(chat_id)
+
                     if messages and messages[0] is item:
-                        if completed or item["attempts"] >= MAX_WORKER_RETRIES:
+                        if (
+                            completed
+                            or item["attempts"] >= MAX_WORKER_RETRIES
+                        ):
                             messages.popleft()
-                            _pending_message_count = max(0, _pending_message_count - 1)
+
+                            _pending_message_count = max(
+                                0,
+                                _pending_message_count - 1,
+                            )
+
                             if not completed:
-                                logger.error("Message discarded after bounded worker retries")
+                                logger.error(
+                                    "Message discarded after bounded worker retries"
+                                )
+
                         else:
                             item["attempts"] += 1
                             item["queued_at"] = time.perf_counter()
+
             with _chat_queue_lock:
                 messages = _chat_messages.get(chat_id)
+
                 if messages:
                     _chat_queue.put_nowait(chat_id)
                 else:
                     _chat_messages.pop(chat_id, None)
+
         except Exception as exc:
-            logger.error("Chat worker failed: type=%s", type(exc).__name__)
+            logger.error(
+                "Chat worker failed: type=%s",
+                type(exc).__name__,
+            )
+
             with _chat_queue_lock:
                 messages = _chat_messages.get(chat_id)
+
                 if messages:
                     try:
                         _chat_queue.put_nowait(chat_id)
+
                     except queue.Full:
-                        logger.critical("Worker queue unexpectedly full")
+                        logger.critical(
+                            "Worker queue unexpectedly full"
+                        )
+
                 else:
                     _chat_messages.pop(chat_id, None)
+
         finally:
             _chat_queue.task_done()
 
@@ -571,11 +995,22 @@ def chat_worker():
 def start_chat_workers():
     if _worker_threads:
         return
+
     for index in range(MAX_PARALLEL_CHATS):
-        worker = threading.Thread(target=chat_worker, name=f"NeptonWorker-{index + 1}", daemon=True)
+        worker = threading.Thread(
+            target=chat_worker,
+            name=f"NeptonWorker-{index + 1}",
+            daemon=True,
+        )
+
         worker.start()
         _worker_threads.append(worker)
-    logger.info("Started %s chat workers", MAX_PARALLEL_CHATS)
+
+    logger.info(
+        "Started %s chat workers",
+        MAX_PARALLEL_CHATS,
+    )
+
 
 # =========================================================
 # Update batch handling and polling
@@ -583,17 +1018,24 @@ def start_chat_workers():
 def process_update_batch(updates):
     grouped = OrderedDict()
     last_update_id = None
+
     for update in updates:
         update_id = get_update_id(update)
+
         if update_id is not None:
             last_update_id = update_id
+
         extracted = extract_message(update)
+
         if extracted is None:
             continue
+
         chat_id, text = extracted
         grouped.setdefault(chat_id, []).append(text)
+
     if not enqueue_chat_messages(grouped):
         return None
+
     return last_update_id
 
 
@@ -604,60 +1046,123 @@ _polling_started = False
 def polling_loop():
     offset = None
     backoff = POLL_ERROR_BACKOFF_START
+
     logger.info("Soroush polling started")
+
     while not _polling_stop.is_set():
         try:
-            payload = {"offset": offset} if offset is not None else {}
+            payload = (
+                {"offset": offset}
+                if offset is not None
+                else {}
+            )
+
             started = time.perf_counter()
-            data = soroush_request("getUpdates", payload)
-            logger.info("TIMING get_updates_ms=%.0f", (time.perf_counter() - started) * 1000)
+
+            data = soroush_request(
+                "getUpdates",
+                payload,
+            )
+
+            logger.info(
+                "TIMING get_updates_ms=%.0f",
+                (time.perf_counter() - started) * 1000,
+            )
+
             if data is None:
                 _polling_stop.wait(backoff)
-                backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
+                backoff = min(
+                    backoff * 2,
+                    POLL_ERROR_BACKOFF_MAX,
+                )
                 continue
+
             if not has_update_container(data):
-                logger.error("Unexpected Soroush getUpdates response")
+                logger.error(
+                    "Unexpected Soroush getUpdates response"
+                )
+
                 _polling_stop.wait(backoff)
-                backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
+
+                backoff = min(
+                    backoff * 2,
+                    POLL_ERROR_BACKOFF_MAX,
+                )
+
                 continue
+
             updates = extract_updates(data)
+
             if not updates:
                 backoff = POLL_ERROR_BACKOFF_START
                 _polling_stop.wait(POLL_EMPTY_WAIT)
                 continue
+
             last_id = process_update_batch(updates)
+
             if last_id is not None:
                 if offset is not None and last_id < offset - 1:
                     logger.warning("Unexpected update ID")
                 else:
                     offset = last_id + 1
+
             backoff = POLL_ERROR_BACKOFF_START
+
         except Exception as exc:
-            logger.error("Polling iteration failed: type=%s", type(exc).__name__)
+            logger.error(
+                "Polling iteration failed: type=%s",
+                type(exc).__name__,
+            )
+
             _polling_stop.wait(backoff)
-            backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
+
+            backoff = min(
+                backoff * 2,
+                POLL_ERROR_BACKOFF_MAX,
+            )
 
 
 def _polling_main():
     try:
         polling_loop()
+
     except Exception as exc:
-        logger.error("Polling thread stopped unexpectedly: type=%s", type(exc).__name__)
+        logger.error(
+            "Polling thread stopped unexpectedly: type=%s",
+            type(exc).__name__,
+        )
 
 
 def start_polling():
     global _polling_started, _polling_thread
+
     with _polling_lock:
-        if _polling_started and _polling_thread and _polling_thread.is_alive():
+        if (
+            _polling_started
+            and _polling_thread
+            and _polling_thread.is_alive()
+        ):
             return
+
         _polling_stop.clear()
-        _polling_thread = threading.Thread(target=_polling_main, name="SoroushPolling", daemon=True)
+
+        _polling_thread = threading.Thread(
+            target=_polling_main,
+            name="SoroushPolling",
+            daemon=True,
+        )
+
         _polling_thread.start()
         _polling_started = True
+
 
 # =========================================================
 # Startup
 # =========================================================
 start_chat_workers()
 start_polling()
-logger.info("NeptonBot %s started successfully", VERSION)
+
+logger.info(
+    "NeptonBot %s started successfully",
+    VERSION,
+)

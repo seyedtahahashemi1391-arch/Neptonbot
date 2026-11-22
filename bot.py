@@ -17,7 +17,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.2.3"
+VERSION = "2.2.5"
 ADMIN_USERNAME = "t91m62"  # Username only; never use it as chat_id.
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -45,7 +45,9 @@ SYSTEM_PROMPT = (
     "درستی اطلاعات را بر روانی متن مقدم بدان و هیچ واقعیت، منبع، آزمون یا تجربه‌ای را جعل نکن. "
     "اطلاعات متغیر مانند قیمت، رتبه‌بندی و وضعیت روز را بدون منبع به‌روز قطعی اعلام نکن. "
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
-    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن."
+    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
+    "اگر کاربر پرسید چه کسی تو را ساخته یا سازنده‌ات کیست، پاسخ بده: «من نپتون هستم و توسط نپتون ساخته شده‌ام.» "
+    "در پاسخ به این سؤال هرگز از عبارت «تیم نپتون» استفاده نکن."
 )
 
 # =========================================================
@@ -404,6 +406,39 @@ def get_update_id(update):
 # =========================================================
 # Message processing
 # =========================================================
+def is_creator_question(user_text):
+    """Recognize common Persian questions about the bot's creator."""
+    normalized = user_text.strip().lower()
+    normalized = normalized.replace("ي", "ی").replace("ك", "ک")
+    normalized = normalized.replace("\u200c", " ")
+    normalized = re.sub(r"[؟?!.,،؛:]+", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    exact_phrases = {
+        "سازندت کیه",
+        "سازنده ات کیه",
+        "سازنده تو کیه",
+        "چه کسی ساختت",
+        "کی ساختت",
+        "تو رو کی ساخته",
+        "تورو کی ساخته",
+        "توسعه دهنده ات کیه",
+        "توسعه دهنده تو کیه",
+        "چه کسی تو را ساخته",
+        "چه کسی تو رو ساخته",
+        "تو توسط چه کسی ساخته شدی",
+    }
+    if normalized in exact_phrases:
+        return True
+
+    patterns = (
+        r"^(سازند|سازنده) .{0,12} کیه$",
+        r"^(چه کسی|کی) .{0,8} (ساختت|ساخته|ساخته است)$",
+        r"^(توسعه دهنده) .{0,12} کیه$",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
+
+
 def process_message(chat_id, text, queued_at):
     started = time.perf_counter()
     queue_wait_ms = max(0, (started - queued_at) * 1000)
@@ -421,6 +456,17 @@ def process_message(chat_id, text, queued_at):
         reset_history(chat_id)
         send_ok = send_message(chat_id, "حافظه گفت‌وگوی شما پاک شد.")
         logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset", queue_wait_ms, (time.perf_counter() - started) * 1000)
+        return send_ok
+
+    # Answer creator questions deterministically so the model cannot vary the wording.
+    if is_creator_question(text):
+        answer = "من توسط نپتون ساخته شدم. آیدی سازنده‌ام در بیوگرافی من قرار دارد."
+        send_ok = send_message(chat_id, answer)
+        if send_ok:
+            save_turn(chat_id, text, answer)
+        logger.info("TIMING message queue_wait_ms=%.0f total_ms=%.0f type=creator result=%s",
+                    queue_wait_ms, (time.perf_counter() - started) * 1000,
+                    "sent" if send_ok else "send_failed")
         return send_ok
 
     text = text[:MAX_MESSAGE_LENGTH]

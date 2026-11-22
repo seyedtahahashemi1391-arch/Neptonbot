@@ -1,4 +1,3 @@
-
 import os
 import time
 import logging
@@ -605,7 +604,8 @@ def extract_message(update):
         or message.get("message_text")
     )
 
-    chat_id = message.get("chat_id)
+    # FIX: the closing quotation mark after chat_id was missing.
+    chat_id = message.get("chat_id")
     chat = message.get("chat")
 
     if chat_id is None and isinstance(chat, dict):

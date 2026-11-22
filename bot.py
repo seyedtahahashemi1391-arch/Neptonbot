@@ -1,8 +1,9 @@
+
 import os
 import logging
 import threading
+import queue
 from collections import OrderedDict, deque
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -27,10 +28,14 @@ CLOUDFLARE_URL = (
 
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
+
 MAX_HISTORY_MESSAGES = 12
 MAX_CONVERSATIONS = 500
 MAX_MESSAGE_LENGTH = 3500
+
 MAX_PARALLEL_CHATS = 3
+MAX_QUEUED_MESSAGES = 1000
+
 POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
@@ -58,6 +63,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
+
 logger = logging.getLogger("NeptonBot")
 
 
@@ -87,14 +93,14 @@ logger.info("Model: %s", MODEL)
 
 
 # =========================
-# Per-thread HTTP sessions
+# HTTP sessions
 # =========================
 
 _thread_local = threading.local()
 
 
 def _new_session():
-    http_session = requests.Session()
+    session = requests.Session()
 
     adapter = HTTPAdapter(
         pool_connections=4,
@@ -103,26 +109,25 @@ def _new_session():
         pool_block=True,
     )
 
-    http_session.mount("https://", adapter)
-    http_session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
-    http_session.headers.update({
-        "User-Agent": "NeptonBot/2.0",
+    session.headers.update({
+        "User-Agent": "NeptonBot/2.1",
         "Accept": "application/json",
     })
 
-    return http_session
+    return session
 
 
 def get_http_session(name):
-    """Return one reusable requests session per thread and service."""
-    current = getattr(_thread_local, name, None)
+    session = getattr(_thread_local, name, None)
 
-    if current is None:
-        current = _new_session()
-        setattr(_thread_local, name, current)
+    if session is None:
+        session = _new_session()
+        setattr(_thread_local, name, session)
 
-    return current
+    return session
 
 
 # =========================
@@ -179,12 +184,16 @@ def reset_history(chat_id):
 
 app = Flask(__name__)
 
+_polling_thread = None
+_polling_stop = threading.Event()
+
 
 @app.get("/")
 def home():
     return jsonify({
         "status": "online",
         "bot": "Nepton",
+        "version": "2.1",
         "provider": "Cloudflare Workers AI",
         "model": MODEL,
     })
@@ -200,18 +209,25 @@ def health():
             "polling": "stopped",
         }), 503
 
+    with _chat_queue_lock:
+        pending = _pending_message_count
+        active_chats = len(_chat_messages)
+
     return jsonify({
         "status": "healthy",
         "polling": "running",
+        "queued_messages": pending,
+        "active_chats": active_chats,
+        "workers": MAX_PARALLEL_CHATS,
     }), 200
 
 
 # =========================
-# Safe application errors
+# Application errors
 # =========================
 
 class UserVisibleError(Exception):
-    """An error message that is safe to show to the user."""
+    pass
 
 
 # =========================
@@ -225,14 +241,10 @@ _cloudflare_headers = {
 }
 
 
-def cloudflare_post_with_retry(http_session, payload):
-    """
-    Retry temporary network failures and selected server errors once.
-    HTTP 429 and other client errors are not retried.
-    """
+def cloudflare_post_with_retry(session, payload):
     for attempt in range(2):
         try:
-            response = http_session.post(
+            response = session.post(
                 CLOUDFLARE_URL,
                 headers=_cloudflare_headers,
                 json=payload,
@@ -246,21 +258,22 @@ def cloudflare_post_with_retry(http_session, payload):
         ):
             if attempt == 0:
                 logger.warning(
-                    "Temporary Cloudflare network failure; retrying once"
+                    "Temporary Cloudflare network failure; retrying"
                 )
                 continue
 
             raise
 
-        if response.status_code in (500, 502, 503, 504) and attempt == 0:
-            status = response.status_code
-            response.close()
+        if response.status_code in (500, 502, 503, 504):
+            if attempt == 0:
+                status = response.status_code
+                response.close()
 
-            logger.warning(
-                "Cloudflare temporary HTTP error: status=%s; retrying once",
-                status,
-            )
-            continue
+                logger.warning(
+                    "Cloudflare HTTP %s; retrying once",
+                    status,
+                )
+                continue
 
         return response
 
@@ -292,11 +305,11 @@ def call_ai(chat_id, user_text):
         "stream": False,
     }
 
-    http_session = get_http_session("cloudflare_session")
+    session = get_http_session("cloudflare_session")
 
     try:
         with cloudflare_post_with_retry(
-            http_session,
+            session,
             payload,
         ) as response:
 
@@ -313,15 +326,13 @@ def call_ai(chat_id, user_text):
                     )
 
                 raise UserVisibleError(
-                    "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست. "
-                    "کمی بعد دوباره تلاش کن."
+                    "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
                 )
 
             try:
                 data = response.json()
             except ValueError as exc:
                 logger.error("Cloudflare returned invalid JSON")
-
                 raise UserVisibleError(
                     "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
                 ) from exc
@@ -331,9 +342,8 @@ def call_ai(chat_id, user_text):
 
     except requests.exceptions.Timeout as exc:
         logger.warning("Cloudflare request timed out")
-
         raise UserVisibleError(
-            "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید. دوباره تلاش کن."
+            "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
         ) from exc
 
     except requests.exceptions.RequestException as exc:
@@ -341,13 +351,11 @@ def call_ai(chat_id, user_text):
             "Cloudflare network error: type=%s",
             type(exc).__name__,
         )
-
         raise UserVisibleError(
-            "ارتباط با سرویس هوش مصنوعی برقرار نشد. کمی بعد دوباره تلاش کن."
+            "ارتباط با سرویس هوش مصنوعی برقرار نشد."
         ) from exc
 
     if not isinstance(data, dict):
-        logger.error("Cloudflare returned a non-object JSON response")
         raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
 
     choices = data.get("choices")
@@ -357,22 +365,17 @@ def call_ai(chat_id, user_text):
             "Cloudflare response has no choices; keys=%s",
             list(data.keys()),
         )
-
         raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
 
-    first_choice = choices[0]
+    first = choices[0]
 
-    if not isinstance(first_choice, dict):
+    if not isinstance(first, dict):
         raise UserVisibleError("ساختار خروجی مدل نامعتبر است.")
 
-    finish_reason = first_choice.get("finish_reason")
-    message = first_choice.get("message")
+    finish_reason = first.get("finish_reason")
+    message = first.get("message")
 
     if not isinstance(message, dict):
-        logger.error(
-            "Cloudflare response has no valid message; finish_reason=%r",
-            finish_reason,
-        )
         raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
 
     content = message.get("content")
@@ -384,13 +387,11 @@ def call_ai(chat_id, user_text):
         parts = []
 
         for item in content:
-            if not isinstance(item, dict):
-                continue
+            if isinstance(item, dict):
+                part = item.get("text")
 
-            part = item.get("text")
-
-            if isinstance(part, str) and part.strip():
-                parts.append(part.strip())
+                if isinstance(part, str) and part.strip():
+                    parts.append(part.strip())
 
         answer = "\n".join(parts).strip()
 
@@ -399,14 +400,13 @@ def call_ai(chat_id, user_text):
 
     if not answer:
         logger.error(
-            "Cloudflare returned empty final content; "
-            "finish_reason=%r, message_keys=%s",
+            "Empty AI content; finish_reason=%r; keys=%s",
             finish_reason,
             list(message.keys()),
         )
 
         raise UserVisibleError(
-            "مدل این بار پاسخ متنی تولید نکرد. لطفاً دوباره تلاش کن."
+            "مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن."
         )
 
     return answer
@@ -418,10 +418,10 @@ def call_ai(chat_id, user_text):
 
 def soroush_request(method, payload=None):
     url = f"{SOROUSH_API}/{method}"
-    http_session = get_http_session("soroush_session")
+    session = get_http_session("soroush_session")
 
     try:
-        with http_session.post(
+        with session.post(
             url,
             json=payload or {},
             timeout=SOROUSH_TIMEOUT,
@@ -430,7 +430,7 @@ def soroush_request(method, payload=None):
 
             if not 200 <= response.status_code < 300:
                 logger.error(
-                    "Soroush API HTTP error: method=%s status=%s",
+                    "Soroush HTTP error: method=%s status=%s",
                     method,
                     response.status_code,
                 )
@@ -440,15 +440,14 @@ def soroush_request(method, payload=None):
                 return response.json()
             except ValueError:
                 logger.error(
-                    "Soroush returned invalid JSON: method=%s",
+                    "Soroush invalid JSON: method=%s",
                     method,
                 )
                 return None
 
     except requests.exceptions.RequestException as exc:
-        # The Soroush URL contains the bot token; never log the URL or traceback.
         logger.error(
-            "Soroush API network error: method=%s type=%s",
+            "Soroush network error: method=%s type=%s",
             method,
             type(exc).__name__,
         )
@@ -476,7 +475,7 @@ def send_message(chat_id, text):
         )
 
         if result is None:
-            logger.error("Could not send a message through Soroush")
+            logger.error("Soroush sendMessage failed")
             return False
 
         if isinstance(result, dict) and result.get("ok") is False:
@@ -526,11 +525,12 @@ def has_update_container(data):
         if isinstance(value, list):
             return True
 
-        if isinstance(value, dict) and any(
-            isinstance(value.get(nested_key), list)
-            for nested_key in ("updates", "messages", "result")
-        ):
-            return True
+        if isinstance(value, dict):
+            if any(
+                isinstance(value.get(nested), list)
+                for nested in ("updates", "messages", "result")
+            ):
+                return True
 
     return False
 
@@ -637,11 +637,142 @@ def process_message(chat_id, text):
         )
 
 
-def process_chat_batch(chat_id, messages):
-    # Each chat is assigned to one task, preserving its message order.
-    for text in messages:
-        process_message(chat_id, text)
+# =========================
+# Asynchronous chat queue
+# =========================
 
+_chat_queue = queue.Queue(maxsize=MAX_CONVERSATIONS)
+
+_chat_queue_lock = threading.Lock()
+
+_chat_messages = {}
+_pending_message_count = 0
+
+_worker_threads = []
+
+
+def enqueue_chat_messages(grouped_messages):
+    global _pending_message_count
+
+    if not grouped_messages:
+        return True
+
+    with _chat_queue_lock:
+        incoming_count = sum(
+            len(messages)
+            for messages in grouped_messages.values()
+        )
+
+        new_chats = [
+            chat_id
+            for chat_id in grouped_messages
+            if chat_id not in _chat_messages
+        ]
+
+        if (
+            _pending_message_count + incoming_count
+            > MAX_QUEUED_MESSAGES
+        ):
+            logger.warning("Message queue is full")
+            return False
+
+        if (
+            _chat_queue.qsize() + len(new_chats)
+            > MAX_CONVERSATIONS
+        ):
+            logger.warning("Chat queue capacity reached")
+            return False
+
+        for chat_id, messages in grouped_messages.items():
+            if chat_id not in _chat_messages:
+                _chat_messages[chat_id] = deque()
+                _chat_queue.put_nowait(chat_id)
+
+            _chat_messages[chat_id].extend(messages)
+
+        _pending_message_count += incoming_count
+
+    return True
+
+
+def chat_worker():
+    global _pending_message_count
+
+    while True:
+        chat_id = _chat_queue.get()
+
+        try:
+            with _chat_queue_lock:
+                messages = _chat_messages.get(chat_id)
+
+                if not messages:
+                    _chat_messages.pop(chat_id, None)
+                    text = None
+                else:
+                    text = messages.popleft()
+                    _pending_message_count -= 1
+
+            if text is not None:
+                try:
+                    process_message(chat_id, text)
+
+                except Exception as exc:
+                    logger.error(
+                        "Worker processing failed: type=%s",
+                        type(exc).__name__,
+                    )
+
+            with _chat_queue_lock:
+                messages = _chat_messages.get(chat_id)
+
+                if messages:
+                    # Put the chat at the end of the queue.
+                    # This provides fairness between conversations.
+                    _chat_queue.put_nowait(chat_id)
+                else:
+                    _chat_messages.pop(chat_id, None)
+
+        except Exception as exc:
+            logger.error(
+                "Chat worker failed: type=%s",
+                type(exc).__name__,
+            )
+
+            with _chat_queue_lock:
+                messages = _chat_messages.get(chat_id)
+
+                if messages:
+                    _chat_queue.put_nowait(chat_id)
+                else:
+                    _chat_messages.pop(chat_id, None)
+
+        finally:
+            _chat_queue.task_done()
+
+
+def start_chat_workers():
+    if _worker_threads:
+        return
+
+    for index in range(MAX_PARALLEL_CHATS):
+        worker = threading.Thread(
+            target=chat_worker,
+            name=f"NeptonWorker-{index + 1}",
+            daemon=True,
+        )
+
+        worker.start()
+        _worker_threads.append(worker)
+
+    logger.info(
+        "Started %s chat workers",
+        MAX_PARALLEL_CHATS,
+    )
+
+
+# =========================
+# Update batch handling
+# =========================
 
 def process_update_batch(updates):
     grouped_messages = OrderedDict()
@@ -659,28 +790,14 @@ def process_update_batch(updates):
             continue
 
         chat_id, text = extracted
-        grouped_messages.setdefault(chat_id, []).append(text)
 
-    futures = []
+        grouped_messages.setdefault(
+            chat_id,
+            [],
+        ).append(text)
 
-    for chat_id, messages in grouped_messages.items():
-        futures.append(
-            _message_executor.submit(
-                process_chat_batch,
-                chat_id,
-                messages,
-            )
-        )
-
-    for future in futures:
-        try:
-            future.result()
-
-        except Exception as exc:
-            logger.error(
-                "Chat batch failed: type=%s",
-                type(exc).__name__,
-            )
+    if not enqueue_chat_messages(grouped_messages):
+        return None
 
     return last_update_id
 
@@ -689,15 +806,8 @@ def process_update_batch(updates):
 # Polling
 # =========================
 
-_message_executor = ThreadPoolExecutor(
-    max_workers=MAX_PARALLEL_CHATS,
-    thread_name_prefix="NeptonChat",
-)
-
-_polling_stop = threading.Event()
 _polling_lock = threading.Lock()
 _polling_started = False
-_polling_thread = None
 
 
 def polling_loop():
@@ -717,6 +827,7 @@ def polling_loop():
 
             if data is None:
                 _polling_stop.wait(error_backoff)
+
                 error_backoff = min(
                     error_backoff * 2,
                     POLL_ERROR_BACKOFF_MAX,
@@ -725,10 +836,11 @@ def polling_loop():
 
             if not has_update_container(data):
                 logger.error(
-                    "Soroush getUpdates returned an unexpected response"
+                    "Unexpected Soroush getUpdates response"
                 )
 
                 _polling_stop.wait(error_backoff)
+
                 error_backoff = min(
                     error_backoff * 2,
                     POLL_ERROR_BACKOFF_MAX,
@@ -744,9 +856,13 @@ def polling_loop():
 
             last_update_id = process_update_batch(updates)
 
-            # Advance only after all updates in this batch have been handled.
+            # Advance only after the entire batch is accepted
+            # by the in-memory queue.
             if last_update_id is not None:
-                offset = last_update_id + 1
+                if last_update_id < (offset or -1):
+                    logger.warning("Unexpected update ID")
+                else:
+                    offset = last_update_id + 1
 
             error_backoff = POLL_ERROR_BACKOFF_START
 
@@ -757,6 +873,7 @@ def polling_loop():
             )
 
             _polling_stop.wait(error_backoff)
+
             error_backoff = min(
                 error_backoff * 2,
                 POLL_ERROR_BACKOFF_MAX,
@@ -768,7 +885,6 @@ def _polling_main():
         polling_loop()
 
     except Exception as exc:
-        # A final guard prevents an unhandled exception from being silent.
         logger.error(
             "Polling thread stopped unexpectedly: type=%s",
             type(exc).__name__,
@@ -798,4 +914,11 @@ def start_polling():
         _polling_started = True
 
 
+# =========================
+# Application startup
+# =========================
+
+start_chat_workers()
 start_polling()
+
+logger.info("NeptonBot 2.1 started successfully")

@@ -225,6 +225,50 @@ _cloudflare_headers = {
 }
 
 
+def cloudflare_post_with_retry(http_session, payload):
+    """
+    Retry temporary network failures and selected server errors once.
+    HTTP 429 and other client errors are not retried.
+    """
+    for attempt in range(2):
+        try:
+            response = http_session.post(
+                CLOUDFLARE_URL,
+                headers=_cloudflare_headers,
+                json=payload,
+                timeout=AI_TIMEOUT,
+                allow_redirects=False,
+            )
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+        ):
+            if attempt == 0:
+                logger.warning(
+                    "Temporary Cloudflare network failure; retrying once"
+                )
+                continue
+
+            raise
+
+        if response.status_code in (500, 502, 503, 504) and attempt == 0:
+            status = response.status_code
+            response.close()
+
+            logger.warning(
+                "Cloudflare temporary HTTP error: status=%s; retrying once",
+                status,
+            )
+            continue
+
+        return response
+
+    raise requests.exceptions.ConnectionError(
+        "Cloudflare request failed after retry"
+    )
+
+
 def call_ai(chat_id, user_text):
     messages = [
         {
@@ -251,12 +295,9 @@ def call_ai(chat_id, user_text):
     http_session = get_http_session("cloudflare_session")
 
     try:
-        with http_session.post(
-            CLOUDFLARE_URL,
-            headers=_cloudflare_headers,
-            json=payload,
-            timeout=AI_TIMEOUT,
-            allow_redirects=False,
+        with cloudflare_post_with_retry(
+            http_session,
+            payload,
         ) as response:
 
             if not 200 <= response.status_code < 300:

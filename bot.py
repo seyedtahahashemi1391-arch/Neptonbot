@@ -36,10 +36,17 @@ POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
 
 SYSTEM_PROMPT = (
-    "تو یک دستیار هوش مصنوعی دقیق و فارسی‌زبان هستی. "
-    "به زبان پیام کاربر پاسخ بده؛ پاسخ را روشن، منظم و متناسب با سؤال بنویس. "
-    "درستی اطلاعات را بر روانی متن مقدم بدان، اطلاعات یا منبع ساختگی ارائه نکن "
-    "و هرجا مطمئن نیستی، عدم‌قطعیت را صریح بیان کن."
+    "تو دستیار هوش مصنوعی Nepton هستی. "
+    "به زبان پیام کاربر پاسخ بده و پاسخ را دقیق، مستقیم، روشن و متناسب با سؤال بنویس. "
+    "از مقدمه‌های کلیشه‌ای، تکرار سؤال و توضیحات غیرضروری پرهیز کن. "
+    "برای سؤال‌های کوتاه، پاسخ کوتاه و روشن بده؛ فقط در صورت نیاز جزئیات اضافه کن. "
+    "درستی اطلاعات را بر روانی متن مقدم بدان و هیچ واقعیت، منبع، آزمون یا تجربه‌ای را جعل نکن. "
+    "اطلاعات متغیر مانند قیمت، رتبه‌بندی و وضعیت روز را بدون منبع به‌روز قطعی اعلام نکن. "
+    "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
+    "اگر سؤال به معیارها یا شرایط خاصی وابسته است، معیارهای مهم را کوتاه روشن کن "
+    "و نتیجه را بر همان اساس ارائه بده. "
+    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
+    "اطلاعات شخصی کاربر را فقط وقتی مرتبط است در پاسخ به کار ببر."
 )
 
 
@@ -59,10 +66,13 @@ logger = logging.getLogger("NeptonBot")
 # =========================
 
 _missing = []
+
 if not BOT_TOKEN:
     _missing.append("BOT_TOKEN")
+
 if not CLOUDFLARE_ACCOUNT_ID:
     _missing.append("CLOUDFLARE_ACCOUNT_ID")
+
 if not CLOUDFLARE_API_TOKEN:
     _missing.append("CLOUDFLARE_API_TOKEN")
 
@@ -85,27 +95,33 @@ _thread_local = threading.local()
 
 def _new_session():
     http_session = requests.Session()
+
     adapter = HTTPAdapter(
         pool_connections=4,
         pool_maxsize=4,
         max_retries=0,
         pool_block=True,
     )
+
     http_session.mount("https://", adapter)
     http_session.mount("http://", adapter)
+
     http_session.headers.update({
         "User-Agent": "NeptonBot/2.0",
         "Accept": "application/json",
     })
+
     return http_session
 
 
 def get_http_session(name):
     """Return one reusable requests session per thread and service."""
     current = getattr(_thread_local, name, None)
+
     if current is None:
         current = _new_session()
         setattr(_thread_local, name, current)
+
     return current
 
 
@@ -120,8 +136,10 @@ history_lock = threading.Lock()
 def get_history(chat_id):
     with history_lock:
         history = conversation_history.get(chat_id)
+
         if history is None:
             return []
+
         conversation_history.move_to_end(chat_id)
         return list(history)
 
@@ -129,12 +147,21 @@ def get_history(chat_id):
 def save_turn(chat_id, user_text, assistant_text):
     with history_lock:
         history = conversation_history.get(chat_id)
+
         if history is None:
             history = deque(maxlen=MAX_HISTORY_MESSAGES)
             conversation_history[chat_id] = history
 
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": assistant_text})
+        history.append({
+            "role": "user",
+            "content": user_text,
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": assistant_text,
+        })
+
         conversation_history.move_to_end(chat_id)
 
         while len(conversation_history) > MAX_CONVERSATIONS:
@@ -166,9 +193,17 @@ def home():
 @app.get("/health")
 def health():
     thread = _polling_thread
+
     if thread is None or not thread.is_alive():
-        return jsonify({"status": "degraded", "polling": "stopped"}), 503
-    return jsonify({"status": "healthy", "polling": "running"}), 200
+        return jsonify({
+            "status": "degraded",
+            "polling": "stopped",
+        }), 503
+
+    return jsonify({
+        "status": "healthy",
+        "polling": "running",
+    }), 200
 
 
 # =========================
@@ -191,9 +226,19 @@ _cloudflare_headers = {
 
 
 def call_ai(chat_id, user_text):
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        }
+    ]
+
     messages.extend(get_history(chat_id))
-    messages.append({"role": "user", "content": user_text})
+
+    messages.append({
+        "role": "user",
+        "content": user_text,
+    })
 
     payload = {
         "model": MODEL,
@@ -213,16 +258,19 @@ def call_ai(chat_id, user_text):
             timeout=AI_TIMEOUT,
             allow_redirects=False,
         ) as response:
+
             if not 200 <= response.status_code < 300:
                 logger.error(
                     "Cloudflare HTTP error: status=%s",
                     response.status_code,
                 )
+
                 if response.status_code == 429:
                     raise UserVisibleError(
                         "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
                         "کمی بعد دوباره تلاش کن."
                     )
+
                 raise UserVisibleError(
                     "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست. "
                     "کمی بعد دوباره تلاش کن."
@@ -232,22 +280,27 @@ def call_ai(chat_id, user_text):
                 data = response.json()
             except ValueError as exc:
                 logger.error("Cloudflare returned invalid JSON")
+
                 raise UserVisibleError(
                     "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
                 ) from exc
 
     except UserVisibleError:
         raise
+
     except requests.exceptions.Timeout as exc:
         logger.warning("Cloudflare request timed out")
+
         raise UserVisibleError(
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید. دوباره تلاش کن."
         ) from exc
+
     except requests.exceptions.RequestException as exc:
         logger.error(
             "Cloudflare network error: type=%s",
             type(exc).__name__,
         )
+
         raise UserVisibleError(
             "ارتباط با سرویس هوش مصنوعی برقرار نشد. کمی بعد دوباره تلاش کن."
         ) from exc
@@ -257,29 +310,37 @@ def call_ai(chat_id, user_text):
         raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
 
     choices = data.get("choices")
+
     if not isinstance(choices, list) or not choices:
         logger.error(
             "Cloudflare response has no choices; keys=%s",
             list(data.keys()),
         )
+
         raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
 
     first_choice = choices[0]
+
     if not isinstance(first_choice, dict):
         raise UserVisibleError("ساختار خروجی مدل نامعتبر است.")
 
     message = first_choice.get("message")
+
     if not isinstance(message, dict):
         raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
 
     answer = message.get("content")
+
     if isinstance(answer, list):
         parts = []
+
         for item in answer:
             if isinstance(item, dict):
                 part = item.get("text")
+
                 if isinstance(part, str):
                     parts.append(part)
+
         answer = "".join(parts)
 
     if not isinstance(answer, str) or not answer.strip():
@@ -287,6 +348,7 @@ def call_ai(chat_id, user_text):
             "Cloudflare returned empty content; message_keys=%s",
             list(message.keys()),
         )
+
         raise UserVisibleError("مدل پاسخ متنی تولید نکرد.")
 
     return answer.strip()
@@ -295,7 +357,6 @@ def call_ai(chat_id, user_text):
 # =========================
 # Soroush Plus API
 # =========================
-
 
 def soroush_request(method, payload=None):
     url = f"{SOROUSH_API}/{method}"
@@ -308,6 +369,7 @@ def soroush_request(method, payload=None):
             timeout=SOROUSH_TIMEOUT,
             allow_redirects=False,
         ) as response:
+
             if not 200 <= response.status_code < 300:
                 logger.error(
                     "Soroush API HTTP error: method=%s status=%s",
@@ -349,7 +411,10 @@ def send_message(chat_id, text):
     for chunk in split_message(text):
         result = soroush_request(
             "sendMessage",
-            {"chat_id": chat_id, "text": chunk},
+            {
+                "chat_id": chat_id,
+                "text": chunk,
+            },
         )
 
         if result is None:
@@ -367,7 +432,6 @@ def send_message(chat_id, text):
 # Update parsing
 # =========================
 
-
 def extract_updates(data):
     if isinstance(data, list):
         return data
@@ -384,6 +448,7 @@ def extract_updates(data):
         if isinstance(value, dict):
             for nested_key in ("updates", "messages", "result"):
                 nested = value.get(nested_key)
+
                 if isinstance(nested, list):
                     return nested
 
@@ -393,13 +458,16 @@ def extract_updates(data):
 def has_update_container(data):
     if isinstance(data, list):
         return True
+
     if not isinstance(data, dict) or data.get("ok") is False:
         return False
 
     for key in ("result", "updates", "data"):
         value = data.get(key)
+
         if isinstance(value, list):
             return True
+
         if isinstance(value, dict) and any(
             isinstance(value.get(nested_key), list)
             for nested_key in ("updates", "messages", "result")
@@ -431,11 +499,13 @@ def extract_message(update):
 
     chat_id = message.get("chat_id")
     chat = message.get("chat")
+
     if chat_id is None and isinstance(chat, dict):
         chat_id = chat.get("id")
 
     if chat_id is None:
         sender = message.get("from")
+
         if isinstance(sender, dict):
             chat_id = sender.get("id")
         elif sender is not None:
@@ -456,6 +526,7 @@ def get_update_id(update):
 
     for key in ("update_id", "updateId", "id"):
         value = update.get(key)
+
         if isinstance(value, int) and not isinstance(value, bool):
             return value
 
@@ -466,9 +537,9 @@ def get_update_id(update):
 # Message processing
 # =========================
 
-
 def process_message(chat_id, text):
     text = text.strip()
+
     if not text:
         return
 
@@ -489,15 +560,19 @@ def process_message(chat_id, text):
 
     try:
         answer = call_ai(chat_id, text)
+
         if send_message(chat_id, answer):
             save_turn(chat_id, text, answer)
+
     except UserVisibleError as exc:
         send_message(chat_id, str(exc))
+
     except Exception as exc:
         logger.error(
             "Message processing failed: type=%s",
             type(exc).__name__,
         )
+
         send_message(
             chat_id,
             "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن."
@@ -516,10 +591,12 @@ def process_update_batch(updates):
 
     for update in updates:
         update_id = get_update_id(update)
+
         if update_id is not None:
             last_update_id = update_id
 
         extracted = extract_message(update)
+
         if extracted is None:
             continue
 
@@ -527,14 +604,20 @@ def process_update_batch(updates):
         grouped_messages.setdefault(chat_id, []).append(text)
 
     futures = []
+
     for chat_id, messages in grouped_messages.items():
         futures.append(
-            _message_executor.submit(process_chat_batch, chat_id, messages)
+            _message_executor.submit(
+                process_chat_batch,
+                chat_id,
+                messages,
+            )
         )
 
     for future in futures:
         try:
             future.result()
+
         except Exception as exc:
             logger.error(
                 "Chat batch failed: type=%s",
@@ -548,11 +631,11 @@ def process_update_batch(updates):
 # Polling
 # =========================
 
-
 _message_executor = ThreadPoolExecutor(
     max_workers=MAX_PARALLEL_CHATS,
     thread_name_prefix="NeptonChat",
 )
+
 _polling_stop = threading.Event()
 _polling_lock = threading.Lock()
 _polling_started = False
@@ -568,6 +651,7 @@ def polling_loop():
     while not _polling_stop.is_set():
         try:
             payload = {}
+
             if offset is not None:
                 payload["offset"] = offset
 
@@ -575,16 +659,26 @@ def polling_loop():
 
             if data is None:
                 _polling_stop.wait(error_backoff)
-                error_backoff = min(error_backoff * 2, POLL_ERROR_BACKOFF_MAX)
+                error_backoff = min(
+                    error_backoff * 2,
+                    POLL_ERROR_BACKOFF_MAX,
+                )
                 continue
 
             if not has_update_container(data):
-                logger.error("Soroush getUpdates returned an unexpected response")
+                logger.error(
+                    "Soroush getUpdates returned an unexpected response"
+                )
+
                 _polling_stop.wait(error_backoff)
-                error_backoff = min(error_backoff * 2, POLL_ERROR_BACKOFF_MAX)
+                error_backoff = min(
+                    error_backoff * 2,
+                    POLL_ERROR_BACKOFF_MAX,
+                )
                 continue
 
             updates = extract_updates(data)
+
             if not updates:
                 error_backoff = POLL_ERROR_BACKOFF_START
                 _polling_stop.wait(POLL_EMPTY_WAIT)
@@ -603,13 +697,18 @@ def polling_loop():
                 "Polling iteration failed: type=%s",
                 type(exc).__name__,
             )
+
             _polling_stop.wait(error_backoff)
-            error_backoff = min(error_backoff * 2, POLL_ERROR_BACKOFF_MAX)
+            error_backoff = min(
+                error_backoff * 2,
+                POLL_ERROR_BACKOFF_MAX,
+            )
 
 
 def _polling_main():
     try:
         polling_loop()
+
     except Exception as exc:
         # A final guard prevents an unhandled exception from being silent.
         logger.error(
@@ -622,15 +721,21 @@ def start_polling():
     global _polling_started, _polling_thread
 
     with _polling_lock:
-        if _polling_started and _polling_thread and _polling_thread.is_alive():
+        if (
+            _polling_started
+            and _polling_thread
+            and _polling_thread.is_alive()
+        ):
             return
 
         _polling_stop.clear()
+
         _polling_thread = threading.Thread(
             target=_polling_main,
             name="SoroushPolling",
             daemon=True,
         )
+
         _polling_thread.start()
         _polling_started = True
 

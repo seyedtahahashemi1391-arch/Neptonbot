@@ -19,7 +19,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.2.6"
+VERSION = "2.2.7"
 ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -41,6 +41,11 @@ POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
 MAX_WORKER_RETRIES = 2
+
+START_MESSAGE = (
+    "سلام! من نپتون بات هستم.\n"
+    "به هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم."
+)
 
 CREATOR_ANSWER = (
     "من توسط نپتون ساخته شدم. "
@@ -187,10 +192,7 @@ def set_admin_chat_id(chat_id):
     with admin_lock:
         admin_chat_id = str(chat_id)
 
-    logger.info(
-        "Admin chat registered from verified sender username"
-    )
-
+    logger.info("Admin chat registered from verified sender username")
     return True
 
 
@@ -206,6 +208,15 @@ app = Flask(__name__)
 
 _polling_thread = None
 _polling_stop = threading.Event()
+
+# Queue variables are initialized before health can be requested.
+_chat_queue = queue.Queue(
+    maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS
+)
+_chat_queue_lock = threading.Lock()
+_chat_messages = {}
+_pending_message_count = 0
+_worker_threads = []
 
 
 @app.get("/")
@@ -281,18 +292,12 @@ def cloudflare_post_with_retry(session, payload):
                     "Temporary Cloudflare network failure; retrying once"
                 )
                 continue
-
             raise
 
         if response.status_code in (500, 502, 503, 504) and attempt == 0:
             status = response.status_code
             response.close()
-
-            logger.warning(
-                "Cloudflare HTTP %s; retrying once",
-                status,
-            )
-
+            logger.warning("Cloudflare HTTP %s; retrying once", status)
             continue
 
         return response
@@ -311,7 +316,6 @@ def call_ai(chat_id, user_text):
     ]
 
     messages.extend(get_history(chat_id))
-
     messages.append({
         "role": "user",
         "content": user_text,
@@ -332,11 +336,7 @@ def call_ai(chat_id, user_text):
     started = time.perf_counter()
 
     try:
-        with cloudflare_post_with_retry(
-            session,
-            payload,
-        ) as response:
-
+        with cloudflare_post_with_retry(session, payload) as response:
             if not 200 <= response.status_code < 300:
                 logger.error(
                     "Cloudflare HTTP error: status=%s",
@@ -355,12 +355,8 @@ def call_ai(chat_id, user_text):
 
             try:
                 data = response.json()
-
             except ValueError as exc:
-                logger.error(
-                    "Cloudflare returned invalid JSON"
-                )
-
+                logger.error("Cloudflare returned invalid JSON")
                 raise UserVisibleError(
                     "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
                 ) from exc
@@ -370,7 +366,6 @@ def call_ai(chat_id, user_text):
 
     except requests.exceptions.Timeout as exc:
         logger.warning("Cloudflare request timed out")
-
         raise UserVisibleError(
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
         ) from exc
@@ -380,7 +375,6 @@ def call_ai(chat_id, user_text):
             "Cloudflare network error: type=%s",
             type(exc).__name__,
         )
-
         raise UserVisibleError(
             "ارتباط با سرویس هوش مصنوعی برقرار نشد."
         ) from exc
@@ -392,9 +386,7 @@ def call_ai(chat_id, user_text):
         )
 
     if not isinstance(data, dict):
-        raise UserVisibleError(
-            "ساختار پاسخ هوش مصنوعی نامعتبر است."
-        )
+        raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
 
     choices = data.get("choices")
 
@@ -403,10 +395,7 @@ def call_ai(chat_id, user_text):
         or not choices
         or not isinstance(choices[0], dict)
     ):
-        logger.error(
-            "Cloudflare response has no valid choices"
-        )
-
+        logger.error("Cloudflare response has no valid choices")
         raise UserVisibleError(
             "مدل نتوانست پاسخ معتبری تولید کند."
         )
@@ -442,7 +431,6 @@ def call_ai(chat_id, user_text):
             "Empty AI content; finish_reason=%r",
             choices[0].get("finish_reason"),
         )
-
         raise UserVisibleError(
             "مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن."
         )
@@ -475,7 +463,6 @@ def soroush_request(method, payload=None):
 
             try:
                 return response.json()
-
             except ValueError:
                 logger.error(
                     "Soroush invalid JSON: method=%s",
@@ -489,7 +476,6 @@ def soroush_request(method, payload=None):
             method,
             type(exc).__name__,
         )
-
         return None
 
 
@@ -527,7 +513,6 @@ def send_message(chat_id, text):
                 logger.error(
                     "Soroush sendMessage failed or was rejected"
                 )
-
                 success = False
                 break
 
@@ -558,11 +543,7 @@ def extract_updates(data):
             return value
 
         if isinstance(value, dict):
-            for nested_key in (
-                "updates",
-                "messages",
-                "result",
-            ):
+            for nested_key in ("updates", "messages", "result"):
                 nested = value.get(nested_key)
 
                 if isinstance(nested, list):
@@ -670,9 +651,7 @@ def get_update_id(update):
 # =========================================================
 def is_creator_question(user_text):
     normalized = user_text.strip().lower()
-
-    normalized = normalized.replace("ي", "ی")
-    normalized = normalized.replace("ك", "ک")
+    normalized = normalized.replace("ي", "ی").replace("ك", "ک")
     normalized = normalized.replace("\u200c", " ")
 
     normalized = re.sub(
@@ -733,13 +712,16 @@ def process_message(chat_id, text, queued_at):
     if not text:
         return True
 
-    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    command = (
+        text.split(maxsplit=1)[0]
+        .split("@", 1)[0]
+        .lower()
+    )
 
     if command == "/start":
         send_ok = send_message(
             chat_id,
-            "سلام! من نپتون هستم.\n"
-            "به هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم.",
+            START_MESSAGE,
         )
 
         logger.info(
@@ -766,7 +748,6 @@ def process_message(chat_id, text, queued_at):
 
         return send_ok
 
-    # پاسخ سازنده به‌صورت قطعی و مستقل از مدل
     if is_creator_question(text):
         send_ok = send_message(
             chat_id,
@@ -854,16 +835,6 @@ def process_message(chat_id, text, queued_at):
 # =========================================================
 # Per-chat asynchronous queue
 # =========================================================
-_chat_queue = queue.Queue(
-    maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS
-)
-
-_chat_queue_lock = threading.Lock()
-_chat_messages = {}
-_pending_message_count = 0
-_worker_threads = []
-
-
 def enqueue_chat_messages(grouped_messages):
     global _pending_message_count
 
@@ -979,12 +950,10 @@ def chat_worker():
                 if messages:
                     try:
                         _chat_queue.put_nowait(chat_id)
-
                     except queue.Full:
                         logger.critical(
                             "Worker queue unexpectedly full"
                         )
-
                 else:
                     _chat_messages.pop(chat_id, None)
 
@@ -1088,7 +1057,6 @@ def polling_loop():
                     backoff * 2,
                     POLL_ERROR_BACKOFF_MAX,
                 )
-
                 continue
 
             updates = extract_updates(data)

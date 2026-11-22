@@ -22,7 +22,7 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
 
-VERSION = "2.2"
+VERSION = "2.2.1"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 
@@ -310,6 +310,13 @@ def call_ai(chat_id, user_text):
         "messages": messages,
         "temperature": 0.5,
         "max_completion_tokens": 2048,
+
+        # Experimental optimization:
+        # Disable GLM thinking mode for this test.
+        "chat_template_kwargs": {
+            "enable_thinking": False
+        },
+
         "stream": False,
     }
 
@@ -598,7 +605,7 @@ def extract_message(update):
         or message.get("message_text")
     )
 
-    chat_id = message.get("chat_id")
+    chat_id = message.get("chat_id)
     chat = message.get("chat")
 
     if chat_id is None and isinstance(chat, dict):

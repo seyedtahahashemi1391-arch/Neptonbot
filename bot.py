@@ -1,8 +1,10 @@
 
 import os
+import time
 import logging
 import threading
 import queue
+
 from collections import OrderedDict, deque
 
 import requests
@@ -10,9 +12,9 @@ from requests.adapters import HTTPAdapter
 from flask import Flask, jsonify
 
 
-# =========================
+# =========================================================
 # Configuration
-# =========================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
@@ -20,7 +22,10 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
 
+VERSION = "2.2"
+
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
+
 CLOUDFLARE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
@@ -55,9 +60,9 @@ SYSTEM_PROMPT = (
 )
 
 
-# =========================
+# =========================================================
 # Logging
-# =========================
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -67,9 +72,9 @@ logging.basicConfig(
 logger = logging.getLogger("NeptonBot")
 
 
-# =========================
+# =========================================================
 # Environment validation
-# =========================
+# =========================================================
 
 _missing = []
 
@@ -88,13 +93,14 @@ if _missing:
     )
 
 logger.info("Environment variables verified")
+logger.info("NeptonBot version: %s", VERSION)
 logger.info("AI provider: Cloudflare Workers AI")
 logger.info("Model: %s", MODEL)
 
 
-# =========================
-# HTTP sessions
-# =========================
+# =========================================================
+# Per-thread HTTP sessions
+# =========================================================
 
 _thread_local = threading.local()
 
@@ -113,7 +119,7 @@ def _new_session():
     session.mount("http://", adapter)
 
     session.headers.update({
-        "User-Agent": "NeptonBot/2.1",
+        "User-Agent": f"NeptonBot/{VERSION}",
         "Accept": "application/json",
     })
 
@@ -130,9 +136,9 @@ def get_http_session(name):
     return session
 
 
-# =========================
+# =========================================================
 # Conversation memory
-# =========================
+# =========================================================
 
 conversation_history = OrderedDict()
 history_lock = threading.Lock()
@@ -178,9 +184,9 @@ def reset_history(chat_id):
         conversation_history.pop(chat_id, None)
 
 
-# =========================
+# =========================================================
 # Flask application
-# =========================
+# =========================================================
 
 app = Flask(__name__)
 
@@ -193,7 +199,7 @@ def home():
     return jsonify({
         "status": "online",
         "bot": "Nepton",
-        "version": "2.1",
+        "version": VERSION,
         "provider": "Cloudflare Workers AI",
         "model": MODEL,
     })
@@ -207,32 +213,36 @@ def health():
         return jsonify({
             "status": "degraded",
             "polling": "stopped",
+            "version": VERSION,
         }), 503
 
     with _chat_queue_lock:
-        pending = _pending_message_count
+        pending_messages = _pending_message_count
         active_chats = len(_chat_messages)
+        waiting_chats = _chat_queue.qsize()
 
     return jsonify({
         "status": "healthy",
         "polling": "running",
-        "queued_messages": pending,
-        "active_chats": active_chats,
+        "version": VERSION,
+        "queued_messages": pending_messages,
+        "active_or_waiting_chats": active_chats,
+        "waiting_chats": waiting_chats,
         "workers": MAX_PARALLEL_CHATS,
     }), 200
 
 
-# =========================
-# Application errors
-# =========================
+# =========================================================
+# Safe application errors
+# =========================================================
 
 class UserVisibleError(Exception):
     pass
 
 
-# =========================
+# =========================================================
 # Cloudflare AI
-# =========================
+# =========================================================
 
 _cloudflare_headers = {
     "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
@@ -258,7 +268,7 @@ def cloudflare_post_with_retry(session, payload):
         ):
             if attempt == 0:
                 logger.warning(
-                    "Temporary Cloudflare network failure; retrying"
+                    "Temporary Cloudflare network failure; retrying once"
                 )
                 continue
 
@@ -283,12 +293,10 @@ def cloudflare_post_with_retry(session, payload):
 
 
 def call_ai(chat_id, user_text):
-    messages = [
-        {
-            "role": "system",
-            "content": SYSTEM_PROMPT,
-        }
-    ]
+    messages = [{
+        "role": "system",
+        "content": SYSTEM_PROMPT,
+    }]
 
     messages.extend(get_history(chat_id))
 
@@ -306,6 +314,7 @@ def call_ai(chat_id, user_text):
     }
 
     session = get_http_session("cloudflare_session")
+    ai_started = time.perf_counter()
 
     try:
         with cloudflare_post_with_retry(
@@ -331,8 +340,10 @@ def call_ai(chat_id, user_text):
 
             try:
                 data = response.json()
+
             except ValueError as exc:
                 logger.error("Cloudflare returned invalid JSON")
+
                 raise UserVisibleError(
                     "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
                 ) from exc
@@ -342,6 +353,7 @@ def call_ai(chat_id, user_text):
 
     except requests.exceptions.Timeout as exc:
         logger.warning("Cloudflare request timed out")
+
         raise UserVisibleError(
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
         ) from exc
@@ -351,12 +363,21 @@ def call_ai(chat_id, user_text):
             "Cloudflare network error: type=%s",
             type(exc).__name__,
         )
+
         raise UserVisibleError(
             "ارتباط با سرویس هوش مصنوعی برقرار نشد."
         ) from exc
 
+    finally:
+        logger.info(
+            "TIMING cloudflare_request_ms=%.0f",
+            (time.perf_counter() - ai_started) * 1000,
+        )
+
     if not isinstance(data, dict):
-        raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
+        raise UserVisibleError(
+            "ساختار پاسخ هوش مصنوعی نامعتبر است."
+        )
 
     choices = data.get("choices")
 
@@ -365,18 +386,25 @@ def call_ai(chat_id, user_text):
             "Cloudflare response has no choices; keys=%s",
             list(data.keys()),
         )
-        raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
+
+        raise UserVisibleError(
+            "مدل نتوانست پاسخ معتبری تولید کند."
+        )
 
     first = choices[0]
 
     if not isinstance(first, dict):
-        raise UserVisibleError("ساختار خروجی مدل نامعتبر است.")
+        raise UserVisibleError(
+            "ساختار خروجی مدل نامعتبر است."
+        )
 
     finish_reason = first.get("finish_reason")
     message = first.get("message")
 
     if not isinstance(message, dict):
-        raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
+        raise UserVisibleError(
+            "ساختار پیام خروجی مدل نامعتبر است."
+        )
 
     content = message.get("content")
 
@@ -400,7 +428,7 @@ def call_ai(chat_id, user_text):
 
     if not answer:
         logger.error(
-            "Empty AI content; finish_reason=%r; keys=%s",
+            "Empty AI content; finish_reason=%r; message_keys=%s",
             finish_reason,
             list(message.keys()),
         )
@@ -412,9 +440,9 @@ def call_ai(chat_id, user_text):
     return answer
 
 
-# =========================
+# =========================================================
 # Soroush Plus API
-# =========================
+# =========================================================
 
 def soroush_request(method, payload=None):
     url = f"{SOROUSH_API}/{method}"
@@ -438,6 +466,7 @@ def soroush_request(method, payload=None):
 
             try:
                 return response.json()
+
             except ValueError:
                 logger.error(
                     "Soroush invalid JSON: method=%s",
@@ -446,6 +475,7 @@ def soroush_request(method, payload=None):
                 return None
 
     except requests.exceptions.RequestException as exc:
+        # Never log the URL because it contains the bot token.
         logger.error(
             "Soroush network error: method=%s type=%s",
             method,
@@ -465,29 +495,42 @@ def send_message(chat_id, text):
     if not isinstance(text, str) or not text:
         return False
 
-    for chunk in split_message(text):
-        result = soroush_request(
-            "sendMessage",
-            {
-                "chat_id": chat_id,
-                "text": chunk,
-            },
+    send_started = time.perf_counter()
+    success = True
+
+    try:
+        for chunk in split_message(text):
+            result = soroush_request(
+                "sendMessage",
+                {
+                    "chat_id": chat_id,
+                    "text": chunk,
+                },
+            )
+
+            if result is None:
+                logger.error("Soroush sendMessage failed")
+                success = False
+                break
+
+            if isinstance(result, dict) and result.get("ok") is False:
+                logger.error("Soroush rejected sendMessage")
+                success = False
+                break
+
+        return success
+
+    finally:
+        logger.info(
+            "TIMING send_message_ms=%.0f success=%s",
+            (time.perf_counter() - send_started) * 1000,
+            success,
         )
 
-        if result is None:
-            logger.error("Soroush sendMessage failed")
-            return False
 
-        if isinstance(result, dict) and result.get("ok") is False:
-            logger.error("Soroush rejected sendMessage")
-            return False
-
-    return True
-
-
-# =========================
+# =========================================================
 # Update parsing
-# =========================
+# =========================================================
 
 def extract_updates(data):
     if isinstance(data, list):
@@ -566,6 +609,7 @@ def extract_message(update):
 
         if isinstance(sender, dict):
             chat_id = sender.get("id")
+
         elif sender is not None:
             chat_id = sender
 
@@ -591,17 +635,28 @@ def get_update_id(update):
     return None
 
 
-# =========================
-# Message processing
-# =========================
+# =========================================================
+# Message processing and timing
+# =========================================================
 
-def process_message(chat_id, text):
+def process_message(chat_id, text, queued_at):
+    total_started = time.perf_counter()
+
+    queue_wait_ms = max(
+        0,
+        (total_started - queued_at) * 1000,
+    )
+
     text = text.strip()
 
     if not text:
         return
 
-    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    command = (
+        text.split(maxsplit=1)[0]
+        .split("@", 1)[0]
+        .lower()
+    )
 
     if command == "/start":
         send_message(
@@ -609,21 +664,55 @@ def process_message(chat_id, text):
             "سلام! من نپتون هستم.\n"
             "به هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم."
         )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=start",
+            queue_wait_ms,
+            (time.perf_counter() - total_started) * 1000,
+        )
         return
 
     if command == "/reset":
         reset_history(chat_id)
-        send_message(chat_id, "حافظه گفت‌وگوی شما پاک شد.")
+
+        send_message(
+            chat_id,
+            "حافظه گفت‌وگوی شما پاک شد."
+        )
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset",
+            queue_wait_ms,
+            (time.perf_counter() - total_started) * 1000,
+        )
         return
+
+    if len(text) > MAX_MESSAGE_LENGTH:
+        text = text[:MAX_MESSAGE_LENGTH]
 
     try:
         answer = call_ai(chat_id, text)
 
-        if send_message(chat_id, answer):
+        send_success = send_message(chat_id, answer)
+
+        if send_success:
             save_turn(chat_id, text, answer)
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=%s",
+            queue_wait_ms,
+            (time.perf_counter() - total_started) * 1000,
+            "sent" if send_success else "send_failed",
+        )
 
     except UserVisibleError as exc:
         send_message(chat_id, str(exc))
+
+        logger.warning(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error",
+            queue_wait_ms,
+            (time.perf_counter() - total_started) * 1000,
+        )
 
     except Exception as exc:
         logger.error(
@@ -636,12 +725,20 @@ def process_message(chat_id, text):
             "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن."
         )
 
+        logger.error(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=internal_error",
+            queue_wait_ms,
+            (time.perf_counter() - total_started) * 1000,
+        )
 
-# =========================
+
+# =========================================================
 # Asynchronous chat queue
-# =========================
+# =========================================================
 
-_chat_queue = queue.Queue(maxsize=MAX_CONVERSATIONS)
+_chat_queue = queue.Queue(
+    maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS
+)
 
 _chat_queue_lock = threading.Lock()
 
@@ -677,10 +774,10 @@ def enqueue_chat_messages(grouped_messages):
             return False
 
         if (
-            _chat_queue.qsize() + len(new_chats)
+            len(_chat_messages) + len(new_chats)
             > MAX_CONVERSATIONS
         ):
-            logger.warning("Chat queue capacity reached")
+            logger.warning("Conversation queue capacity reached")
             return False
 
         for chat_id, messages in grouped_messages.items():
@@ -688,7 +785,12 @@ def enqueue_chat_messages(grouped_messages):
                 _chat_messages[chat_id] = deque()
                 _chat_queue.put_nowait(chat_id)
 
-            _chat_messages[chat_id].extend(messages)
+            received_at = time.perf_counter()
+
+            for message_text in messages:
+                _chat_messages[chat_id].append(
+                    (message_text, received_at)
+                )
 
         _pending_message_count += incoming_count
 
@@ -707,14 +809,21 @@ def chat_worker():
 
                 if not messages:
                     _chat_messages.pop(chat_id, None)
-                    text = None
+                    item = None
+
                 else:
-                    text = messages.popleft()
+                    item = messages.popleft()
                     _pending_message_count -= 1
 
-            if text is not None:
+            if item is not None:
+                message_text, queued_at = item
+
                 try:
-                    process_message(chat_id, text)
+                    process_message(
+                        chat_id,
+                        message_text,
+                        queued_at,
+                    )
 
                 except Exception as exc:
                     logger.error(
@@ -726,9 +835,8 @@ def chat_worker():
                 messages = _chat_messages.get(chat_id)
 
                 if messages:
-                    # Put the chat at the end of the queue.
-                    # This provides fairness between conversations.
                     _chat_queue.put_nowait(chat_id)
+
                 else:
                     _chat_messages.pop(chat_id, None)
 
@@ -743,6 +851,7 @@ def chat_worker():
 
                 if messages:
                     _chat_queue.put_nowait(chat_id)
+
                 else:
                     _chat_messages.pop(chat_id, None)
 
@@ -770,9 +879,9 @@ def start_chat_workers():
     )
 
 
-# =========================
+# =========================================================
 # Update batch handling
-# =========================
+# =========================================================
 
 def process_update_batch(updates):
     grouped_messages = OrderedDict()
@@ -802,9 +911,9 @@ def process_update_batch(updates):
     return last_update_id
 
 
-# =========================
+# =========================================================
 # Polling
-# =========================
+# =========================================================
 
 _polling_lock = threading.Lock()
 _polling_started = False
@@ -823,7 +932,21 @@ def polling_loop():
             if offset is not None:
                 payload["offset"] = offset
 
-            data = soroush_request("getUpdates", payload)
+            poll_started = time.perf_counter()
+
+            data = soroush_request(
+                "getUpdates",
+                payload,
+            )
+
+            poll_duration_ms = (
+                time.perf_counter() - poll_started
+            ) * 1000
+
+            logger.info(
+                "TIMING get_updates_ms=%.0f",
+                poll_duration_ms,
+            )
 
             if data is None:
                 _polling_stop.wait(error_backoff)
@@ -856,11 +979,11 @@ def polling_loop():
 
             last_update_id = process_update_batch(updates)
 
-            # Advance only after the entire batch is accepted
-            # by the in-memory queue.
+            # Advance only after successful queue acceptance.
             if last_update_id is not None:
                 if last_update_id < (offset or -1):
                     logger.warning("Unexpected update ID")
+
                 else:
                     offset = last_update_id + 1
 
@@ -914,11 +1037,14 @@ def start_polling():
         _polling_started = True
 
 
-# =========================
-# Application startup
-# =========================
+# =========================================================
+# Startup
+# =========================================================
 
 start_chat_workers()
 start_polling()
 
-logger.info("NeptonBot 2.1 started successfully")
+logger.info(
+    "NeptonBot %s started successfully",
+    VERSION,
+)

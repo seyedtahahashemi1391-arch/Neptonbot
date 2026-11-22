@@ -324,34 +324,51 @@ def call_ai(chat_id, user_text):
     if not isinstance(first_choice, dict):
         raise UserVisibleError("ساختار خروجی مدل نامعتبر است.")
 
+    finish_reason = first_choice.get("finish_reason")
     message = first_choice.get("message")
 
     if not isinstance(message, dict):
+        logger.error(
+            "Cloudflare response has no valid message; finish_reason=%r",
+            finish_reason,
+        )
         raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
 
-    answer = message.get("content")
+    content = message.get("content")
 
-    if isinstance(answer, list):
+    if isinstance(content, str):
+        answer = content.strip()
+
+    elif isinstance(content, list):
         parts = []
 
-        for item in answer:
-            if isinstance(item, dict):
-                part = item.get("text")
+        for item in content:
+            if not isinstance(item, dict):
+                continue
 
-                if isinstance(part, str):
-                    parts.append(part)
+            part = item.get("text")
 
-        answer = "".join(parts)
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
 
-    if not isinstance(answer, str) or not answer.strip():
+        answer = "\n".join(parts).strip()
+
+    else:
+        answer = ""
+
+    if not answer:
         logger.error(
-            "Cloudflare returned empty content; message_keys=%s",
+            "Cloudflare returned empty final content; "
+            "finish_reason=%r, message_keys=%s",
+            finish_reason,
             list(message.keys()),
         )
 
-        raise UserVisibleError("مدل پاسخ متنی تولید نکرد.")
+        raise UserVisibleError(
+            "مدل این بار پاسخ متنی تولید نکرد. لطفاً دوباره تلاش کن."
+        )
 
-    return answer.strip()
+    return answer
 
 
 # =========================

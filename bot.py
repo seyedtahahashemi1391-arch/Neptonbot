@@ -21,7 +21,7 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
 
-VERSION = "2.2.1"
+VERSION = "2.2.2-diagnostic"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 
@@ -43,6 +43,11 @@ MAX_QUEUED_MESSAGES = 1000
 POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
+
+# Only the first few accepted messages are structurally inspected.
+DIAGNOSTIC_MAX_LOGS = 10
+_diagnostic_log_count = 0
+_diagnostic_lock = threading.Lock()
 
 SYSTEM_PROMPT = (
     "تو دستیار هوش مصنوعی Nepton هستی. "
@@ -309,13 +314,9 @@ def call_ai(chat_id, user_text):
         "messages": messages,
         "temperature": 0.5,
         "max_completion_tokens": 2048,
-
-        # Experimental optimization:
-        # Disable GLM thinking mode for this test.
         "chat_template_kwargs": {
             "enable_thinking": False
         },
-
         "stream": False,
     }
 
@@ -535,8 +536,122 @@ def send_message(chat_id, text):
 
 
 # =========================================================
-# Update parsing
+# Update parsing and privacy-safe diagnostics
 # =========================================================
+
+def _value_type(value):
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "float"
+    return type(value).__name__
+
+
+def _collect_key_paths(value, target_keys, prefix="", depth=0, max_depth=4):
+    """Return key paths only; never return or log field values."""
+    found = []
+
+    if depth > max_depth:
+        return found
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            path = f"{prefix}.{key_text}" if prefix else key_text
+
+            if key_text.lower() in target_keys:
+                found.append((path, child))
+
+            if isinstance(child, (dict, list)):
+                found.extend(
+                    _collect_key_paths(
+                        child,
+                        target_keys,
+                        path,
+                        depth + 1,
+                        max_depth,
+                    )
+                )
+
+    elif isinstance(value, list):
+        for index, child in enumerate(value[:5]):
+            if isinstance(child, (dict, list)):
+                found.extend(
+                    _collect_key_paths(
+                        child,
+                        target_keys,
+                        f"{prefix}[{index}]",
+                        depth + 1,
+                        max_depth,
+                    )
+                )
+
+    return found
+
+
+def _diagnose_update_structure(update, message, resolved_chat_id):
+    """
+    Logs only structural metadata.
+    No message text, token, chat ID, username, or other personal values
+    are written to logs.
+    """
+    global _diagnostic_log_count
+
+    with _diagnostic_lock:
+        if _diagnostic_log_count >= DIAGNOSTIC_MAX_LOGS:
+            return
+        _diagnostic_log_count += 1
+        diagnostic_number = _diagnostic_log_count
+
+    username_entries = _collect_key_paths(
+        update,
+        {"username", "user_name", "screen_name"},
+    )
+
+    admin_candidate = False
+    username_paths = []
+
+    for path, value in username_entries:
+        username_paths.append(path)
+
+        if isinstance(value, str):
+            normalized = value.strip().lstrip("@").lower()
+            if normalized == "t91m62":
+                admin_candidate = True
+
+    sender_paths = _collect_key_paths(
+        update,
+        {"from", "sender", "user", "author"},
+    )
+
+    sender_path_names = [path for path, _ in sender_paths[:12]]
+
+    logger.info(
+        "DIAGNOSTIC update=%s update_keys=%s message_keys=%s "
+        "chat_id_present=%s chat_id_type=%s "
+        "username_paths=%s sender_paths=%s admin_candidate=%s",
+        diagnostic_number,
+        sorted(str(key) for key in update.keys())
+        if isinstance(update, dict) else [],
+        sorted(str(key) for key in message.keys())
+        if isinstance(message, dict) else [],
+        resolved_chat_id is not None,
+        _value_type(resolved_chat_id),
+        username_paths[:12],
+        sender_path_names,
+        admin_candidate,
+    )
+
 
 def extract_updates(data):
     if isinstance(data, list):
@@ -604,7 +719,6 @@ def extract_message(update):
         or message.get("message_text")
     )
 
-    # FIX: the closing quotation mark after chat_id was missing.
     chat_id = message.get("chat_id")
     chat = message.get("chat")
 
@@ -619,6 +733,10 @@ def extract_message(update):
 
         elif sender is not None:
             chat_id = sender
+
+    # Diagnostic probe is deliberately separate from ID selection.
+    # It does not assume username is a valid chat_id.
+    _diagnose_update_structure(update, message, chat_id)
 
     if text is None or chat_id is None:
         return None
@@ -986,7 +1104,6 @@ def polling_loop():
 
             last_update_id = process_update_batch(updates)
 
-            # Advance only after successful queue acceptance.
             if last_update_id is not None:
                 if last_update_id < (offset or -1):
                     logger.warning("Unexpected update ID")

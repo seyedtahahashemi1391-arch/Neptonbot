@@ -1,16 +1,23 @@
-import os
-import re
-import time
-import random
-import sqlite3
+import atexit
+import json
 import logging
+import os
+import random
+import re
+import sqlite3
 import threading
+import time
 from contextlib import contextmanager
-from collections import OrderedDict, deque
+from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
 from flask import Flask, jsonify
+
+try:
+    import fcntl
+except ImportError:  # Windows development fallback; Render/Linux supports fcntl.
+    fcntl = None
 
 
 # =========================================================
@@ -20,9 +27,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
-MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.4.1"
-ADMIN_USERNAME = "t91m62"
+MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
+VERSION = "2.5.0"
+ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 CLOUDFLARE_URL = (
@@ -30,18 +37,20 @@ CLOUDFLARE_URL = (
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
 
-DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3")
+DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3").strip()
 
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
 
 MAX_HISTORY_MESSAGES = 12
 MAX_CONVERSATIONS = 500
+HISTORY_RETENTION_DAYS = 30
 MAX_MESSAGE_LENGTH = 3500
 MAX_PARALLEL_CHATS = 3
 MAX_QUEUED_MESSAGES = 1000
 
-POLL_EMPTY_WAIT = 0.8
+POLL_EMPTY_WAIT = 1.5
+POLL_EMPTY_WAIT_MAX = 5.0
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
 
@@ -49,9 +58,12 @@ MAX_WORKER_RETRIES = 5
 RETRY_BACKOFF_START = 2
 RETRY_BACKOFF_MAX = 120
 WORKER_IDLE_WAIT = 0.25
+WORKER_LEASE_SECONDS = 420
+SUPERVISOR_INTERVAL = 5
 
-PROCESSED_UPDATE_RETENTION_DAYS = 14
-PROCESSED_UPDATE_CLEANUP_INTERVAL = 6 * 60 * 60
+PROCESSED_UPDATE_RETENTION_DAYS = 30
+DEAD_LETTER_RETENTION_DAYS = 30
+DB_CLEANUP_INTERVAL = 6 * 60 * 60
 
 FEEDBACK_COMMAND = "/feedback"
 FEEDBACK_CANCEL_COMMAND = "/cancel"
@@ -73,15 +85,18 @@ SYSTEM_PROMPT = (
     "تو دستیار هوش مصنوعی Nepton هستی. "
     "به زبان پیام کاربر پاسخ بده و پاسخ را دقیق، مستقیم، روشن و متناسب با سؤال بنویس. "
     "از مقدمه‌های کلیشه‌ای، تکرار سؤال و توضیحات غیرضروری پرهیز کن. "
-    "برای سؤال‌های کوتاه، پاسخ کوتاه و روشن بده؛ فقط در صورت نیاز جزئیات اضافه کن. "
+    "برای سؤال‌های کوتاه، پاسخ کوتاه و روشن بده و فقط در صورت نیاز جزئیات اضافه کن. "
     "درستی اطلاعات را بر روانی متن مقدم بدان و هیچ واقعیت، منبع، آزمون یا تجربه‌ای را جعل نکن. "
     "اطلاعات متغیر مانند قیمت، رتبه‌بندی و وضعیت روز را بدون منبع به‌روز قطعی اعلام نکن. "
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
-    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن."
+    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
+    "درخواست‌هایی را که می‌توانند به آسیب واقعی، سوءاستفاده یا فعالیت غیرقانونی کمک کنند، "
+    "با راهنمایی ایمن و غیرعملیاتی پاسخ بده."
 )
 
 _missing = [
-    name for name, value in (
+    name
+    for name, value in (
         ("BOT_TOKEN", BOT_TOKEN),
         ("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID),
         ("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN),
@@ -91,20 +106,25 @@ _missing = [
 if _missing:
     raise RuntimeError("Missing environment variables: " + ", ".join(_missing))
 
+if not DB_PATH:
+    raise RuntimeError("NEPTON_DB_PATH cannot be empty")
+
 
 # =========================================================
-# Logging and HTTP sessions
+# Logging
 # =========================================================
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=os.getenv("NEPTON_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s pid=%(process)d %(threadName)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
 
-logger.info("NeptonBot version: %s", VERSION)
-logger.info("AI provider: Cloudflare Workers AI")
-logger.info("Model: %s", MODEL)
+logger.info("Starting NeptonBot version=%s model=%s", VERSION, MODEL)
 
+
+# =========================================================
+# HTTP sessions (one requests.Session per thread)
+# =========================================================
 _thread_local = threading.local()
 
 
@@ -134,14 +154,13 @@ def get_http_session(name):
 
 
 # =========================================================
-# SQLite persistent state
+# SQLite database
 # =========================================================
 _db_init_lock = threading.Lock()
 
 
 @contextmanager
 def db_connect():
-    """اتصال SQLite را در همهٔ حالت‌ها می‌بندد."""
     connection = sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -150,7 +169,7 @@ def db_connect():
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 30000")
     connection.execute("PRAGMA foreign_keys = ON")
-
+    connection.execute("PRAGMA synchronous = FULL")
     try:
         yield connection
     except Exception:
@@ -166,20 +185,25 @@ def db_connect():
 def _table_columns(db, table_name):
     return {
         row["name"]
-        for row in db.execute(
-            f"PRAGMA table_info({table_name})"
-        ).fetchall()
+        for row in db.execute(f"PRAGMA table_info({table_name})").fetchall()
     }
+
+
+def _add_column_if_missing(db, table_name, column_name, definition):
+    if column_name not in _table_columns(db, table_name):
+        db.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+        )
 
 
 def init_database():
     with _db_init_lock:
-        parent = os.path.dirname(os.path.abspath(DB_PATH))
-        os.makedirs(parent, exist_ok=True)
+        db_parent = Path(DB_PATH).expanduser().resolve().parent
+        db_parent.mkdir(parents=True, exist_ok=True)
 
         with db_connect() as db:
             db.execute("PRAGMA journal_mode = WAL")
-            db.execute("PRAGMA synchronous = FULL")
+            db.execute("PRAGMA wal_autocheckpoint = 1000")
 
             db.execute("""
                 CREATE TABLE IF NOT EXISTS message_queue (
@@ -191,32 +215,43 @@ def init_database():
                     attempts INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     retry_at REAL NOT NULL DEFAULT 0,
-                    last_error TEXT
+                    last_error TEXT,
+                    response_plan TEXT,
+                    response_index INTEGER NOT NULL DEFAULT 0,
+                    lease_until REAL NOT NULL DEFAULT 0,
+                    locked_by TEXT,
+                    history_user TEXT,
+                    history_assistant TEXT,
+                    clear_history INTEGER NOT NULL DEFAULT 0,
+                    feedback_action TEXT
                 )
             """)
 
-            columns = _table_columns(db, "message_queue")
-
-            if "retry_at" not in columns:
-                db.execute("""
-                    ALTER TABLE message_queue
-                    ADD COLUMN retry_at REAL NOT NULL DEFAULT 0
-                """)
-
-            if "last_error" not in columns:
-                db.execute("""
-                    ALTER TABLE message_queue
-                    ADD COLUMN last_error TEXT
-                """)
+            # Safe, additive migrations from the 2.4.x database.
+            migrations = (
+                ("retry_at", "REAL NOT NULL DEFAULT 0"),
+                ("last_error", "TEXT"),
+                ("response_plan", "TEXT"),
+                ("response_index", "INTEGER NOT NULL DEFAULT 0"),
+                ("lease_until", "REAL NOT NULL DEFAULT 0"),
+                ("locked_by", "TEXT"),
+                ("history_user", "TEXT"),
+                ("history_assistant", "TEXT"),
+                ("clear_history", "INTEGER NOT NULL DEFAULT 0"),
+                ("feedback_action", "TEXT"),
+            )
+            for column_name, definition in migrations:
+                _add_column_if_missing(
+                    db, "message_queue", column_name, definition
+                )
 
             db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_queue_status_retry_id
                 ON message_queue(status, retry_at, id)
             """)
-
             db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_queue_chat_status_id
-                ON message_queue(chat_id, status, id)
+                CREATE INDEX IF NOT EXISTS idx_queue_chat_id
+                ON message_queue(chat_id, id)
             """)
 
             db.execute("""
@@ -240,12 +275,37 @@ def init_database():
             """)
 
             db.execute("""
-                UPDATE message_queue
-                SET status = 'pending', retry_at = 0
-                WHERE status = 'processing'
+                CREATE TABLE IF NOT EXISTS conversation_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                )
+            """)
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_history_chat_id
+                ON conversation_history(chat_id, id)
             """)
 
-    logger.info("SQLite database initialized: %s", DB_PATH)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS dead_letters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_queue_id INTEGER,
+                    update_id INTEGER,
+                    chat_id TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    response_plan TEXT,
+                    response_index INTEGER NOT NULL DEFAULT 0,
+                    attempts INTEGER NOT NULL,
+                    last_error TEXT,
+                    failed_at REAL NOT NULL
+                )
+            """)
+
+            db.execute("PRAGMA user_version = 5")
+
+    logger.info("SQLite initialized at %s", str(Path(DB_PATH).resolve()))
 
 
 def db_get_state(key, default=None):
@@ -271,7 +331,7 @@ def db_get_offset():
     try:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
-        logger.warning("Invalid saved polling offset; starting without offset")
+        logger.exception("Invalid saved polling offset")
         return None
 
 
@@ -286,38 +346,56 @@ def db_set_admin_chat_id(chat_id):
     return True
 
 
-def db_get_feedback_pending():
-    with db_connect() as db:
-        rows = db.execute(
-            "SELECT chat_id FROM feedback_pending"
-        ).fetchall()
-    return {row["chat_id"] for row in rows}
-
-
-def db_set_feedback_pending(chat_id, pending):
-    with db_connect() as db:
-        if pending:
-            db.execute(
-                "INSERT OR IGNORE INTO feedback_pending(chat_id) VALUES(?)",
-                (str(chat_id),),
-            )
-        else:
-            db.execute(
-                "DELETE FROM feedback_pending WHERE chat_id = ?",
-                (str(chat_id),),
-            )
-
-
-def db_queue_count():
+def db_feedback_is_pending(chat_id):
     with db_connect() as db:
         row = db.execute(
-            "SELECT COUNT(*) AS total FROM message_queue"
+            "SELECT 1 FROM feedback_pending WHERE chat_id = ?",
+            (str(chat_id),),
         ).fetchone()
-    return int(row["total"])
+    return row is not None
+
+
+
+def db_recover_interrupted_jobs():
+    """Recover claimed rows only after this process owns the singleton runtime lock."""
+    with db_connect() as db:
+        cursor = db.execute("""
+            UPDATE message_queue
+            SET status = 'pending',
+                retry_at = 0,
+                lease_until = 0,
+                locked_by = NULL
+            WHERE status = 'processing'
+        """)
+    if cursor.rowcount:
+        logger.warning("Recovered %s interrupted queue item(s)", cursor.rowcount)
+
+def db_queue_stats():
+    now = time.time()
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT status, COUNT(*) AS n FROM message_queue GROUP BY status"
+        ).fetchall()
+        oldest = db.execute(
+            "SELECT MIN(queued_at) AS oldest FROM message_queue"
+        ).fetchone()["oldest"]
+        dead_count = db.execute(
+            "SELECT COUNT(*) AS n FROM dead_letters"
+        ).fetchone()["n"]
+    by_status = {row["status"]: int(row["n"]) for row in rows}
+    queued = sum(by_status.values())
+    age = max(0, now - oldest) if oldest is not None else 0
+    return {
+        "queued_messages": queued,
+        "pending_messages": by_status.get("pending", 0),
+        "processing_messages": by_status.get("processing", 0),
+        "oldest_queue_age_seconds": round(age, 1),
+        "dead_letters": int(dead_count),
+    }
 
 
 def db_enqueue_updates(prepared_updates, next_offset):
-    """ذخیرهٔ پیام‌ها، شناسه‌ها و offset در یک تراکنش."""
+    """Persist updates and polling offset atomically, with deduplication."""
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
@@ -333,15 +411,13 @@ def db_enqueue_updates(prepared_updates, next_offset):
                 if update_id in seen_in_batch:
                     continue
                 seen_in_batch.add(update_id)
-
                 exists = db.execute(
                     "SELECT 1 FROM processed_updates WHERE update_id = ?",
                     (update_id,),
                 ).fetchone()
                 if exists:
                     continue
-
-            unique_updates.append((update_id, chat_id, text))
+            unique_updates.append((update_id, str(chat_id), text))
 
         if current_count + len(unique_updates) > MAX_QUEUED_MESSAGES:
             db.rollback()
@@ -349,14 +425,13 @@ def db_enqueue_updates(prepared_updates, next_offset):
             return False
 
         now = time.time()
-
-        for update_id, chat_id, text in unique_updates:
+        for update_id, chat_id, message_text in unique_updates:
             db.execute("""
                 INSERT INTO message_queue
                     (update_id, chat_id, message_text, queued_at,
                      attempts, status, retry_at)
                 VALUES (?, ?, ?, ?, 0, 'pending', 0)
-            """, (update_id, str(chat_id), text, now))
+            """, (update_id, chat_id, message_text, now))
 
             if update_id is not None:
                 db.execute("""
@@ -375,15 +450,23 @@ def db_enqueue_updates(prepared_updates, next_offset):
         return True
 
 
-def db_claim_next_message():
-    """
-    پیام بعدی آماده را به‌صورت اتمی claim می‌کند.
-    پیام‌های یک چت به ترتیب می‌مانند؛ چت‌های مختلف موازی‌اند.
-    """
+def _worker_id():
+    return f"{os.getpid()}:{threading.get_ident()}"
+
+
+def db_claim_next_message(worker_id):
+    """Atomically claim the oldest eligible message while preserving per-chat order."""
+    now = time.time()
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
-        now = time.time()
+        # Recover work whose owner disappeared without releasing its claim.
+        db.execute("""
+            UPDATE message_queue
+            SET status = 'pending', locked_by = NULL, lease_until = 0
+            WHERE status = 'processing' AND lease_until < ?
+        """, (now,))
+
         row = db.execute("""
             SELECT q.*
             FROM message_queue AS q
@@ -405,163 +488,329 @@ def db_claim_next_message():
 
         changed = db.execute("""
             UPDATE message_queue
-            SET status = 'processing'
+            SET status = 'processing',
+                locked_by = ?,
+                lease_until = ?
             WHERE id = ? AND status = 'pending'
-        """, (row["id"],)).rowcount
+        """, (worker_id, now + WORKER_LEASE_SECONDS, row["id"])).rowcount
 
         db.commit()
         return dict(row) if changed else None
 
 
-def db_finish_message(message_id):
+def db_renew_lease(message_id, worker_id):
     with db_connect() as db:
+        changed = db.execute("""
+            UPDATE message_queue
+            SET lease_until = ?
+            WHERE id = ? AND status = 'processing' AND locked_by = ?
+        """, (time.time() + WORKER_LEASE_SECONDS, message_id, worker_id)).rowcount
+    return changed == 1
+
+
+def db_prepare_response_plan(
+    message_id,
+    worker_id,
+    response_plan,
+    history_user=None,
+    history_assistant=None,
+    clear_history=False,
+    feedback_action=None,
+):
+    serialized = json.dumps(response_plan, ensure_ascii=False, separators=(",", ":"))
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE message_queue
+            SET response_plan = ?,
+                response_index = 0,
+                history_user = ?,
+                history_assistant = ?,
+                clear_history = ?,
+                feedback_action = ?,
+                lease_until = ?
+            WHERE id = ? AND status = 'processing' AND locked_by = ?
+        """, (
+            serialized,
+            history_user,
+            history_assistant,
+            1 if clear_history else 0,
+            feedback_action,
+            time.time() + WORKER_LEASE_SECONDS,
+            message_id,
+            worker_id,
+        )).rowcount
+    return changed == 1
+
+
+def db_advance_response(message_id, worker_id, expected_index):
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE message_queue
+            SET response_index = response_index + 1,
+                lease_until = ?
+            WHERE id = ?
+              AND status = 'processing'
+              AND locked_by = ?
+              AND response_index = ?
+        """, (
+            time.time() + WORKER_LEASE_SECONDS,
+            message_id,
+            worker_id,
+            expected_index,
+        )).rowcount
+    return changed == 1
+
+
+def db_finish_message(message_id, worker_id):
+    with db_connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""
+            SELECT * FROM message_queue
+            WHERE id = ? AND status = 'processing' AND locked_by = ?
+        """, (message_id, worker_id)).fetchone()
+
+        if row is None:
+            db.rollback()
+            return False
+
+        try:
+            plan = json.loads(row["response_plan"] or "[]")
+        except (TypeError, ValueError):
+            plan = []
+
+        if int(row["response_index"] or 0) < len(plan):
+            db.rollback()
+            return False
+
+        chat_id = row["chat_id"]
+
+        if row["clear_history"]:
+            db.execute(
+                "DELETE FROM conversation_history WHERE chat_id = ?",
+                (chat_id,),
+            )
+        elif row["history_user"] is not None and row["history_assistant"] is not None:
+            now = time.time()
+            db.executemany("""
+                INSERT INTO conversation_history(chat_id, role, content, created_at)
+                VALUES(?, ?, ?, ?)
+            """, (
+                (chat_id, "user", row["history_user"], now),
+                (chat_id, "assistant", row["history_assistant"], now),
+            ))
+            db.execute("""
+                DELETE FROM conversation_history
+                WHERE chat_id = ? AND id NOT IN (
+                    SELECT id FROM conversation_history
+                    WHERE chat_id = ? ORDER BY id DESC LIMIT ?
+                )
+            """, (chat_id, chat_id, MAX_HISTORY_MESSAGES))
+
+        if row["feedback_action"] == "set":
+            db.execute(
+                "INSERT OR IGNORE INTO feedback_pending(chat_id) VALUES(?)",
+                (chat_id,),
+            )
+        elif row["feedback_action"] == "clear":
+            db.execute(
+                "DELETE FROM feedback_pending WHERE chat_id = ?",
+                (chat_id,),
+            )
+
+        # Bound history storage by both age and number of active chats.
+        history_cutoff = time.time() - HISTORY_RETENTION_DAYS * 86400
         db.execute(
-            "DELETE FROM message_queue WHERE id = ?",
-            (message_id,),
+            "DELETE FROM conversation_history WHERE created_at < ?",
+            (history_cutoff,),
         )
-
-
-def retry_delay(attempts):
-    """تأخیر افزایشی همراه با jitter برای جلوگیری از هجوم هم‌زمان."""
-    exponent = max(0, int(attempts))
-    base_delay = min(
-        RETRY_BACKOFF_START * (2 ** exponent),
-        RETRY_BACKOFF_MAX,
-    )
-    jitter = random.uniform(0, min(base_delay * 0.25, 5))
-    return base_delay + jitter
-
-
-def db_retry_message(message_id, attempts, error_text=None):
-    delay = retry_delay(attempts)
-    retry_at = time.time() + delay
-
-    with db_connect() as db:
         db.execute("""
+            DELETE FROM conversation_history
+            WHERE chat_id NOT IN (
+                SELECT chat_id FROM conversation_history
+                GROUP BY chat_id
+                ORDER BY MAX(created_at) DESC
+                LIMIT ?
+            )
+        """, (MAX_CONVERSATIONS,))
+
+        db.execute("DELETE FROM message_queue WHERE id = ?", (message_id,))
+        db.commit()
+        return True
+
+
+def db_retry_message(message_id, worker_id, attempts, error_text=None):
+    delay = retry_delay(attempts)
+    with db_connect() as db:
+        changed = db.execute("""
             UPDATE message_queue
             SET status = 'pending',
                 attempts = attempts + 1,
-                queued_at = ?,
                 retry_at = ?,
-                last_error = ?
-            WHERE id = ?
-        """, (time.time(), retry_at, error_text, message_id))
+                last_error = ?,
+                lease_until = 0,
+                locked_by = NULL
+            WHERE id = ? AND status = 'processing' AND locked_by = ?
+        """, (
+            time.time() + delay,
+            (error_text or "")[:500],
+            message_id,
+            worker_id,
+        )).rowcount
 
-    logger.warning(
-        "Queue item scheduled for retry: id=%s delay=%.1fs",
-        message_id,
-        delay,
-    )
+    if changed:
+        logger.warning(
+            "Queue item scheduled for retry id=%s delay=%.1fs",
+            message_id,
+            delay,
+        )
+    return changed == 1
 
 
-def db_discard_message(message_id, reason=None):
+def db_dead_letter(message_id, worker_id, reason):
+    with db_connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""
+            SELECT * FROM message_queue
+            WHERE id = ? AND status = 'processing' AND locked_by = ?
+        """, (message_id, worker_id)).fetchone()
+        if row is None:
+            db.rollback()
+            return False
+
+        db.execute("""
+            INSERT INTO dead_letters(
+                original_queue_id, update_id, chat_id, message_text,
+                response_plan, response_index, attempts, last_error, failed_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            row["id"],
+            row["update_id"],
+            row["chat_id"],
+            row["message_text"],
+            row["response_plan"],
+            row["response_index"],
+            row["attempts"],
+            (reason or row["last_error"] or "retry limit reached")[:500],
+            time.time(),
+        ))
+        db.execute("DELETE FROM message_queue WHERE id = ?", (message_id,))
+        db.commit()
+        logger.error("Queue item moved to dead-letter storage id=%s", message_id)
+        return True
+
+
+def retry_delay(attempts):
+    exponent = min(max(0, int(attempts)), 10)
+    base = min(RETRY_BACKOFF_START * (2 ** exponent), RETRY_BACKOFF_MAX)
+    return base + random.uniform(0, min(base * 0.25, 5))
+
+
+def db_cleanup_old_records():
+    now = time.time()
+    processed_cutoff = now - PROCESSED_UPDATE_RETENTION_DAYS * 86400
+    dead_cutoff = now - DEAD_LETTER_RETENTION_DAYS * 86400
+    history_cutoff = now - HISTORY_RETENTION_DAYS * 86400
+
     with db_connect() as db:
         db.execute(
-            "DELETE FROM message_queue WHERE id = ?",
-            (message_id,),
-        )
-
-    logger.error(
-        "Queue item discarded: id=%s reason=%s",
-        message_id,
-        reason or "retry limit reached",
-    )
-
-
-def db_cleanup_processed_updates():
-    cutoff = time.time() - (
-        PROCESSED_UPDATE_RETENTION_DAYS * 24 * 60 * 60
-    )
-
-    with db_connect() as db:
-        cursor = db.execute(
             "DELETE FROM processed_updates WHERE processed_at < ?",
-            (cutoff,),
+            (processed_cutoff,),
         )
-
-    deleted = cursor.rowcount
-    if deleted:
-        logger.info("Cleaned up %s old processed update records", deleted)
+        db.execute(
+            "DELETE FROM dead_letters WHERE failed_at < ?",
+            (dead_cutoff,),
+        )
+        db.execute(
+            "DELETE FROM conversation_history WHERE created_at < ?",
+            (history_cutoff,),
+        )
+        db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
 
 # =========================================================
-# Conversation history and runtime state
+# Runtime state and Flask app
 # =========================================================
-conversation_history = OrderedDict()
-history_lock = threading.Lock()
+app = Flask(__name__)
 
 admin_lock = threading.Lock()
 admin_chat_id = None
 
-feedback_lock = threading.Lock()
-feedback_pending = set()
+_runtime_lock_file = None
+_runtime_lock_acquired = False
+_runtime_active = False
 
-app = Flask(__name__)
 _polling_thread = None
 _polling_stop = threading.Event()
 _worker_threads = []
+_supervisor_thread = None
+_service_lock = threading.Lock()
+
+
+class UserVisibleError(Exception):
+    pass
+
+
+class RetryableDeliveryError(Exception):
+    pass
 
 
 def load_persistent_runtime_state():
-    global admin_chat_id, feedback_pending
-
+    global admin_chat_id
     saved_admin = db_get_admin_chat_id()
     with admin_lock:
         admin_chat_id = saved_admin
 
-    saved_pending = db_get_feedback_pending()
-    with feedback_lock:
-        feedback_pending = saved_pending
-
-
-def get_history(chat_id):
-    with history_lock:
-        history = conversation_history.get(chat_id)
-        if history is None:
-            return []
-        conversation_history.move_to_end(chat_id)
-        return list(history)
-
-
-def save_turn(chat_id, user_text, assistant_text):
-    with history_lock:
-        history = conversation_history.get(chat_id)
-        if history is None:
-            history = deque(maxlen=MAX_HISTORY_MESSAGES)
-            conversation_history[chat_id] = history
-
-        history.append({"role": "user", "content": user_text})
-        history.append({"role": "assistant", "content": assistant_text})
-        conversation_history.move_to_end(chat_id)
-
-        while len(conversation_history) > MAX_CONVERSATIONS:
-            conversation_history.popitem(last=False)
-
-
-def reset_history(chat_id):
-    with history_lock:
-        conversation_history.pop(chat_id, None)
-
 
 def set_admin_chat_id(chat_id):
     global admin_chat_id
-
     if chat_id is None:
         return False
 
     chat_id = str(chat_id)
     db_set_admin_chat_id(chat_id)
-
     with admin_lock:
         admin_chat_id = chat_id
-
-    logger.info("Admin chat registered from verified sender username")
+    logger.info("Admin private chat registered")
     return True
 
 
 def get_admin_chat_id():
     with admin_lock:
         return admin_chat_id
+
+
+def acquire_runtime_lock():
+    """Prevent multiple Gunicorn processes from polling and processing the same bot."""
+    global _runtime_lock_file, _runtime_lock_acquired
+
+    lock_path = str(Path(DB_PATH).expanduser().resolve()) + ".runtime.lock"
+    lock_parent = Path(lock_path).parent
+    lock_parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+
+    if fcntl is None:
+        logger.warning(
+            "fcntl is unavailable; process-level runtime locking is disabled. "
+            "Run exactly one application worker."
+        )
+        _runtime_lock_file = handle
+        _runtime_lock_acquired = True
+        return True
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        logger.warning(
+            "Another process owns the Nepton runtime lock; this process will serve HTTP only"
+        )
+        _runtime_lock_acquired = False
+        return False
+
+    _runtime_lock_file = handle
+    _runtime_lock_acquired = True
+    logger.info("Runtime lock acquired")
+    return True
 
 
 @app.get("/")
@@ -577,21 +826,53 @@ def home():
 
 @app.get("/health")
 def health():
-    thread = _polling_thread
-    polling_running = thread is not None and thread.is_alive()
+    try:
+        stats = db_queue_stats()
+        polling_running = _polling_thread is not None and _polling_thread.is_alive()
+        live_workers = sum(worker.is_alive() for worker in _worker_threads)
+        healthy = _runtime_active and polling_running and live_workers > 0
 
-    return jsonify({
-        "status": "healthy" if polling_running else "degraded",
-        "polling": "running" if polling_running else "stopped",
-        "version": VERSION,
-        "queued_messages": db_queue_count(),
-        "workers": sum(worker.is_alive() for worker in _worker_threads),
-        "admin_registered": get_admin_chat_id() is not None,
-    }), 200 if polling_running else 503
+        payload = {
+            "status": "healthy" if healthy else "degraded",
+            "runtime_owner": _runtime_active,
+            "runtime_lock_acquired": _runtime_lock_acquired,
+            "polling": "running" if polling_running else "stopped",
+            "workers_alive": live_workers,
+            "workers_expected": MAX_PARALLEL_CHATS,
+            "version": VERSION,
+            "model": MODEL,
+        }
+        payload.update(stats)
+        return jsonify(payload), 200 if healthy else 503
+    except Exception:
+        logger.exception("Health check failed")
+        return jsonify({"status": "unhealthy", "version": VERSION}), 503
 
 
-class UserVisibleError(Exception):
-    pass
+# =========================================================
+# Conversation history
+# =========================================================
+def get_history(chat_id):
+    with db_connect() as db:
+        rows = db.execute("""
+            SELECT role, content
+            FROM conversation_history
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (str(chat_id), MAX_HISTORY_MESSAGES)).fetchall()
+    return [
+        {"role": row["role"], "content": row["content"]}
+        for row in reversed(rows)
+    ]
+
+
+def reset_history(chat_id):
+    with db_connect() as db:
+        db.execute(
+            "DELETE FROM conversation_history WHERE chat_id = ?",
+            (str(chat_id),),
+        )
 
 
 # =========================================================
@@ -605,6 +886,9 @@ _cloudflare_headers = {
 
 
 def cloudflare_post_with_retry(session, payload):
+    """One bounded retry for transient transport/server failures."""
+    last_exception = None
+
     for attempt in range(2):
         try:
             response = session.post(
@@ -614,28 +898,56 @@ def cloudflare_post_with_retry(session, payload):
                 timeout=AI_TIMEOUT,
                 allow_redirects=False,
             )
-        except (
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ):
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exception = exc
             if attempt == 0:
-                logger.warning(
-                    "Temporary Cloudflare network failure; retrying once"
-                )
+                logger.warning("Temporary Cloudflare transport failure; retrying once")
+                time.sleep(0.4 + random.uniform(0, 0.4))
                 continue
             raise
 
         if response.status_code in (500, 502, 503, 504) and attempt == 0:
             status = response.status_code
             response.close()
-            logger.warning("Cloudflare HTTP %s; retrying once", status)
+            logger.warning("Cloudflare returned HTTP %s; retrying once", status)
+            time.sleep(0.4 + random.uniform(0, 0.4))
             continue
 
         return response
 
-    raise requests.exceptions.ConnectionError(
-        "Cloudflare request failed after retry"
-    )
+    raise requests.exceptions.ConnectionError("Cloudflare request failed") from last_exception
+
+
+def _extract_ai_text(data):
+    if not isinstance(data, dict):
+        return ""
+
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                part = item["text"].strip()
+                if part:
+                    parts.append(part)
+        return "\n".join(parts).strip()
+
+    return ""
 
 
 def call_ai(chat_id, user_text):
@@ -646,32 +958,31 @@ def call_ai(chat_id, user_text):
     payload = {
         "model": MODEL,
         "messages": messages,
-        "temperature": 0.5,
-        "max_completion_tokens": 2048,
+        "temperature": 0.4,
+        "max_completion_tokens": 1536,
         "chat_template_kwargs": {"enable_thinking": False},
         "stream": False,
     }
 
     started = time.perf_counter()
-
     try:
         with cloudflare_post_with_retry(
             get_http_session("cloudflare_session"), payload
         ) as response:
             if not 200 <= response.status_code < 300:
-                logger.error(
-                    "Cloudflare HTTP error: status=%s",
-                    response.status_code,
-                )
+                status = response.status_code
+                logger.error("Cloudflare HTTP error status=%s", status)
 
-                if response.status_code == 429:
+                if status == 429:
                     raise UserVisibleError(
-                        "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
-                        "کمی بعد دوباره تلاش کن."
+                        "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. کمی بعد دوباره تلاش کن."
                     )
-
+                if status in (401, 403):
+                    raise UserVisibleError(
+                        "دسترسی سرویس هوش مصنوعی با مشکل روبه‌رو شده است. مدیر باید تنظیمات اتصال را بررسی کند."
+                    )
                 raise UserVisibleError(
-                    "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
+                    "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست. کمی بعد دوباره تلاش کن."
                 )
 
             try:
@@ -685,15 +996,12 @@ def call_ai(chat_id, user_text):
         raise
     except requests.exceptions.Timeout as exc:
         raise UserVisibleError(
-            "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
+            "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید. دوباره تلاش کن."
         ) from exc
     except requests.exceptions.RequestException as exc:
-        logger.error(
-            "Cloudflare network error: type=%s",
-            type(exc).__name__,
-        )
+        logger.error("Cloudflare network error type=%s", type(exc).__name__)
         raise UserVisibleError(
-            "ارتباط با سرویس هوش مصنوعی برقرار نشد."
+            "ارتباط با سرویس هوش مصنوعی برقرار نشد. کمی بعد دوباره تلاش کن."
         ) from exc
     finally:
         logger.info(
@@ -701,41 +1009,11 @@ def call_ai(chat_id, user_text):
             (time.perf_counter() - started) * 1000,
         )
 
-    if not isinstance(data, dict):
-        raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
-
-    choices = data.get("choices")
-    if (
-        not isinstance(choices, list)
-        or not choices
-        or not isinstance(choices[0], dict)
-    ):
-        raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
-
-    message = choices[0].get("message")
-    if not isinstance(message, dict):
-        raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
-
-    content = message.get("content")
-
-    if isinstance(content, str):
-        answer = content.strip()
-    elif isinstance(content, list):
-        answer = "\n".join(
-            item.get("text", "").strip()
-            for item in content
-            if isinstance(item, dict)
-            and isinstance(item.get("text"), str)
-            and item.get("text").strip()
-        ).strip()
-    else:
-        answer = ""
-
+    answer = _extract_ai_text(data)
     if not answer:
         raise UserVisibleError(
-            "مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن."
+            "مدل این بار پاسخ متنی تولید نکرد. لطفاً دوباره تلاش کن."
         )
-
     return answer
 
 
@@ -744,7 +1022,6 @@ def call_ai(chat_id, user_text):
 # =========================================================
 def soroush_request(method, payload=None):
     session = get_http_session("soroush_session")
-
     try:
         with session.post(
             f"{SOROUSH_API}/{method}",
@@ -754,25 +1031,38 @@ def soroush_request(method, payload=None):
         ) as response:
             if not 200 <= response.status_code < 300:
                 logger.error(
-                    "Soroush HTTP error: method=%s status=%s",
+                    "Soroush HTTP error method=%s status=%s",
                     method,
                     response.status_code,
                 )
                 return None
 
             try:
-                return response.json()
+                data = response.json()
             except ValueError:
-                logger.error("Soroush invalid JSON: method=%s", method)
+                logger.error("Soroush returned invalid JSON method=%s", method)
                 return None
+
+            if isinstance(data, dict) and data.get("ok") is False:
+                logger.warning("Soroush API rejected method=%s", method)
+            return data
 
     except requests.exceptions.RequestException as exc:
         logger.error(
-            "Soroush network error: method=%s type=%s",
+            "Soroush network error method=%s type=%s",
             method,
             type(exc).__name__,
         )
         return None
+
+
+def api_result_is_success(result):
+    if result is None:
+        return False
+    if isinstance(result, dict) and "ok" in result:
+        return result.get("ok") is True
+    # Some Soroush-compatible responses may omit the Telegram-style `ok` key.
+    return isinstance(result, (dict, list))
 
 
 def register_bot_commands():
@@ -786,9 +1076,7 @@ def register_bot_commands():
         },
     )
 
-    if result is None or (
-        isinstance(result, dict) and result.get("ok") is False
-    ):
+    if not api_result_is_success(result):
         logger.warning(
             "Could not register bot commands; /feedback remains usable by text"
         )
@@ -798,41 +1086,47 @@ def register_bot_commands():
     return True
 
 
-def split_message(text):
-    return [
-        text[i:i + MAX_MESSAGE_LENGTH]
-        for i in range(0, len(text), MAX_MESSAGE_LENGTH)
-    ]
+def split_message(text, limit=MAX_MESSAGE_LENGTH):
+    """Split long text near line boundaries without splitting Unicode characters."""
+    if not isinstance(text, str) or not text:
+        return []
+
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < int(limit * 0.55):
+            split_at = limit
+        else:
+            split_at += 1
+        chunk = remaining[:split_at]
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:]
+
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
-def send_message(chat_id, text):
+def send_one_message(chat_id, text):
     if not isinstance(text, str) or not text:
         return False
 
     started = time.perf_counter()
-    success = True
-
     try:
-        for chunk in split_message(text):
-            result = soroush_request(
-                "sendMessage",
-                {"chat_id": chat_id, "text": chunk},
-            )
-
-            if result is None or (
-                isinstance(result, dict) and result.get("ok") is False
-            ):
-                logger.error("Soroush sendMessage failed or was rejected")
-                success = False
-                break
-
+        result = soroush_request(
+            "sendMessage",
+            {"chat_id": str(chat_id), "text": text},
+        )
+        success = api_result_is_success(result)
+        if not success:
+            logger.error("Soroush sendMessage failed or was rejected")
         return success
-
     finally:
         logger.info(
-            "TIMING send_message_ms=%.0f success=%s",
+            "TIMING send_message_ms=%.0f",
             (time.perf_counter() - started) * 1000,
-            success,
         )
 
 
@@ -842,45 +1136,50 @@ def send_message(chat_id, text):
 def extract_updates(data):
     if isinstance(data, list):
         return data
-
     if not isinstance(data, dict):
         return []
 
     for key in ("result", "updates", "data"):
         value = data.get(key)
-
         if isinstance(value, list):
             return value
-
         if isinstance(value, dict):
             for nested_key in ("updates", "messages", "result"):
                 nested = value.get(nested_key)
                 if isinstance(nested, list):
                     return nested
-
     return []
 
 
 def has_update_container(data):
     if isinstance(data, list):
         return True
-
     if not isinstance(data, dict) or data.get("ok") is False:
         return False
 
     for key in ("result", "updates", "data"):
         value = data.get(key)
-
         if isinstance(value, list):
             return True
-
         if isinstance(value, dict) and any(
             isinstance(value.get(k), list)
             for k in ("updates", "messages", "result")
         ):
             return True
-
     return False
+
+
+def _as_identifier(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def extract_message(update):
@@ -891,29 +1190,34 @@ def extract_message(update):
         update.get("message")
         or update.get("edited_message")
         or update.get("new_message")
+        or update.get("channel_post")
         or update
     )
-
     if not isinstance(message, dict):
         return None
 
-    text = (
+    message_text = (
         message.get("text")
         or message.get("body")
         or message.get("message_text")
     )
 
     chat = message.get("chat")
-    sender = message.get("from")
+    sender = message.get("from") or message.get("sender") or message.get("user")
 
     chat_id = (
         chat.get("id")
         if isinstance(chat, dict)
         else message.get("chat_id")
     )
-
     if chat_id is None and isinstance(sender, dict):
         chat_id = sender.get("id")
+
+    if chat_id is None or message_text is None:
+        return None
+
+    if not isinstance(message_text, str):
+        message_text = str(message_text)
 
     username = sender.get("username") if isinstance(sender, dict) else None
     normalized_username = (
@@ -922,36 +1226,48 @@ def extract_message(update):
         else None
     )
 
-    if normalized_username == ADMIN_USERNAME.lower() and chat_id is not None:
+    # Never register a group chat as the administrator's private destination.
+    chat_type = None
+    if isinstance(chat, dict):
+        chat_type = chat.get("type")
+    if chat_type is None:
+        chat_type = message.get("chat_type")
+
+    sender_id = sender.get("id") if isinstance(sender, dict) else None
+    is_private = (
+        str(chat_type).lower() in {"private", "personal", "user"}
+        if chat_type is not None
+        else (sender_id is not None and str(sender_id) == str(chat_id))
+    )
+
+    if (
+        normalized_username == ADMIN_USERNAME
+        and is_private
+        and chat_id is not None
+    ):
         set_admin_chat_id(chat_id)
 
-    if text is None or chat_id is None:
-        return None
-
-    if not isinstance(text, str):
-        text = str(text)
-
-    return str(chat_id), text
+    return str(chat_id), message_text
 
 
 def get_update_id(update):
     if not isinstance(update, dict):
         return None
-
     for key in ("update_id", "updateId", "id"):
-        value = update.get(key)
-        if isinstance(value, int) and not isinstance(value, bool):
+        value = _as_identifier(update.get(key))
+        if value is not None:
             return value
-
     return None
 
 
 # =========================================================
-# Creator question detection
+# Text normalization and deterministic replies
 # =========================================================
 def normalize_text(text):
-    normalized = text.strip().lower()
+    normalized = str(text).strip().lower()
     normalized = normalized.replace("ي", "ی").replace("ك", "ک")
+    normalized = normalized.replace("ۀ", "ه").replace("ة", "ه")
+    normalized = normalized.replace("ؤ", "و").replace("إ", "ا").replace("أ", "ا")
     normalized = normalized.replace("\u200c", " ")
     normalized = re.sub(r"[؟?!.,،؛:]+", "", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
@@ -960,11 +1276,11 @@ def normalize_text(text):
 
 def is_creator_question(user_text):
     normalized = normalize_text(user_text)
-
     exact_phrases = {
         "سازندت کیه",
         "سازنده ات کیه",
         "سازنده تو کیه",
+        "سازنده تو چیه",
         "چه کسی ساختت",
         "کی ساختت",
         "تو رو کی ساخته",
@@ -974,106 +1290,95 @@ def is_creator_question(user_text):
         "چه کسی تو را ساخته",
         "چه کسی تو رو ساخته",
         "تو توسط چه کسی ساخته شدی",
+        "سازنده تو چه کسیه",
     }
-
     if normalized in exact_phrases:
         return True
 
     patterns = (
-        r"^(سازند|سازنده) .{0,12} کیه$",
-        r"^(چه کسی|کی) .{0,8} (ساختت|ساخته|ساخته است)$",
-        r"^(توسعه دهنده) .{0,12} کیه$",
+        r"^(سازنده|سازند) .{0,18} کیه$",
+        r"^(چه کسی|کی) .{0,10} (ساختت|ساخته|ساخته است)$",
+        r"^(توسعه دهنده) .{0,18} کیه$",
     )
-
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
-# =========================================================
-# Fixed conversational replies
-# =========================================================
 def get_fixed_conversation_answer(user_text):
-    """
-    پاسخ ثابت برای احوال‌پرسی‌های کوتاه و پرتکرار.
-    این پیام‌ها به مدل فرستاده نمی‌شوند.
-    """
     normalized = normalize_text(user_text)
-
     answers = {
         "سلام": "سلام! چطور می‌تونم کمکت کنم؟",
+        "درود": "درود! چطور می‌تونم کمکت کنم؟",
         "سلام خوبی": "سلام! خوبم، ممنون. تو چطوری؟",
         "سلام چطوری": "سلام! خوبم، ممنون. تو چطوری؟",
         "چطوری": "خوبم، ممنون! تو چطوری؟",
         "خوبی": "خوبم، ممنون! تو چطوری؟",
         "چه خبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
         "چخبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
+        "صبح بخیر": "صبح بخیر! روز خوبی داشته باشی. چطور می‌تونم کمکت کنم؟",
+        "شب بخیر": "شب بخیر! شبت خوش. کاری از دستم برمیاد؟",
     }
-
     return answers.get(normalized)
 
 
 # =========================================================
-# Feedback flow
+# Durable feedback workflow
 # =========================================================
 def process_feedback_message(chat_id, text):
     stripped = text.strip()
-    command = (
-        stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
-        if stripped
-        else ""
-    )
+    normalized = normalize_text(stripped)
+    first_token = stripped.split(maxsplit=1)[0] if stripped else ""
+    command = first_token.split("@", 1)[0].lower() if first_token else ""
+    is_pending = db_feedback_is_pending(chat_id)
 
     if command == FEEDBACK_CANCEL_COMMAND:
-        with feedback_lock:
-            was_pending = chat_id in feedback_pending
-            feedback_pending.discard(chat_id)
+        if is_pending:
+            return {
+                "responses": [(chat_id, "ارسال نظر لغو شد.")],
+                "feedback_action": "clear",
+            }
+        return {
+            "responses": [(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")],
+            "feedback_action": None,
+        }
 
-        if was_pending:
-            db_set_feedback_pending(chat_id, False)
-            return send_message(chat_id, "ارسال نظر لغو شد.")
-
-        return send_message(
-            chat_id,
-            "در حال حاضر در مرحلهٔ ارسال نظر نیستی.",
-        )
-
-    if command == FEEDBACK_COMMAND or stripped == FEEDBACK_TRIGGER_TEXT:
-        with feedback_lock:
-            feedback_pending.add(chat_id)
-
-        db_set_feedback_pending(chat_id, True)
-
-        return send_message(
-            chat_id,
-            "متن نظر یا پیشنهادت را در پیام بعدی بفرست.\n"
-            "برای لغو، /cancel را ارسال کن.",
-        )
-
-    with feedback_lock:
-        is_pending = chat_id in feedback_pending
+    if command == FEEDBACK_COMMAND or normalized == normalize_text(FEEDBACK_TRIGGER_TEXT):
+        return {
+            "responses": [(
+                chat_id,
+                "متن نظر یا پیشنهادت را در پیام بعدی بفرست.\n"
+                "برای لغو، /cancel را ارسال کن.",
+            )],
+            "feedback_action": "set",
+        }
 
     if not is_pending:
         return None
 
     if not stripped:
-        return send_message(
-            chat_id,
-            "متن نظر خالی است؛ لطفاً دوباره بفرست.",
-        )
+        return {
+            "responses": [(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")],
+            "feedback_action": None,
+        }
 
     if len(stripped) > MAX_MESSAGE_LENGTH:
-        return send_message(
-            chat_id,
-            f"متن نظر طولانی است. لطفاً آن را به حداکثر "
-            f"{MAX_MESSAGE_LENGTH} نویسه کاهش بده.",
-        )
+        return {
+            "responses": [(
+                chat_id,
+                f"متن نظر طولانی است. لطفاً آن را به حداکثر {MAX_MESSAGE_LENGTH} نویسه کاهش بده.",
+            )],
+            "feedback_action": None,
+        }
 
     admin_id = get_admin_chat_id()
     if admin_id is None:
-        return send_message(
-            chat_id,
-            "صندوق پیشنهادها هنوز برای مدیر فعال نشده است. "
-            "مدیر باید ابتدا یک پیام به ربات بفرستد؛ سپس دوباره تلاش کن.",
-        )
+        return {
+            "responses": [(
+                chat_id,
+                "صندوق پیشنهادها هنوز برای مدیر فعال نشده است. "
+                "مدیر باید ابتدا در گفت‌وگوی خصوصی به ربات پیام بدهد؛ سپس دوباره تلاش کن.",
+            )],
+            "feedback_action": None,
+        }
 
     admin_message = (
         "نظر یا پیشنهاد جدید\n"
@@ -1081,215 +1386,229 @@ def process_feedback_message(chat_id, text):
         f"{stripped}"
     )
 
-    if not send_message(admin_id, admin_message):
-        return send_message(
-            chat_id,
-            "ارسال نظر به مدیر انجام نشد. لطفاً کمی بعد دوباره تلاش کن.",
-        )
-
-    with feedback_lock:
-        feedback_pending.discard(chat_id)
-
-    db_set_feedback_pending(chat_id, False)
-    return send_message(
-        chat_id,
-        "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت.",
-    )
+    # Admin delivery is planned before user confirmation. The durable response
+    # cursor prevents resending the admin message after it is acknowledged.
+    return {
+        "responses": [
+            (admin_id, admin_message),
+            (chat_id, "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت."),
+        ],
+        "feedback_action": "clear",
+    }
 
 
 # =========================================================
-# Message processing
+# Build a durable response plan (no network sends in this stage)
 # =========================================================
-def process_message(chat_id, text, queued_at):
+def build_response_plan(chat_id, text):
     started = time.perf_counter()
-    queue_wait_ms = max(0, (time.time() - queued_at) * 1000)
     text = text.strip()
-
     if not text:
-        return True
+        return {
+            "responses": [],
+            "history_user": None,
+            "history_assistant": None,
+            "clear_history": False,
+            "feedback_action": None,
+        }
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
     if command == "/start":
-        send_ok = send_message(chat_id, START_MESSAGE)
-        logger.info(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=start",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-        )
-        return send_ok
+        return {
+            "responses": [(chat_id, START_MESSAGE)],
+            "history_user": None,
+            "history_assistant": None,
+            "clear_history": False,
+            "feedback_action": None,
+        }
 
     if command == "/reset":
-        reset_history(chat_id)
-        send_ok = send_message(chat_id, "حافظه گفت‌وگوی شما پاک شد.")
-        logger.info(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-        )
-        return send_ok
+        return {
+            "responses": [(chat_id, "حافظه گفت‌وگوی شما پاک شد.")],
+            "history_user": None,
+            "history_assistant": None,
+            "clear_history": True,
+            "feedback_action": None,
+        }
 
     feedback_result = process_feedback_message(chat_id, text)
     if feedback_result is not None:
-        return feedback_result
+        return {
+            "responses": feedback_result["responses"],
+            "history_user": None,
+            "history_assistant": None,
+            "clear_history": False,
+            "feedback_action": feedback_result.get("feedback_action"),
+        }
 
     if is_creator_question(text):
-        send_ok = send_message(chat_id, CREATOR_ANSWER)
-
-        if send_ok:
-            save_turn(chat_id, text, CREATOR_ANSWER)
-
-        logger.info(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=creator result=%s",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-            "sent" if send_ok else "send_failed",
-        )
-        return send_ok
+        return {
+            "responses": [(chat_id, CREATOR_ANSWER)],
+            "history_user": text,
+            "history_assistant": CREATOR_ANSWER,
+            "clear_history": False,
+            "feedback_action": None,
+        }
 
     fixed_answer = get_fixed_conversation_answer(text)
-
     if fixed_answer is not None:
-        send_ok = send_message(chat_id, fixed_answer)
+        return {
+            "responses": [(chat_id, fixed_answer)],
+            "history_user": text,
+            "history_assistant": fixed_answer,
+            "clear_history": False,
+            "feedback_action": None,
+        }
 
-        if send_ok:
-            save_turn(chat_id, text, fixed_answer)
-
-        logger.info(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=fixed_conversation result=%s",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-            "sent" if send_ok else "send_failed",
-        )
-        return send_ok
-
-    text = text[:MAX_MESSAGE_LENGTH]
-
+    bounded_text = text[:MAX_MESSAGE_LENGTH]
+    history_user = None
+    history_assistant = None
     try:
-        answer = call_ai(chat_id, text)
-        send_ok = send_message(chat_id, answer)
-
-        if send_ok:
-            save_turn(chat_id, text, answer)
-
-        logger.info(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=%s",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-            "sent" if send_ok else "send_failed",
-        )
-        return send_ok
-
+        answer = call_ai(chat_id, bounded_text)
+        history_user = bounded_text
+        history_assistant = answer
     except UserVisibleError as exc:
-        send_ok = send_message(chat_id, str(exc))
-        logger.warning(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-        )
-        return bool(send_ok)
+        # Do not pollute future context with transient service-error messages.
+        answer = str(exc)
+    except Exception:
+        logger.exception("Unexpected message processing failure")
+        answer = "در پردازش پیام مشکلی پیش آمد. لطفاً کمی بعد دوباره تلاش کن."
 
-    except Exception as exc:
-        logger.error(
-            "Message processing failed: type=%s",
-            type(exc).__name__,
-        )
-        send_ok = send_message(
-            chat_id,
-            "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن.",
-        )
-        logger.error(
-            "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=internal_error",
-            queue_wait_ms,
-            (time.perf_counter() - started) * 1000,
-        )
-        return send_ok
+    logger.info(
+        "TIMING build_response_plan_ms=%.0f",
+        (time.perf_counter() - started) * 1000,
+    )
+    return {
+        "responses": [(chat_id, answer)],
+        "history_user": history_user,
+        "history_assistant": history_assistant,
+        "clear_history": False,
+        "feedback_action": None,
+    }
+
+
+def flatten_response_plan(responses):
+    """Convert multi-recipient responses into durable, individually acknowledged chunks."""
+    plan = []
+    for chat_id, text in responses:
+        for chunk in split_message(text):
+            plan.append({"chat_id": str(chat_id), "text": chunk})
+    return plan
 
 
 # =========================================================
-# Persistent queue workers
+# Queue workers
 # =========================================================
-def chat_worker():
-    while True:
-        item = None
+def _process_claimed_item(item, worker_id):
+    message_id = item["id"]
 
+    response_plan_raw = item.get("response_plan")
+    if not response_plan_raw:
+        result = build_response_plan(item["chat_id"], item["message_text"])
+        plan = flatten_response_plan(result["responses"])
+
+        saved = db_prepare_response_plan(
+            message_id,
+            worker_id,
+            plan,
+            history_user=result.get("history_user"),
+            history_assistant=result.get("history_assistant"),
+            clear_history=result.get("clear_history", False),
+            feedback_action=result.get("feedback_action"),
+        )
+        if not saved:
+            raise RuntimeError("Could not persist response plan or worker lease was lost")
+        response_index = 0
+    else:
         try:
-            item = db_claim_next_message()
+            plan = json.loads(response_plan_raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Stored response plan is invalid JSON") from exc
+        response_index = int(item.get("response_index") or 0)
 
+    if not isinstance(plan, list):
+        raise RuntimeError("Stored response plan is not a list")
+
+    while response_index < len(plan):
+        if not db_renew_lease(message_id, worker_id):
+            raise RuntimeError("Worker lease was lost before message delivery")
+
+        part = plan[response_index]
+        if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
+            raise RuntimeError("Stored response plan contains an invalid item")
+
+        success = send_one_message(part["chat_id"], part["text"])
+        if not success:
+            raise RetryableDeliveryError("Soroush sendMessage failed or had an ambiguous result")
+
+        if not db_advance_response(message_id, worker_id, response_index):
+            raise RuntimeError("Could not advance durable response cursor")
+        response_index += 1
+
+    if not db_finish_message(message_id, worker_id):
+        raise RuntimeError("Could not finalize queue item")
+
+
+def chat_worker():
+    worker_id = _worker_id()
+    logger.info("Worker started id=%s", worker_id)
+
+    while not _polling_stop.is_set():
+        item = None
+        try:
+            item = db_claim_next_message(worker_id)
             if item is None:
-                time.sleep(WORKER_IDLE_WAIT)
+                _polling_stop.wait(WORKER_IDLE_WAIT)
                 continue
 
-            completed = process_message(
-                item["chat_id"],
-                item["message_text"],
-                item["queued_at"],
-            )
-
-            if completed:
-                db_finish_message(item["id"])
-                continue
-
-            attempts = int(item["attempts"])
-
-            if attempts >= MAX_WORKER_RETRIES:
-                db_discard_message(
-                    item["id"],
-                    reason="send failed after retry limit",
-                )
-            else:
-                db_retry_message(
-                    item["id"],
-                    attempts=attempts,
-                    error_text="message processing or delivery failed",
-                )
+            _process_claimed_item(item, worker_id)
 
         except Exception as exc:
             logger.error(
-                "Worker failed: type=%s",
+                "Worker processing failed type=%s",
                 type(exc).__name__,
+                exc_info=True,
             )
-
             if item is not None:
                 try:
                     attempts = int(item.get("attempts", 0))
-
                     if attempts >= MAX_WORKER_RETRIES:
-                        db_discard_message(
-                            item["id"],
-                            reason=type(exc).__name__,
-                        )
+                        db_dead_letter(item["id"], worker_id, str(exc))
                     else:
                         db_retry_message(
                             item["id"],
-                            attempts=attempts,
-                            error_text=type(exc).__name__,
+                            worker_id,
+                            attempts,
+                            str(exc),
                         )
-
                 except Exception:
                     logger.exception("Could not update failed queue item")
+            _polling_stop.wait(0.5)
 
-            time.sleep(1)
+    logger.info("Worker stopped id=%s", worker_id)
 
 
-def start_chat_workers():
-    if _worker_threads:
-        return
-
-    for index in range(MAX_PARALLEL_CHATS):
-        worker = threading.Thread(
-            target=chat_worker,
-            name=f"NeptonWorker-{index + 1}",
-            daemon=True,
-        )
-        worker.start()
-        _worker_threads.append(worker)
-
-    logger.info("Started %s persistent queue workers", MAX_PARALLEL_CHATS)
+def _start_or_replace_workers():
+    global _worker_threads
+    with _service_lock:
+        alive = [worker for worker in _worker_threads if worker.is_alive()]
+        _worker_threads = alive
+        missing = max(0, MAX_PARALLEL_CHATS - len(_worker_threads))
+        for index in range(missing):
+            worker = threading.Thread(
+                target=chat_worker,
+                name=f"NeptonWorker-{len(_worker_threads) + 1}",
+                daemon=True,
+            )
+            worker.start()
+            _worker_threads.append(worker)
+        if missing:
+            logger.info("Started %s queue worker(s)", missing)
 
 
 # =========================================================
-# Update batch handling and polling
+# Polling and update batch handling
 # =========================================================
 def prepare_update_batch(updates):
     prepared = []
@@ -1297,7 +1616,6 @@ def prepare_update_batch(updates):
 
     for update in updates:
         update_id = get_update_id(update)
-
         if update_id is not None:
             last_update_id = (
                 update_id if last_update_id is None
@@ -1306,8 +1624,8 @@ def prepare_update_batch(updates):
 
         extracted = extract_message(update)
         if extracted is not None:
-            chat_id, text = extracted
-            prepared.append((update_id, chat_id, text))
+            chat_id, message_text = extracted
+            prepared.append((update_id, chat_id, message_text))
 
     return prepared, last_update_id
 
@@ -1315,26 +1633,23 @@ def prepare_update_batch(updates):
 def polling_loop():
     offset = db_get_offset()
     backoff = POLL_ERROR_BACKOFF_START
+    idle_wait = POLL_EMPTY_WAIT
     last_cleanup = time.monotonic()
 
-    logger.info("Soroush polling started; saved offset=%s", offset)
+    logger.info("Soroush polling started saved_offset=%s", offset)
 
     while not _polling_stop.is_set():
         try:
-            if (
-                time.monotonic() - last_cleanup
-                >= PROCESSED_UPDATE_CLEANUP_INTERVAL
-            ):
+            if time.monotonic() - last_cleanup >= DB_CLEANUP_INTERVAL:
                 try:
-                    db_cleanup_processed_updates()
+                    db_cleanup_old_records()
                 except Exception:
-                    logger.exception("Processed update cleanup failed")
+                    logger.exception("Database cleanup failed")
                 last_cleanup = time.monotonic()
 
             payload = {"offset": offset} if offset is not None else {}
             started = time.perf_counter()
             data = soroush_request("getUpdates", payload)
-
             logger.info(
                 "TIMING get_updates_ms=%.0f",
                 (time.perf_counter() - started) * 1000,
@@ -1342,87 +1657,121 @@ def polling_loop():
 
             if data is None or not has_update_container(data):
                 logger.error("Unexpected or failed Soroush getUpdates response")
-                _polling_stop.wait(backoff)
+                wait = min(backoff + random.uniform(0, backoff * 0.2), POLL_ERROR_BACKOFF_MAX)
+                _polling_stop.wait(wait)
                 backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
                 continue
 
             updates = extract_updates(data)
-
             if not updates:
                 backoff = POLL_ERROR_BACKOFF_START
-                _polling_stop.wait(POLL_EMPTY_WAIT)
+                _polling_stop.wait(idle_wait)
+                idle_wait = min(idle_wait * 1.5, POLL_EMPTY_WAIT_MAX)
                 continue
 
+            idle_wait = POLL_EMPTY_WAIT
             prepared, last_id = prepare_update_batch(updates)
 
             if last_id is None:
                 if not db_enqueue_updates(prepared, None):
                     _polling_stop.wait(POLL_ERROR_BACKOFF_START)
                 elif not prepared:
-                    _polling_stop.wait(POLL_EMPTY_WAIT)
+                    _polling_stop.wait(idle_wait)
+                    idle_wait = min(idle_wait * 1.5, POLL_EMPTY_WAIT_MAX)
                 else:
                     backoff = POLL_ERROR_BACKOFF_START
                 continue
 
             next_offset = last_id + 1
-
             if db_enqueue_updates(prepared, next_offset):
                 offset = next_offset
                 backoff = POLL_ERROR_BACKOFF_START
             else:
+                # Do not move offset while the durable queue is full.
                 _polling_stop.wait(POLL_ERROR_BACKOFF_START)
 
-        except Exception as exc:
-            logger.error(
-                "Polling iteration failed: type=%s",
-                type(exc).__name__,
-            )
+        except Exception:
+            logger.exception("Polling iteration failed")
             _polling_stop.wait(backoff)
             backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
+
+    logger.info("Soroush polling stopped")
 
 
 def _polling_main():
     try:
         polling_loop()
-    except Exception as exc:
-        logger.error(
-            "Polling thread stopped unexpectedly: type=%s",
-            type(exc).__name__,
-        )
-
-
-_polling_lock = threading.Lock()
-_polling_started = False
+    except Exception:
+        logger.exception("Polling thread stopped unexpectedly")
 
 
 def start_polling():
-    global _polling_started, _polling_thread
-
-    with _polling_lock:
-        if (
-            _polling_started
-            and _polling_thread is not None
-            and _polling_thread.is_alive()
-        ):
+    global _polling_thread
+    with _service_lock:
+        if _polling_thread is not None and _polling_thread.is_alive():
             return
-
-        _polling_stop.clear()
         _polling_thread = threading.Thread(
             target=_polling_main,
             name="SoroushPolling",
             daemon=True,
         )
         _polling_thread.start()
-        _polling_started = True
+        logger.info("Polling thread started")
+
+
+def runtime_supervisor():
+    logger.info("Runtime supervisor started")
+    while not _polling_stop.wait(SUPERVISOR_INTERVAL):
+        try:
+            _start_or_replace_workers()
+            start_polling()
+        except Exception:
+            logger.exception("Runtime supervisor iteration failed")
+    logger.info("Runtime supervisor stopped")
+
+
+def start_runtime_services():
+    global _runtime_active, _supervisor_thread
+    if _runtime_active:
+        return
+
+    if not acquire_runtime_lock():
+        return
+
+    # Database initialization and recovery happen only in the lock-owning process.
+    # This prevents secondary WSGI workers from resetting live queue claims.
+    init_database()
+    db_recover_interrupted_jobs()
+    load_persistent_runtime_state()
+    register_bot_commands()
+    _start_or_replace_workers()
+    start_polling()
+
+    _supervisor_thread = threading.Thread(
+        target=runtime_supervisor,
+        name="NeptonSupervisor",
+        daemon=True,
+    )
+    _supervisor_thread.start()
+    _runtime_active = True
+    logger.info("NeptonBot %s runtime services started", VERSION)
+
+
+def shutdown_runtime():
+    _polling_stop.set()
+    logger.info("NeptonBot shutdown requested")
+
+
+atexit.register(shutdown_runtime)
 
 
 # =========================================================
 # Startup
 # =========================================================
-init_database()
-load_persistent_runtime_state()
-register_bot_commands()
-start_chat_workers()
-start_polling()
+if os.getenv("NEPTON_DISABLE_AUTOSTART", "0").strip().lower() not in {"1", "true", "yes"}:
+    start_runtime_services()
+else:
+    init_database()
+    logger.warning("NEPTON_DISABLE_AUTOSTART is enabled; background services were not started")
 
-logger.info("NeptonBot %s started successfully", VERSION)
+logger.info("NeptonBot %s module initialized", VERSION)

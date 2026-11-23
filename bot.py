@@ -1,15 +1,16 @@
 import os
 import re
 import time
-import json
 import sqlite3
 import logging
 import threading
+from contextlib import contextmanager
 from collections import OrderedDict, deque
 
 import requests
 from requests.adapters import HTTPAdapter
 from flask import Flask, jsonify
+
 
 # =========================================================
 # Configuration
@@ -19,7 +20,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -28,7 +29,7 @@ CLOUDFLARE_URL = (
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
 
-# روی Render، این مسیر را روی Persistent Disk قرار بده.
+# برای ماندگاری دیتابیس در Render، این متغیر را روی مسیر Persistent Disk تنظیم کن.
 DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3")
 
 AI_TIMEOUT = (15, 150)
@@ -71,8 +72,7 @@ SYSTEM_PROMPT = (
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
     "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
     "اگر کاربر پرسید چه کسی تو را ساخته یا سازنده‌ات کیست، "
-    "پاسخ بده: «من توسط نپتون ساخته شدم. "
-    "آیدی سازنده‌ام در بیوگرافی من قرار دارد.» "
+    "پاسخ بده: «من توسط نپتون ساخته شدم. آیدی سازنده‌ام در بیوگرافی من قرار دارد.» "
     "در پاسخ به این سؤال هرگز از عبارت «تیم نپتون» استفاده نکن."
 )
 
@@ -86,6 +86,7 @@ _missing = [
 if _missing:
     raise RuntimeError("Missing environment variables: " + ", ".join(_missing))
 
+
 # =========================================================
 # Logging and HTTP sessions
 # =========================================================
@@ -94,7 +95,6 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
-
 logger.info("NeptonBot version: %s", VERSION)
 logger.info("AI provider: Cloudflare Workers AI")
 logger.info("Model: %s", MODEL)
@@ -133,7 +133,9 @@ def get_http_session(name):
 _db_init_lock = threading.Lock()
 
 
+@contextmanager
 def db_connect():
+    """اتصال SQLite را در همهٔ حالت‌ها، حتی هنگام خطا، می‌بندد."""
     connection = sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -142,7 +144,17 @@ def db_connect():
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout = 30000")
     connection.execute("PRAGMA foreign_keys = ON")
-    return connection
+
+    try:
+        yield connection
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
 
 
 def init_database():
@@ -196,7 +208,7 @@ def init_database():
                 )
             """)
 
-            # اگر برنامه هنگام پردازش متوقف شده باشد، پیام بازیابی می‌شود.
+            # پیام‌هایی که هنگام خاموش‌شدن در وضعیت پردازش بوده‌اند، بازیابی می‌شوند.
             db.execute("""
                 UPDATE message_queue
                 SET status = 'pending'
@@ -217,14 +229,11 @@ def db_get_state(key, default=None):
 
 def db_set_state(key, value):
     with db_connect() as db:
-        db.execute(
-            """
+        db.execute("""
             INSERT INTO bot_state(key, value)
             VALUES(?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
-            """,
-            (key, str(value)),
-        )
+        """, (key, str(value)))
 
 
 def db_get_offset():
@@ -278,10 +287,7 @@ def db_queue_count():
 
 
 def db_enqueue_updates(prepared_updates, next_offset):
-    """
-    ذخیرهٔ پیام‌ها، شناسه‌های پردازش‌شده و offset در یک تراکنش.
-    prepared_updates: فهرست (update_id, chat_id, text)
-    """
+    """پیام‌ها، شناسه‌های پردازش‌شده و offset را در یک تراکنش ذخیره می‌کند."""
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
@@ -315,42 +321,31 @@ def db_enqueue_updates(prepared_updates, next_offset):
         now = time.time()
 
         for update_id, chat_id, text in unique_updates:
-            db.execute(
-                """
+            db.execute("""
                 INSERT INTO message_queue
                     (update_id, chat_id, message_text, queued_at, attempts, status)
                 VALUES (?, ?, ?, ?, 0, 'pending')
-                """,
-                (update_id, str(chat_id), text, now),
-            )
+            """, (update_id, str(chat_id), text, now))
 
             if update_id is not None:
-                db.execute(
-                    """
+                db.execute("""
                     INSERT OR IGNORE INTO processed_updates(update_id, processed_at)
                     VALUES(?, ?)
-                    """,
-                    (update_id, now),
-                )
+                """, (update_id, now))
 
         if next_offset is not None:
-            db.execute(
-                """
+            db.execute("""
                 INSERT INTO bot_state(key, value)
                 VALUES('polling_offset', ?)
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (str(next_offset),),
-            )
+            """, (str(next_offset),))
 
         db.commit()
         return True
 
 
 def db_claim_next_message():
-    """
-    هر چت به ترتیب پردازش می‌شود؛ چت‌های مختلف می‌توانند هم‌زمان پردازش شوند.
-    """
+    """ترتیب پیام‌های هر چت را حفظ می‌کند و چت‌های مختلف را موازی اجرا می‌کند."""
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
@@ -372,20 +367,14 @@ def db_claim_next_message():
             db.commit()
             return None
 
-        changed = db.execute(
-            """
+        changed = db.execute("""
             UPDATE message_queue
             SET status = 'processing'
             WHERE id = ? AND status = 'pending'
-            """,
-            (row["id"],),
-        ).rowcount
+        """, (row["id"],)).rowcount
 
         db.commit()
-        if not changed:
-            return None
-
-        return dict(row)
+        return dict(row) if changed else None
 
 
 def db_finish_message(message_id):
@@ -398,16 +387,11 @@ def db_finish_message(message_id):
 
 def db_retry_message(message_id):
     with db_connect() as db:
-        db.execute(
-            """
+        db.execute("""
             UPDATE message_queue
-            SET status = 'pending',
-                attempts = attempts + 1,
-                queued_at = ?
+            SET status = 'pending', attempts = attempts + 1, queued_at = ?
             WHERE id = ?
-            """,
-            (time.time(), message_id),
-        )
+        """, (time.time(), message_id))
 
 
 def db_discard_message(message_id):
@@ -434,9 +418,6 @@ app = Flask(__name__)
 _polling_thread = None
 _polling_stop = threading.Event()
 _worker_threads = []
-
-_runtime_lock = threading.Lock()
-_runtime_pending_count = 0
 
 
 def load_persistent_runtime_state():
@@ -567,7 +548,9 @@ def cloudflare_post_with_retry(session, payload):
 
         return response
 
-    raise requests.exceptions.ConnectionError("Cloudflare request failed after retry")
+    raise requests.exceptions.ConnectionError(
+        "Cloudflare request failed after retry"
+    )
 
 
 def call_ai(chat_id, user_text):
@@ -584,20 +567,22 @@ def call_ai(chat_id, user_text):
         "stream": False,
     }
 
-    session = get_http_session("cloudflare_session")
     started = time.perf_counter()
 
     try:
-        with cloudflare_post_with_retry(session, payload) as response:
+        with cloudflare_post_with_retry(
+            get_http_session("cloudflare_session"), payload
+        ) as response:
             if not 200 <= response.status_code < 300:
-                logger.error("Cloudflare HTTP error: status=%s", response.status_code)
-
+                logger.error(
+                    "Cloudflare HTTP error: status=%s",
+                    response.status_code,
+                )
                 if response.status_code == 429:
                     raise UserVisibleError(
                         "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
                         "کمی بعد دوباره تلاش کن."
                     )
-
                 raise UserVisibleError(
                     "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
                 )
@@ -616,8 +601,13 @@ def call_ai(chat_id, user_text):
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
         ) from exc
     except requests.exceptions.RequestException as exc:
-        logger.error("Cloudflare network error: type=%s", type(exc).__name__)
-        raise UserVisibleError("ارتباط با سرویس هوش مصنوعی برقرار نشد.") from exc
+        logger.error(
+            "Cloudflare network error: type=%s",
+            type(exc).__name__,
+        )
+        raise UserVisibleError(
+            "ارتباط با سرویس هوش مصنوعی برقرار نشد."
+        ) from exc
     finally:
         logger.info(
             "TIMING cloudflare_request_ms=%.0f",
@@ -628,7 +618,11 @@ def call_ai(chat_id, user_text):
         raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
 
     choices = data.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+    if (
+        not isinstance(choices, list)
+        or not choices
+        or not isinstance(choices[0], dict)
+    ):
         raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
 
     message = choices[0].get("message")
@@ -650,7 +644,9 @@ def call_ai(chat_id, user_text):
         answer = ""
 
     if not answer:
-        raise UserVisibleError("مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن.")
+        raise UserVisibleError(
+            "مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن."
+        )
 
     return answer
 
@@ -671,7 +667,8 @@ def soroush_request(method, payload=None):
             if not 200 <= response.status_code < 300:
                 logger.error(
                     "Soroush HTTP error: method=%s status=%s",
-                    method, response.status_code,
+                    method,
+                    response.status_code,
                 )
                 return None
 
@@ -684,7 +681,8 @@ def soroush_request(method, payload=None):
     except requests.exceptions.RequestException as exc:
         logger.error(
             "Soroush network error: method=%s type=%s",
-            method, type(exc).__name__,
+            method,
+            type(exc).__name__,
         )
         return None
 
@@ -703,7 +701,9 @@ def register_bot_commands():
     if result is None or (
         isinstance(result, dict) and result.get("ok") is False
     ):
-        logger.warning("Could not register bot commands; /feedback remains usable by text")
+        logger.warning(
+            "Could not register bot commands; /feedback remains usable by text"
+        )
         return False
 
     logger.info("Bot commands registered")
@@ -809,7 +809,11 @@ def extract_message(update):
     if not isinstance(message, dict):
         return None
 
-    text = message.get("text") or message.get("body") or message.get("message_text")
+    text = (
+        message.get("text")
+        or message.get("body")
+        or message.get("message_text")
+    )
     chat = message.get("chat")
     sender = message.get("from")
 
@@ -820,7 +824,8 @@ def extract_message(update):
     username = sender.get("username") if isinstance(sender, dict) else None
     normalized_username = (
         username.strip().lstrip("@").lower()
-        if isinstance(username, str) else None
+        if isinstance(username, str)
+        else None
     )
 
     if normalized_username == ADMIN_USERNAME.lower() and chat_id is not None:
@@ -858,10 +863,17 @@ def is_creator_question(user_text):
     normalized = re.sub(r"\s+", " ", normalized).strip()
 
     exact_phrases = {
-        "سازندت کیه", "سازنده ات کیه", "سازنده تو کیه",
-        "چه کسی ساختت", "کی ساختت", "تو رو کی ساخته",
-        "تورو کی ساخته", "توسعه دهنده ات کیه", "توسعه دهنده تو کیه",
-        "چه کسی تو را ساخته", "چه کسی تو رو ساخته",
+        "سازندت کیه",
+        "سازنده ات کیه",
+        "سازنده تو کیه",
+        "چه کسی ساختت",
+        "کی ساختت",
+        "تو رو کی ساخته",
+        "تورو کی ساخته",
+        "توسعه دهنده ات کیه",
+        "توسعه دهنده تو کیه",
+        "چه کسی تو را ساخته",
+        "چه کسی تو رو ساخته",
         "تو توسط چه کسی ساخته شدی",
     }
 
@@ -884,7 +896,8 @@ def process_feedback_message(chat_id, text):
     stripped = text.strip()
     command = (
         stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
-        if stripped else ""
+        if stripped
+        else ""
     )
 
     if command == FEEDBACK_CANCEL_COMMAND:
@@ -896,7 +909,10 @@ def process_feedback_message(chat_id, text):
             db_set_feedback_pending(chat_id, False)
             return send_message(chat_id, "ارسال نظر لغو شد.")
 
-        return send_message(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")
+        return send_message(
+            chat_id,
+            "در حال حاضر در مرحلهٔ ارسال نظر نیستی.",
+        )
 
     if command == FEEDBACK_COMMAND or stripped == FEEDBACK_TRIGGER_TEXT:
         with feedback_lock:
@@ -917,7 +933,10 @@ def process_feedback_message(chat_id, text):
         return None
 
     if not stripped:
-        return send_message(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")
+        return send_message(
+            chat_id,
+            "متن نظر خالی است؛ لطفاً دوباره بفرست.",
+        )
 
     if len(stripped) > MAX_MESSAGE_LENGTH:
         return send_message(
@@ -950,8 +969,10 @@ def process_feedback_message(chat_id, text):
         feedback_pending.discard(chat_id)
 
     db_set_feedback_pending(chat_id, False)
-
-    return send_message(chat_id, "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت.")
+    return send_message(
+        chat_id,
+        "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت.",
+    )
 
 
 # =========================================================
@@ -971,7 +992,8 @@ def process_message(chat_id, text, queued_at):
         send_ok = send_message(chat_id, START_MESSAGE)
         logger.info(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=start",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
         )
         return send_ok
 
@@ -980,7 +1002,8 @@ def process_message(chat_id, text, queued_at):
         send_ok = send_message(chat_id, "حافظه گفت‌وگوی شما پاک شد.")
         logger.info(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=reset",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
         )
         return send_ok
 
@@ -1022,19 +1045,24 @@ def process_message(chat_id, text, queued_at):
         send_ok = send_message(chat_id, str(exc))
         logger.warning(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
         )
         return bool(send_ok)
 
     except Exception as exc:
-        logger.error("Message processing failed: type=%s", type(exc).__name__)
+        logger.error(
+            "Message processing failed: type=%s",
+            type(exc).__name__,
+        )
         send_ok = send_message(
             chat_id,
             "در پردازش پیام مشکلی پیش آمد. کمی بعد دوباره تلاش کن.",
         )
         logger.error(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=internal_error",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
         )
         return send_ok
 
@@ -1105,7 +1133,7 @@ def prepare_update_batch(updates):
     prepared = []
     last_update_id = None
 
-    # شناسایی مدیر پیش از آغاز تراکنش صف انجام می‌شود.
+    # شناسایی مدیر پیش از آغاز تراکنش ذخیرهٔ صف انجام می‌شود.
     for update in updates:
         update_id = get_update_id(update)
 
@@ -1116,11 +1144,9 @@ def prepare_update_batch(updates):
             )
 
         extracted = extract_message(update)
-        if extracted is None:
-            continue
-
-        chat_id, text = extracted
-        prepared.append((update_id, chat_id, text))
+        if extracted is not None:
+            chat_id, text = extracted
+            prepared.append((update_id, chat_id, text))
 
     return prepared, last_update_id
 
@@ -1135,7 +1161,6 @@ def polling_loop():
         try:
             payload = {"offset": offset} if offset is not None else {}
             started = time.perf_counter()
-
             data = soroush_request("getUpdates", payload)
 
             logger.info(
@@ -1143,19 +1168,13 @@ def polling_loop():
                 (time.perf_counter() - started) * 1000,
             )
 
-            if data is None:
-                _polling_stop.wait(backoff)
-                backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
-                continue
-
-            if not has_update_container(data):
-                logger.error("Unexpected Soroush getUpdates response")
+            if data is None or not has_update_container(data):
+                logger.error("Unexpected or failed Soroush getUpdates response")
                 _polling_stop.wait(backoff)
                 backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
                 continue
 
             updates = extract_updates(data)
-
             if not updates:
                 backoff = POLL_ERROR_BACKOFF_START
                 _polling_stop.wait(POLL_EMPTY_WAIT)
@@ -1164,10 +1183,11 @@ def polling_loop():
             prepared, last_id = prepare_update_batch(updates)
 
             if last_id is None:
-                # اگر updateها شناسه نداشته باشند، offset قابل ذخیره نیست.
-                # پیام‌ها در صف ثبت می‌شوند، اما deduplication شناسه‌ای ممکن نیست.
+                # بدون شناسهٔ update امکان deduplication و ذخیرهٔ offset وجود ندارد.
                 if not db_enqueue_updates(prepared, None):
                     _polling_stop.wait(POLL_ERROR_BACKOFF_START)
+                elif not prepared:
+                    _polling_stop.wait(POLL_EMPTY_WAIT)
                 else:
                     backoff = POLL_ERROR_BACKOFF_START
                 continue
@@ -1178,11 +1198,14 @@ def polling_loop():
                 offset = next_offset
                 backoff = POLL_ERROR_BACKOFF_START
             else:
-                # offset جلو نمی‌رود؛ batch در درخواست بعدی دوباره دریافت می‌شود.
+                # offset جلو نمی‌رود تا batch در درخواست بعدی دوباره دریافت شود.
                 _polling_stop.wait(POLL_ERROR_BACKOFF_START)
 
         except Exception as exc:
-            logger.error("Polling iteration failed: type=%s", type(exc).__name__)
+            logger.error(
+                "Polling iteration failed: type=%s",
+                type(exc).__name__,
+            )
             _polling_stop.wait(backoff)
             backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
 
@@ -1191,7 +1214,10 @@ def _polling_main():
     try:
         polling_loop()
     except Exception as exc:
-        logger.error("Polling thread stopped unexpectedly: type=%s", type(exc).__name__)
+        logger.error(
+            "Polling thread stopped unexpectedly: type=%s",
+            type(exc).__name__,
+        )
 
 
 _polling_lock = threading.Lock()
@@ -1202,7 +1228,11 @@ def start_polling():
     global _polling_started, _polling_thread
 
     with _polling_lock:
-        if _polling_started and _polling_thread and _polling_thread.is_alive():
+        if (
+            _polling_started
+            and _polling_thread is not None
+            and _polling_thread.is_alive()
+        ):
             return
 
         _polling_stop.clear()

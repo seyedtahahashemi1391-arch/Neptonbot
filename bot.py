@@ -21,7 +21,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -45,13 +45,11 @@ POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
 
-# تعداد تلاش‌های مجدد پس از تلاش اولیه
 MAX_WORKER_RETRIES = 5
 RETRY_BACKOFF_START = 2
 RETRY_BACKOFF_MAX = 120
 WORKER_IDLE_WAIT = 0.25
 
-# نگهداری شناسه‌های پردازش‌شده برای جلوگیری از پردازش دوباره
 PROCESSED_UPDATE_RETENTION_DAYS = 14
 PROCESSED_UPDATE_CLEANUP_INTERVAL = 6 * 60 * 60
 
@@ -79,10 +77,7 @@ SYSTEM_PROMPT = (
     "درستی اطلاعات را بر روانی متن مقدم بدان و هیچ واقعیت، منبع، آزمون یا تجربه‌ای را جعل نکن. "
     "اطلاعات متغیر مانند قیمت، رتبه‌بندی و وضعیت روز را بدون منبع به‌روز قطعی اعلام نکن. "
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را صریح بگو و وضعیت فعلی را حدس نزن. "
-    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
-    "اگر کاربر پرسید چه کسی تو را ساخته یا سازنده‌ات کیست، "
-    "پاسخ بده: «من توسط نپتون ساخته شدم. آیدی سازنده‌ام در بیوگرافی من قرار دارد.» "
-    "در پاسخ به این سؤال هرگز از عبارت «تیم نپتون» استفاده نکن."
+    "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن."
 )
 
 _missing = [
@@ -200,7 +195,6 @@ def init_database():
                 )
             """)
 
-            # مهاجرت خودکار از دیتابیس نسخه‌های قبلی
             columns = _table_columns(db, "message_queue")
 
             if "retry_at" not in columns:
@@ -245,7 +239,6 @@ def init_database():
                 )
             """)
 
-            # پیام‌های نیمه‌پردازش‌شده پس از راه‌اندازی دوباره بازیابی می‌شوند.
             db.execute("""
                 UPDATE message_queue
                 SET status = 'pending', retry_at = 0
@@ -956,12 +949,17 @@ def get_update_id(update):
 # =========================================================
 # Creator question detection
 # =========================================================
-def is_creator_question(user_text):
-    normalized = user_text.strip().lower()
+def normalize_text(text):
+    normalized = text.strip().lower()
     normalized = normalized.replace("ي", "ی").replace("ك", "ک")
     normalized = normalized.replace("\u200c", " ")
     normalized = re.sub(r"[؟?!.,،؛:]+", "", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def is_creator_question(user_text):
+    normalized = normalize_text(user_text)
 
     exact_phrases = {
         "سازندت کیه",
@@ -988,6 +986,29 @@ def is_creator_question(user_text):
     )
 
     return any(re.search(pattern, normalized) for pattern in patterns)
+
+
+# =========================================================
+# Fixed conversational replies
+# =========================================================
+def get_fixed_conversation_answer(user_text):
+    """
+    پاسخ ثابت برای احوال‌پرسی‌های کوتاه و پرتکرار.
+    این پیام‌ها به مدل فرستاده نمی‌شوند.
+    """
+    normalized = normalize_text(user_text)
+
+    answers = {
+        "سلام": "سلام! چطور می‌تونم کمکت کنم؟",
+        "سلام خوبی": "سلام! خوبم، ممنون. تو چطوری؟",
+        "سلام چطوری": "سلام! خوبم، ممنون. تو چطوری؟",
+        "چطوری": "خوبم، ممنون! تو چطوری؟",
+        "خوبی": "خوبم، ممنون! تو چطوری؟",
+        "چه خبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
+        "چخبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
+    }
+
+    return answers.get(normalized)
 
 
 # =========================================================
@@ -1120,6 +1141,22 @@ def process_message(chat_id, text, queued_at):
 
         logger.info(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=creator result=%s",
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
+            "sent" if send_ok else "send_failed",
+        )
+        return send_ok
+
+    fixed_answer = get_fixed_conversation_answer(text)
+
+    if fixed_answer is not None:
+        send_ok = send_message(chat_id, fixed_answer)
+
+        if send_ok:
+            save_turn(chat_id, text, fixed_answer)
+
+        logger.info(
+            "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=fixed_conversation result=%s",
             queue_wait_ms,
             (time.perf_counter() - started) * 1000,
             "sent" if send_ok else "send_failed",
@@ -1319,7 +1356,6 @@ def polling_loop():
             prepared, last_id = prepare_update_batch(updates)
 
             if last_id is None:
-                # بدون شناسهٔ update، offset را جلو نمی‌بریم.
                 if not db_enqueue_updates(prepared, None):
                     _polling_stop.wait(POLL_ERROR_BACKOFF_START)
                 elif not prepared:
@@ -1334,7 +1370,6 @@ def polling_loop():
                 offset = next_offset
                 backoff = POLL_ERROR_BACKOFF_START
             else:
-                # در صورت پر بودن صف، offset جلو نمی‌رود.
                 _polling_stop.wait(POLL_ERROR_BACKOFF_START)
 
         except Exception as exc:

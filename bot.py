@@ -1,9 +1,10 @@
 import os
 import re
 import time
+import json
+import sqlite3
 import logging
 import threading
-import queue
 from collections import OrderedDict, deque
 
 import requests
@@ -18,7 +19,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.2.8"
+VERSION = "2.3.0"
 ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -26,6 +27,9 @@ CLOUDFLARE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
+
+# روی Render، این مسیر را روی Persistent Disk قرار بده.
+DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3")
 
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
@@ -43,13 +47,15 @@ MAX_WORKER_RETRIES = 2
 
 FEEDBACK_COMMAND = "/feedback"
 FEEDBACK_CANCEL_COMMAND = "/cancel"
-FEEDBACK_COMMAND_DESCRIPTION = "ارسال نظر و پیشنهاد"
-FEEDBACK_TRIGGER_TEXT = "ارسال نظر و پیشنهاد"
+FEEDBACK_COMMAND_DESCRIPTION = "ارسال نظر"
+FEEDBACK_TRIGGER_TEXT = "ارسال نظر"
 
 START_MESSAGE = (
-    "سلام! من نپتون بات هستم.\n"
-    "به هوش مصنوعی متصل شده‌ام و آماده پاسخ‌گویی هستم."
+    "سلام! من نپتون بات هستم😊👋\n"
+    "جهت ارسال نظرات پیشنهادات و انتقادات بر روی دکمه\n"
+    "آبی کلیک و سپس بر روی ارسال نظر کلیک کنید."
 )
+
 CREATOR_ANSWER = (
     "من توسط نپتون ساخته شدم. "
     "آیدی سازنده‌ام در بیوگرافی من قرار دارد."
@@ -70,15 +76,6 @@ SYSTEM_PROMPT = (
     "در پاسخ به این سؤال هرگز از عبارت «تیم نپتون» استفاده نکن."
 )
 
-# =========================================================
-# Logging and environment validation
-# =========================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logger = logging.getLogger("NeptonBot")
-
 _missing = [
     name for name, value in (
         ("BOT_TOKEN", BOT_TOKEN),
@@ -89,14 +86,19 @@ _missing = [
 if _missing:
     raise RuntimeError("Missing environment variables: " + ", ".join(_missing))
 
-logger.info("Environment variables verified")
+# =========================================================
+# Logging and HTTP sessions
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("NeptonBot")
+
 logger.info("NeptonBot version: %s", VERSION)
 logger.info("AI provider: Cloudflare Workers AI")
 logger.info("Model: %s", MODEL)
 
-# =========================================================
-# HTTP sessions
-# =========================================================
 _thread_local = threading.local()
 
 
@@ -126,7 +128,298 @@ def get_http_session(name):
 
 
 # =========================================================
-# Conversation history, admin identity, and feedback state
+# SQLite persistent state
+# =========================================================
+_db_init_lock = threading.Lock()
+
+
+def db_connect():
+    connection = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        isolation_level=None,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+def init_database():
+    with _db_init_lock:
+        parent = os.path.dirname(os.path.abspath(DB_PATH))
+        os.makedirs(parent, exist_ok=True)
+
+        with db_connect() as db:
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute("PRAGMA synchronous = FULL")
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS message_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    update_id INTEGER,
+                    chat_id TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    queued_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending'
+                )
+            """)
+
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_queue_status_id
+                ON message_queue(status, id)
+            """)
+
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_queue_chat_status_id
+                ON message_queue(chat_id, status, id)
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS processed_updates (
+                    update_id INTEGER PRIMARY KEY,
+                    processed_at REAL NOT NULL
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS feedback_pending (
+                    chat_id TEXT PRIMARY KEY
+                )
+            """)
+
+            # اگر برنامه هنگام پردازش متوقف شده باشد، پیام بازیابی می‌شود.
+            db.execute("""
+                UPDATE message_queue
+                SET status = 'pending'
+                WHERE status = 'processing'
+            """)
+
+    logger.info("SQLite database initialized: %s", DB_PATH)
+
+
+def db_get_state(key, default=None):
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT value FROM bot_state WHERE key = ?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def db_set_state(key, value):
+    with db_connect() as db:
+        db.execute(
+            """
+            INSERT INTO bot_state(key, value)
+            VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, str(value)),
+        )
+
+
+def db_get_offset():
+    value = db_get_state("polling_offset")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        logger.warning("Invalid saved polling offset; starting without offset")
+        return None
+
+
+def db_get_admin_chat_id():
+    return db_get_state("admin_chat_id")
+
+
+def db_set_admin_chat_id(chat_id):
+    if chat_id is None:
+        return False
+    db_set_state("admin_chat_id", str(chat_id))
+    return True
+
+
+def db_get_feedback_pending():
+    with db_connect() as db:
+        rows = db.execute(
+            "SELECT chat_id FROM feedback_pending"
+        ).fetchall()
+    return {row["chat_id"] for row in rows}
+
+
+def db_set_feedback_pending(chat_id, pending):
+    with db_connect() as db:
+        if pending:
+            db.execute(
+                "INSERT OR IGNORE INTO feedback_pending(chat_id) VALUES(?)",
+                (str(chat_id),),
+            )
+        else:
+            db.execute(
+                "DELETE FROM feedback_pending WHERE chat_id = ?",
+                (str(chat_id),),
+            )
+
+
+def db_queue_count():
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT COUNT(*) AS total FROM message_queue"
+        ).fetchone()
+    return int(row["total"])
+
+
+def db_enqueue_updates(prepared_updates, next_offset):
+    """
+    ذخیرهٔ پیام‌ها، شناسه‌های پردازش‌شده و offset در یک تراکنش.
+    prepared_updates: فهرست (update_id, chat_id, text)
+    """
+    with db_connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        current_count = db.execute(
+            "SELECT COUNT(*) AS total FROM message_queue"
+        ).fetchone()["total"]
+
+        unique_updates = []
+        seen_in_batch = set()
+
+        for update_id, chat_id, text in prepared_updates:
+            if update_id is not None:
+                if update_id in seen_in_batch:
+                    continue
+                seen_in_batch.add(update_id)
+
+                exists = db.execute(
+                    "SELECT 1 FROM processed_updates WHERE update_id = ?",
+                    (update_id,),
+                ).fetchone()
+                if exists:
+                    continue
+
+            unique_updates.append((update_id, chat_id, text))
+
+        if current_count + len(unique_updates) > MAX_QUEUED_MESSAGES:
+            db.rollback()
+            logger.warning("Persistent message queue is full")
+            return False
+
+        now = time.time()
+
+        for update_id, chat_id, text in unique_updates:
+            db.execute(
+                """
+                INSERT INTO message_queue
+                    (update_id, chat_id, message_text, queued_at, attempts, status)
+                VALUES (?, ?, ?, ?, 0, 'pending')
+                """,
+                (update_id, str(chat_id), text, now),
+            )
+
+            if update_id is not None:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO processed_updates(update_id, processed_at)
+                    VALUES(?, ?)
+                    """,
+                    (update_id, now),
+                )
+
+        if next_offset is not None:
+            db.execute(
+                """
+                INSERT INTO bot_state(key, value)
+                VALUES('polling_offset', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (str(next_offset),),
+            )
+
+        db.commit()
+        return True
+
+
+def db_claim_next_message():
+    """
+    هر چت به ترتیب پردازش می‌شود؛ چت‌های مختلف می‌توانند هم‌زمان پردازش شوند.
+    """
+    with db_connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        row = db.execute("""
+            SELECT q.*
+            FROM message_queue AS q
+            WHERE q.status = 'pending'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM message_queue AS earlier
+                  WHERE earlier.chat_id = q.chat_id
+                    AND earlier.id < q.id
+              )
+            ORDER BY q.id
+            LIMIT 1
+        """).fetchone()
+
+        if row is None:
+            db.commit()
+            return None
+
+        changed = db.execute(
+            """
+            UPDATE message_queue
+            SET status = 'processing'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (row["id"],),
+        ).rowcount
+
+        db.commit()
+        if not changed:
+            return None
+
+        return dict(row)
+
+
+def db_finish_message(message_id):
+    with db_connect() as db:
+        db.execute(
+            "DELETE FROM message_queue WHERE id = ?",
+            (message_id,),
+        )
+
+
+def db_retry_message(message_id):
+    with db_connect() as db:
+        db.execute(
+            """
+            UPDATE message_queue
+            SET status = 'pending',
+                attempts = attempts + 1,
+                queued_at = ?
+            WHERE id = ?
+            """,
+            (time.time(), message_id),
+        )
+
+
+def db_discard_message(message_id):
+    with db_connect() as db:
+        db.execute(
+            "DELETE FROM message_queue WHERE id = ?",
+            (message_id,),
+        )
+
+
+# =========================================================
+# Conversation history and runtime state
 # =========================================================
 conversation_history = OrderedDict()
 history_lock = threading.Lock()
@@ -136,6 +429,26 @@ admin_chat_id = None
 
 feedback_lock = threading.Lock()
 feedback_pending = set()
+
+app = Flask(__name__)
+_polling_thread = None
+_polling_stop = threading.Event()
+_worker_threads = []
+
+_runtime_lock = threading.Lock()
+_runtime_pending_count = 0
+
+
+def load_persistent_runtime_state():
+    global admin_chat_id, feedback_pending
+
+    saved_admin = db_get_admin_chat_id()
+    with admin_lock:
+        admin_chat_id = saved_admin
+
+    saved_pending = db_get_feedback_pending()
+    with feedback_lock:
+        feedback_pending = saved_pending
 
 
 def get_history(chat_id):
@@ -153,9 +466,11 @@ def save_turn(chat_id, user_text, assistant_text):
         if history is None:
             history = deque(maxlen=MAX_HISTORY_MESSAGES)
             conversation_history[chat_id] = history
+
         history.append({"role": "user", "content": user_text})
         history.append({"role": "assistant", "content": assistant_text})
         conversation_history.move_to_end(chat_id)
+
         while len(conversation_history) > MAX_CONVERSATIONS:
             conversation_history.popitem(last=False)
 
@@ -169,8 +484,13 @@ def set_admin_chat_id(chat_id):
     global admin_chat_id
     if chat_id is None:
         return False
+
+    chat_id = str(chat_id)
+    db_set_admin_chat_id(chat_id)
+
     with admin_lock:
-        admin_chat_id = str(chat_id)
+        admin_chat_id = chat_id
+
     logger.info("Admin chat registered from verified sender username")
     return True
 
@@ -178,20 +498,6 @@ def set_admin_chat_id(chat_id):
 def get_admin_chat_id():
     with admin_lock:
         return admin_chat_id
-
-
-# =========================================================
-# Flask application and queue state
-# =========================================================
-app = Flask(__name__)
-_polling_thread = None
-_polling_stop = threading.Event()
-
-_chat_queue = queue.Queue(maxsize=MAX_CONVERSATIONS + MAX_PARALLEL_CHATS)
-_chat_queue_lock = threading.Lock()
-_chat_messages = {}
-_pending_message_count = 0
-_worker_threads = []
 
 
 @app.get("/")
@@ -208,28 +514,16 @@ def home():
 @app.get("/health")
 def health():
     thread = _polling_thread
-    if thread is None or not thread.is_alive():
-        return jsonify({
-            "status": "degraded",
-            "polling": "stopped",
-            "version": VERSION,
-        }), 503
-
-    with _chat_queue_lock:
-        pending = _pending_message_count
-        chat_count = len(_chat_messages)
-        waiting = _chat_queue.qsize()
+    polling_running = thread is not None and thread.is_alive()
 
     return jsonify({
-        "status": "healthy",
-        "polling": "running",
+        "status": "healthy" if polling_running else "degraded",
+        "polling": "running" if polling_running else "stopped",
         "version": VERSION,
-        "queued_messages": pending,
-        "active_or_waiting_chats": chat_count,
-        "waiting_chats": waiting,
-        "workers": MAX_PARALLEL_CHATS,
+        "queued_messages": db_queue_count(),
+        "workers": len(_worker_threads),
         "admin_registered": get_admin_chat_id() is not None,
-    }), 200
+    }), 200 if polling_running else 503
 
 
 class UserVisibleError(Exception):
@@ -270,6 +564,7 @@ def cloudflare_post_with_retry(session, payload):
             response.close()
             logger.warning("Cloudflare HTTP %s; retrying once", status)
             continue
+
         return response
 
     raise requests.exceptions.ConnectionError("Cloudflare request failed after retry")
@@ -291,29 +586,32 @@ def call_ai(chat_id, user_text):
 
     session = get_http_session("cloudflare_session")
     started = time.perf_counter()
+
     try:
         with cloudflare_post_with_retry(session, payload) as response:
             if not 200 <= response.status_code < 300:
                 logger.error("Cloudflare HTTP error: status=%s", response.status_code)
+
                 if response.status_code == 429:
                     raise UserVisibleError(
                         "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
                         "کمی بعد دوباره تلاش کن."
                     )
+
                 raise UserVisibleError(
                     "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
                 )
+
             try:
                 data = response.json()
             except ValueError as exc:
-                logger.error("Cloudflare returned invalid JSON")
                 raise UserVisibleError(
                     "پاسخ سرویس هوش مصنوعی قابل پردازش نبود."
                 ) from exc
+
     except UserVisibleError:
         raise
     except requests.exceptions.Timeout as exc:
-        logger.warning("Cloudflare request timed out")
         raise UserVisibleError(
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید."
         ) from exc
@@ -328,9 +626,9 @@ def call_ai(chat_id, user_text):
 
     if not isinstance(data, dict):
         raise UserVisibleError("ساختار پاسخ هوش مصنوعی نامعتبر است.")
+
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        logger.error("Cloudflare response has no valid choices")
         raise UserVisibleError("مدل نتوانست پاسخ معتبری تولید کند.")
 
     message = choices[0].get("message")
@@ -352,8 +650,8 @@ def call_ai(chat_id, user_text):
         answer = ""
 
     if not answer:
-        logger.error("Empty AI content; finish_reason=%r", choices[0].get("finish_reason"))
         raise UserVisibleError("مدل این بار پاسخ متنی تولید نکرد. دوباره تلاش کن.")
+
     return answer
 
 
@@ -362,6 +660,7 @@ def call_ai(chat_id, user_text):
 # =========================================================
 def soroush_request(method, payload=None):
     session = get_http_session("soroush_session")
+
     try:
         with session.post(
             f"{SOROUSH_API}/{method}",
@@ -375,11 +674,13 @@ def soroush_request(method, payload=None):
                     method, response.status_code,
                 )
                 return None
+
             try:
                 return response.json()
             except ValueError:
                 logger.error("Soroush invalid JSON: method=%s", method)
                 return None
+
     except requests.exceptions.RequestException as exc:
         logger.error(
             "Soroush network error: method=%s type=%s",
@@ -389,7 +690,6 @@ def soroush_request(method, payload=None):
 
 
 def register_bot_commands():
-    """Register the feedback command in the bot's menu."""
     result = soroush_request(
         "setMyCommands",
         {
@@ -399,33 +699,47 @@ def register_bot_commands():
             }]
         },
     )
-    if result is None or (isinstance(result, dict) and result.get("ok") is False):
+
+    if result is None or (
+        isinstance(result, dict) and result.get("ok") is False
+    ):
         logger.warning("Could not register bot commands; /feedback remains usable by text")
         return False
+
     logger.info("Bot commands registered")
     return True
 
 
 def split_message(text):
-    return [text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(text), MAX_MESSAGE_LENGTH)]
+    return [
+        text[i:i + MAX_MESSAGE_LENGTH]
+        for i in range(0, len(text), MAX_MESSAGE_LENGTH)
+    ]
 
 
 def send_message(chat_id, text):
     if not isinstance(text, str) or not text:
         return False
+
     started = time.perf_counter()
     success = True
+
     try:
         for chunk in split_message(text):
             result = soroush_request(
                 "sendMessage",
                 {"chat_id": chat_id, "text": chunk},
             )
-            if result is None or (isinstance(result, dict) and result.get("ok") is False):
+
+            if result is None or (
+                isinstance(result, dict) and result.get("ok") is False
+            ):
                 logger.error("Soroush sendMessage failed or was rejected")
                 success = False
                 break
+
         return success
+
     finally:
         logger.info(
             "TIMING send_message_ms=%.0f success=%s",
@@ -440,46 +754,58 @@ def send_message(chat_id, text):
 def extract_updates(data):
     if isinstance(data, list):
         return data
+
     if not isinstance(data, dict):
         return []
+
     for key in ("result", "updates", "data"):
         value = data.get(key)
+
         if isinstance(value, list):
             return value
+
         if isinstance(value, dict):
             for nested_key in ("updates", "messages", "result"):
                 nested = value.get(nested_key)
                 if isinstance(nested, list):
                     return nested
+
     return []
 
 
 def has_update_container(data):
     if isinstance(data, list):
         return True
+
     if not isinstance(data, dict) or data.get("ok") is False:
         return False
+
     for key in ("result", "updates", "data"):
         value = data.get(key)
+
         if isinstance(value, list):
             return True
+
         if isinstance(value, dict) and any(
             isinstance(value.get(k), list)
             for k in ("updates", "messages", "result")
         ):
             return True
+
     return False
 
 
 def extract_message(update):
     if not isinstance(update, dict):
         return None
+
     message = (
         update.get("message")
         or update.get("edited_message")
         or update.get("new_message")
         or update
     )
+
     if not isinstance(message, dict):
         return None
 
@@ -496,23 +822,28 @@ def extract_message(update):
         username.strip().lstrip("@").lower()
         if isinstance(username, str) else None
     )
+
     if normalized_username == ADMIN_USERNAME.lower() and chat_id is not None:
         set_admin_chat_id(chat_id)
 
     if text is None or chat_id is None:
         return None
+
     if not isinstance(text, str):
         text = str(text)
+
     return str(chat_id), text
 
 
 def get_update_id(update):
     if not isinstance(update, dict):
         return None
+
     for key in ("update_id", "updateId", "id"):
         value = update.get(key)
         if isinstance(value, int) and not isinstance(value, bool):
             return value
+
     return None
 
 
@@ -533,6 +864,7 @@ def is_creator_question(user_text):
         "چه کسی تو را ساخته", "چه کسی تو رو ساخته",
         "تو توسط چه کسی ساخته شدی",
     }
+
     if normalized in exact_phrases:
         return True
 
@@ -541,6 +873,7 @@ def is_creator_question(user_text):
         r"^(چه کسی|کی) .{0,8} (ساختت|ساخته|ساخته است)$",
         r"^(توسعه دهنده) .{0,12} کیه$",
     )
+
     return any(re.search(pattern, normalized) for pattern in patterns)
 
 
@@ -548,21 +881,29 @@ def is_creator_question(user_text):
 # Feedback flow
 # =========================================================
 def process_feedback_message(chat_id, text):
-    """Return True/False when feedback flow handled the message; None otherwise."""
     stripped = text.strip()
-    command = stripped.split(maxsplit=1)[0].split("@", 1)[0].lower() if stripped else ""
+    command = (
+        stripped.split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if stripped else ""
+    )
 
     if command == FEEDBACK_CANCEL_COMMAND:
         with feedback_lock:
             was_pending = chat_id in feedback_pending
             feedback_pending.discard(chat_id)
+
         if was_pending:
+            db_set_feedback_pending(chat_id, False)
             return send_message(chat_id, "ارسال نظر لغو شد.")
+
         return send_message(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")
 
     if command == FEEDBACK_COMMAND or stripped == FEEDBACK_TRIGGER_TEXT:
         with feedback_lock:
             feedback_pending.add(chat_id)
+
+        db_set_feedback_pending(chat_id, True)
+
         return send_message(
             chat_id,
             "متن نظر یا پیشنهادت را در پیام بعدی بفرست.\n"
@@ -571,6 +912,7 @@ def process_feedback_message(chat_id, text):
 
     with feedback_lock:
         is_pending = chat_id in feedback_pending
+
     if not is_pending:
         return None
 
@@ -597,6 +939,7 @@ def process_feedback_message(chat_id, text):
         f"شناسهٔ فرستنده: {chat_id}\n\n"
         f"{stripped}"
     )
+
     if not send_message(admin_id, admin_message):
         return send_message(
             chat_id,
@@ -606,6 +949,8 @@ def process_feedback_message(chat_id, text):
     with feedback_lock:
         feedback_pending.discard(chat_id)
 
+    db_set_feedback_pending(chat_id, False)
+
     return send_message(chat_id, "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت.")
 
 
@@ -614,8 +959,9 @@ def process_feedback_message(chat_id, text):
 # =========================================================
 def process_message(chat_id, text, queued_at):
     started = time.perf_counter()
-    queue_wait_ms = max(0, (started - queued_at) * 1000)
+    queue_wait_ms = max(0, (time.time() - queued_at) * 1000)
     text = text.strip()
+
     if not text:
         return True
 
@@ -646,32 +992,40 @@ def process_message(chat_id, text, queued_at):
         send_ok = send_message(chat_id, CREATOR_ANSWER)
         if send_ok:
             save_turn(chat_id, text, CREATOR_ANSWER)
+
         logger.info(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f type=creator result=%s",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
             "sent" if send_ok else "send_failed",
         )
         return send_ok
 
     text = text[:MAX_MESSAGE_LENGTH]
+
     try:
         answer = call_ai(chat_id, text)
         send_ok = send_message(chat_id, answer)
+
         if send_ok:
             save_turn(chat_id, text, answer)
+
         logger.info(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=%s",
-            queue_wait_ms, (time.perf_counter() - started) * 1000,
+            queue_wait_ms,
+            (time.perf_counter() - started) * 1000,
             "sent" if send_ok else "send_failed",
         )
         return send_ok
+
     except UserVisibleError as exc:
         send_ok = send_message(chat_id, str(exc))
         logger.warning(
             "TIMING message queue_wait_ms=%.0f total_ms=%.0f result=ai_error",
             queue_wait_ms, (time.perf_counter() - started) * 1000,
         )
-        return True if send_ok else False
+        return bool(send_ok)
+
     except Exception as exc:
         logger.error("Message processing failed: type=%s", type(exc).__name__)
         send_ok = send_message(
@@ -686,91 +1040,52 @@ def process_message(chat_id, text, queued_at):
 
 
 # =========================================================
-# Per-chat asynchronous queue
+# Persistent queue workers
 # =========================================================
-def enqueue_chat_messages(grouped_messages):
-    global _pending_message_count
-    if not grouped_messages:
-        return True
-
-    with _chat_queue_lock:
-        incoming = sum(len(items) for items in grouped_messages.values())
-        new_chats = [cid for cid in grouped_messages if cid not in _chat_messages]
-
-        if _pending_message_count + incoming > MAX_QUEUED_MESSAGES:
-            logger.warning("Message queue is full")
-            return False
-        if len(_chat_messages) + len(new_chats) > MAX_CONVERSATIONS:
-            logger.warning("Conversation queue capacity reached")
-            return False
-
-        for chat_id, messages in grouped_messages.items():
-            if chat_id not in _chat_messages:
-                _chat_messages[chat_id] = deque()
-                _chat_queue.put_nowait(chat_id)
-            received_at = time.perf_counter()
-            for message_text in messages:
-                _chat_messages[chat_id].append({
-                    "text": message_text,
-                    "queued_at": received_at,
-                    "attempts": 0,
-                })
-        _pending_message_count += incoming
-    return True
-
-
 def chat_worker():
-    global _pending_message_count
     while True:
-        chat_id = _chat_queue.get()
+        item = None
+
         try:
-            with _chat_queue_lock:
-                messages = _chat_messages.get(chat_id)
-                item = messages[0] if messages else None
+            item = db_claim_next_message()
+
+            if item is None:
+                time.sleep(0.25)
+                continue
+
+            completed = process_message(
+                item["chat_id"],
+                item["message_text"],
+                item["queued_at"],
+            )
+
+            if completed:
+                db_finish_message(item["id"])
+            elif item["attempts"] >= MAX_WORKER_RETRIES:
+                logger.error("Message discarded after bounded worker retries")
+                db_discard_message(item["id"])
+            else:
+                db_retry_message(item["id"])
+
+        except Exception as exc:
+            logger.error("Worker failed: type=%s", type(exc).__name__)
 
             if item is not None:
                 try:
-                    completed = process_message(chat_id, item["text"], item["queued_at"])
-                except Exception as exc:
-                    logger.error("Worker processing failed: type=%s", type(exc).__name__)
-                    completed = False
+                    if item["attempts"] >= MAX_WORKER_RETRIES:
+                        db_discard_message(item["id"])
+                    else:
+                        db_retry_message(item["id"])
+                except Exception:
+                    logger.exception("Could not update failed queue item")
 
-                with _chat_queue_lock:
-                    messages = _chat_messages.get(chat_id)
-                    if messages and messages[0] is item:
-                        if completed or item["attempts"] >= MAX_WORKER_RETRIES:
-                            messages.popleft()
-                            _pending_message_count = max(0, _pending_message_count - 1)
-                            if not completed:
-                                logger.error("Message discarded after bounded worker retries")
-                        else:
-                            item["attempts"] += 1
-                            item["queued_at"] = time.perf_counter()
-
-            with _chat_queue_lock:
-                messages = _chat_messages.get(chat_id)
-                if messages:
-                    _chat_queue.put_nowait(chat_id)
-                else:
-                    _chat_messages.pop(chat_id, None)
-        except Exception as exc:
-            logger.error("Chat worker failed: type=%s", type(exc).__name__)
-            with _chat_queue_lock:
-                messages = _chat_messages.get(chat_id)
-                if messages:
-                    try:
-                        _chat_queue.put_nowait(chat_id)
-                    except queue.Full:
-                        logger.critical("Worker queue unexpectedly full")
-                else:
-                    _chat_messages.pop(chat_id, None)
-        finally:
-            _chat_queue.task_done()
+            time.sleep(1)
 
 
 def start_chat_workers():
     if _worker_threads:
         return
+
     for index in range(MAX_PARALLEL_CHATS):
         worker = threading.Thread(
             target=chat_worker,
@@ -779,44 +1094,54 @@ def start_chat_workers():
         )
         worker.start()
         _worker_threads.append(worker)
-    logger.info("Started %s chat workers", MAX_PARALLEL_CHATS)
+
+    logger.info("Started %s persistent queue workers", MAX_PARALLEL_CHATS)
 
 
 # =========================================================
 # Update batch handling and polling
 # =========================================================
-def process_update_batch(updates):
-    grouped = OrderedDict()
+def prepare_update_batch(updates):
+    prepared = []
     last_update_id = None
+
+    # شناسایی مدیر پیش از آغاز تراکنش صف انجام می‌شود.
     for update in updates:
         update_id = get_update_id(update)
+
         if update_id is not None:
-            last_update_id = update_id
+            last_update_id = (
+                update_id if last_update_id is None
+                else max(last_update_id, update_id)
+            )
+
         extracted = extract_message(update)
         if extracted is None:
             continue
+
         chat_id, text = extracted
-        grouped.setdefault(chat_id, []).append(text)
-    if not enqueue_chat_messages(grouped):
-        return None
-    return last_update_id
+        prepared.append((update_id, chat_id, text))
 
-
-_polling_lock = threading.Lock()
-_polling_started = False
+    return prepared, last_update_id
 
 
 def polling_loop():
-    offset = None
+    offset = db_get_offset()
     backoff = POLL_ERROR_BACKOFF_START
-    logger.info("Soroush polling started")
+
+    logger.info("Soroush polling started; saved offset=%s", offset)
 
     while not _polling_stop.is_set():
         try:
             payload = {"offset": offset} if offset is not None else {}
             started = time.perf_counter()
+
             data = soroush_request("getUpdates", payload)
-            logger.info("TIMING get_updates_ms=%.0f", (time.perf_counter() - started) * 1000)
+
+            logger.info(
+                "TIMING get_updates_ms=%.0f",
+                (time.perf_counter() - started) * 1000,
+            )
 
             if data is None:
                 _polling_stop.wait(backoff)
@@ -830,18 +1155,32 @@ def polling_loop():
                 continue
 
             updates = extract_updates(data)
+
             if not updates:
                 backoff = POLL_ERROR_BACKOFF_START
                 _polling_stop.wait(POLL_EMPTY_WAIT)
                 continue
 
-            last_id = process_update_batch(updates)
-            if last_id is not None:
-                if offset is not None and last_id < offset - 1:
-                    logger.warning("Unexpected update ID")
+            prepared, last_id = prepare_update_batch(updates)
+
+            if last_id is None:
+                # اگر updateها شناسه نداشته باشند، offset قابل ذخیره نیست.
+                # پیام‌ها در صف ثبت می‌شوند، اما deduplication شناسه‌ای ممکن نیست.
+                if not db_enqueue_updates(prepared, None):
+                    _polling_stop.wait(POLL_ERROR_BACKOFF_START)
                 else:
-                    offset = last_id + 1
-            backoff = POLL_ERROR_BACKOFF_START
+                    backoff = POLL_ERROR_BACKOFF_START
+                continue
+
+            next_offset = last_id + 1
+
+            if db_enqueue_updates(prepared, next_offset):
+                offset = next_offset
+                backoff = POLL_ERROR_BACKOFF_START
+            else:
+                # offset جلو نمی‌رود؛ batch در درخواست بعدی دوباره دریافت می‌شود.
+                _polling_stop.wait(POLL_ERROR_BACKOFF_START)
+
         except Exception as exc:
             logger.error("Polling iteration failed: type=%s", type(exc).__name__)
             _polling_stop.wait(backoff)
@@ -855,11 +1194,17 @@ def _polling_main():
         logger.error("Polling thread stopped unexpectedly: type=%s", type(exc).__name__)
 
 
+_polling_lock = threading.Lock()
+_polling_started = False
+
+
 def start_polling():
     global _polling_started, _polling_thread
+
     with _polling_lock:
         if _polling_started and _polling_thread and _polling_thread.is_alive():
             return
+
         _polling_stop.clear()
         _polling_thread = threading.Thread(
             target=_polling_main,
@@ -873,6 +1218,8 @@ def start_polling():
 # =========================================================
 # Startup
 # =========================================================
+init_database()
+load_persistent_runtime_state()
 register_bot_commands()
 start_chat_workers()
 start_polling()

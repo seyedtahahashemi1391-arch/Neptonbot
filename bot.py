@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import random
 import sqlite3
 import logging
 import threading
@@ -20,7 +21,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = "@cf/zai-org/glm-4.7-flash"
-VERSION = "2.3.1"
+VERSION = "2.4.0"
 ADMIN_USERNAME = "t91m62"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -29,7 +30,6 @@ CLOUDFLARE_URL = (
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
 
-# برای ماندگاری دیتابیس در Render، این متغیر را روی مسیر Persistent Disk تنظیم کن.
 DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3")
 
 AI_TIMEOUT = (15, 150)
@@ -44,7 +44,16 @@ MAX_QUEUED_MESSAGES = 1000
 POLL_EMPTY_WAIT = 0.8
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
-MAX_WORKER_RETRIES = 2
+
+# تعداد تلاش‌های مجدد پس از تلاش اولیه
+MAX_WORKER_RETRIES = 5
+RETRY_BACKOFF_START = 2
+RETRY_BACKOFF_MAX = 120
+WORKER_IDLE_WAIT = 0.25
+
+# نگهداری شناسه‌های پردازش‌شده برای جلوگیری از پردازش دوباره
+PROCESSED_UPDATE_RETENTION_DAYS = 14
+PROCESSED_UPDATE_CLEANUP_INTERVAL = 6 * 60 * 60
 
 FEEDBACK_COMMAND = "/feedback"
 FEEDBACK_CANCEL_COMMAND = "/cancel"
@@ -81,7 +90,8 @@ _missing = [
         ("BOT_TOKEN", BOT_TOKEN),
         ("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID),
         ("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN),
-    ) if not value
+    )
+    if not value
 ]
 if _missing:
     raise RuntimeError("Missing environment variables: " + ", ".join(_missing))
@@ -95,6 +105,7 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
+
 logger.info("NeptonBot version: %s", VERSION)
 logger.info("AI provider: Cloudflare Workers AI")
 logger.info("Model: %s", MODEL)
@@ -135,7 +146,7 @@ _db_init_lock = threading.Lock()
 
 @contextmanager
 def db_connect():
-    """اتصال SQLite را در همهٔ حالت‌ها، حتی هنگام خطا، می‌بندد."""
+    """اتصال SQLite را در همهٔ حالت‌ها می‌بندد."""
     connection = sqlite3.connect(
         DB_PATH,
         timeout=30,
@@ -157,6 +168,15 @@ def db_connect():
         connection.close()
 
 
+def _table_columns(db, table_name):
+    return {
+        row["name"]
+        for row in db.execute(
+            f"PRAGMA table_info({table_name})"
+        ).fetchall()
+    }
+
+
 def init_database():
     with _db_init_lock:
         parent = os.path.dirname(os.path.abspath(DB_PATH))
@@ -174,13 +194,30 @@ def init_database():
                     message_text TEXT NOT NULL,
                     queued_at REAL NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'pending'
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    retry_at REAL NOT NULL DEFAULT 0,
+                    last_error TEXT
                 )
             """)
 
+            # مهاجرت خودکار از دیتابیس نسخه‌های قبلی
+            columns = _table_columns(db, "message_queue")
+
+            if "retry_at" not in columns:
+                db.execute("""
+                    ALTER TABLE message_queue
+                    ADD COLUMN retry_at REAL NOT NULL DEFAULT 0
+                """)
+
+            if "last_error" not in columns:
+                db.execute("""
+                    ALTER TABLE message_queue
+                    ADD COLUMN last_error TEXT
+                """)
+
             db.execute("""
-                CREATE INDEX IF NOT EXISTS idx_queue_status_id
-                ON message_queue(status, id)
+                CREATE INDEX IF NOT EXISTS idx_queue_status_retry_id
+                ON message_queue(status, retry_at, id)
             """)
 
             db.execute("""
@@ -208,10 +245,10 @@ def init_database():
                 )
             """)
 
-            # پیام‌هایی که هنگام خاموش‌شدن در وضعیت پردازش بوده‌اند، بازیابی می‌شوند.
+            # پیام‌های نیمه‌پردازش‌شده پس از راه‌اندازی دوباره بازیابی می‌شوند.
             db.execute("""
                 UPDATE message_queue
-                SET status = 'pending'
+                SET status = 'pending', retry_at = 0
                 WHERE status = 'processing'
             """)
 
@@ -287,7 +324,7 @@ def db_queue_count():
 
 
 def db_enqueue_updates(prepared_updates, next_offset):
-    """پیام‌ها، شناسه‌های پردازش‌شده و offset را در یک تراکنش ذخیره می‌کند."""
+    """ذخیرهٔ پیام‌ها، شناسه‌ها و offset در یک تراکنش."""
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
@@ -323,8 +360,9 @@ def db_enqueue_updates(prepared_updates, next_offset):
         for update_id, chat_id, text in unique_updates:
             db.execute("""
                 INSERT INTO message_queue
-                    (update_id, chat_id, message_text, queued_at, attempts, status)
-                VALUES (?, ?, ?, ?, 0, 'pending')
+                    (update_id, chat_id, message_text, queued_at,
+                     attempts, status, retry_at)
+                VALUES (?, ?, ?, ?, 0, 'pending', 0)
             """, (update_id, str(chat_id), text, now))
 
             if update_id is not None:
@@ -345,14 +383,19 @@ def db_enqueue_updates(prepared_updates, next_offset):
 
 
 def db_claim_next_message():
-    """ترتیب پیام‌های هر چت را حفظ می‌کند و چت‌های مختلف را موازی اجرا می‌کند."""
+    """
+    پیام بعدی آماده را به‌صورت اتمی claim می‌کند.
+    پیام‌های یک چت به ترتیب می‌مانند؛ چت‌های مختلف موازی‌اند.
+    """
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
+        now = time.time()
         row = db.execute("""
             SELECT q.*
             FROM message_queue AS q
             WHERE q.status = 'pending'
+              AND q.retry_at <= ?
               AND NOT EXISTS (
                   SELECT 1
                   FROM message_queue AS earlier
@@ -361,7 +404,7 @@ def db_claim_next_message():
               )
             ORDER BY q.id
             LIMIT 1
-        """).fetchone()
+        """, (now,)).fetchone()
 
         if row is None:
             db.commit()
@@ -385,21 +428,67 @@ def db_finish_message(message_id):
         )
 
 
-def db_retry_message(message_id):
+def retry_delay(attempts):
+    """تأخیر افزایشی همراه با jitter برای جلوگیری از هجوم هم‌زمان."""
+    exponent = max(0, int(attempts))
+    base_delay = min(
+        RETRY_BACKOFF_START * (2 ** exponent),
+        RETRY_BACKOFF_MAX,
+    )
+    jitter = random.uniform(0, min(base_delay * 0.25, 5))
+    return base_delay + jitter
+
+
+def db_retry_message(message_id, attempts, error_text=None):
+    delay = retry_delay(attempts)
+    retry_at = time.time() + delay
+
     with db_connect() as db:
         db.execute("""
             UPDATE message_queue
-            SET status = 'pending', attempts = attempts + 1, queued_at = ?
+            SET status = 'pending',
+                attempts = attempts + 1,
+                queued_at = ?,
+                retry_at = ?,
+                last_error = ?
             WHERE id = ?
-        """, (time.time(), message_id))
+        """, (time.time(), retry_at, error_text, message_id))
+
+    logger.warning(
+        "Queue item scheduled for retry: id=%s delay=%.1fs",
+        message_id,
+        delay,
+    )
 
 
-def db_discard_message(message_id):
+def db_discard_message(message_id, reason=None):
     with db_connect() as db:
         db.execute(
             "DELETE FROM message_queue WHERE id = ?",
             (message_id,),
         )
+
+    logger.error(
+        "Queue item discarded: id=%s reason=%s",
+        message_id,
+        reason or "retry limit reached",
+    )
+
+
+def db_cleanup_processed_updates():
+    cutoff = time.time() - (
+        PROCESSED_UPDATE_RETENTION_DAYS * 24 * 60 * 60
+    )
+
+    with db_connect() as db:
+        cursor = db.execute(
+            "DELETE FROM processed_updates WHERE processed_at < ?",
+            (cutoff,),
+        )
+
+    deleted = cursor.rowcount
+    if deleted:
+        logger.info("Cleaned up %s old processed update records", deleted)
 
 
 # =========================================================
@@ -463,6 +552,7 @@ def reset_history(chat_id):
 
 def set_admin_chat_id(chat_id):
     global admin_chat_id
+
     if chat_id is None:
         return False
 
@@ -502,7 +592,7 @@ def health():
         "polling": "running" if polling_running else "stopped",
         "version": VERSION,
         "queued_messages": db_queue_count(),
-        "workers": len(_worker_threads),
+        "workers": sum(worker.is_alive() for worker in _worker_threads),
         "admin_registered": get_admin_chat_id() is not None,
     }), 200 if polling_running else 503
 
@@ -536,7 +626,9 @@ def cloudflare_post_with_retry(session, payload):
             requests.exceptions.ConnectionError,
         ):
             if attempt == 0:
-                logger.warning("Temporary Cloudflare network failure; retrying once")
+                logger.warning(
+                    "Temporary Cloudflare network failure; retrying once"
+                )
                 continue
             raise
 
@@ -578,11 +670,13 @@ def call_ai(chat_id, user_text):
                     "Cloudflare HTTP error: status=%s",
                     response.status_code,
                 )
+
                 if response.status_code == 429:
                     raise UserVisibleError(
                         "تعداد درخواست‌ها به سرویس هوش مصنوعی زیاد شده است. "
                         "کمی بعد دوباره تلاش کن."
                     )
+
                 raise UserVisibleError(
                     "سرویس هوش مصنوعی در حال حاضر پاسخ‌گوی درخواست نیست."
                 )
@@ -630,6 +724,7 @@ def call_ai(chat_id, user_text):
         raise UserVisibleError("ساختار پیام خروجی مدل نامعتبر است.")
 
     content = message.get("content")
+
     if isinstance(content, str):
         answer = content.strip()
     elif isinstance(content, list):
@@ -814,10 +909,16 @@ def extract_message(update):
         or message.get("body")
         or message.get("message_text")
     )
+
     chat = message.get("chat")
     sender = message.get("from")
 
-    chat_id = chat.get("id") if isinstance(chat, dict) else message.get("chat_id")
+    chat_id = (
+        chat.get("id")
+        if isinstance(chat, dict)
+        else message.get("chat_id")
+    )
+
     if chat_id is None and isinstance(sender, dict):
         chat_id = sender.get("id")
 
@@ -1013,6 +1114,7 @@ def process_message(chat_id, text, queued_at):
 
     if is_creator_question(text):
         send_ok = send_message(chat_id, CREATOR_ANSWER)
+
         if send_ok:
             save_turn(chat_id, text, CREATOR_ANSWER)
 
@@ -1078,7 +1180,7 @@ def chat_worker():
             item = db_claim_next_message()
 
             if item is None:
-                time.sleep(0.25)
+                time.sleep(WORKER_IDLE_WAIT)
                 continue
 
             completed = process_message(
@@ -1089,21 +1191,44 @@ def chat_worker():
 
             if completed:
                 db_finish_message(item["id"])
-            elif item["attempts"] >= MAX_WORKER_RETRIES:
-                logger.error("Message discarded after bounded worker retries")
-                db_discard_message(item["id"])
+                continue
+
+            attempts = int(item["attempts"])
+
+            if attempts >= MAX_WORKER_RETRIES:
+                db_discard_message(
+                    item["id"],
+                    reason="send failed after retry limit",
+                )
             else:
-                db_retry_message(item["id"])
+                db_retry_message(
+                    item["id"],
+                    attempts=attempts,
+                    error_text="message processing or delivery failed",
+                )
 
         except Exception as exc:
-            logger.error("Worker failed: type=%s", type(exc).__name__)
+            logger.error(
+                "Worker failed: type=%s",
+                type(exc).__name__,
+            )
 
             if item is not None:
                 try:
-                    if item["attempts"] >= MAX_WORKER_RETRIES:
-                        db_discard_message(item["id"])
+                    attempts = int(item.get("attempts", 0))
+
+                    if attempts >= MAX_WORKER_RETRIES:
+                        db_discard_message(
+                            item["id"],
+                            reason=type(exc).__name__,
+                        )
                     else:
-                        db_retry_message(item["id"])
+                        db_retry_message(
+                            item["id"],
+                            attempts=attempts,
+                            error_text=type(exc).__name__,
+                        )
+
                 except Exception:
                     logger.exception("Could not update failed queue item")
 
@@ -1133,7 +1258,6 @@ def prepare_update_batch(updates):
     prepared = []
     last_update_id = None
 
-    # شناسایی مدیر پیش از آغاز تراکنش ذخیرهٔ صف انجام می‌شود.
     for update in updates:
         update_id = get_update_id(update)
 
@@ -1154,11 +1278,22 @@ def prepare_update_batch(updates):
 def polling_loop():
     offset = db_get_offset()
     backoff = POLL_ERROR_BACKOFF_START
+    last_cleanup = time.monotonic()
 
     logger.info("Soroush polling started; saved offset=%s", offset)
 
     while not _polling_stop.is_set():
         try:
+            if (
+                time.monotonic() - last_cleanup
+                >= PROCESSED_UPDATE_CLEANUP_INTERVAL
+            ):
+                try:
+                    db_cleanup_processed_updates()
+                except Exception:
+                    logger.exception("Processed update cleanup failed")
+                last_cleanup = time.monotonic()
+
             payload = {"offset": offset} if offset is not None else {}
             started = time.perf_counter()
             data = soroush_request("getUpdates", payload)
@@ -1175,6 +1310,7 @@ def polling_loop():
                 continue
 
             updates = extract_updates(data)
+
             if not updates:
                 backoff = POLL_ERROR_BACKOFF_START
                 _polling_stop.wait(POLL_EMPTY_WAIT)
@@ -1183,7 +1319,7 @@ def polling_loop():
             prepared, last_id = prepare_update_batch(updates)
 
             if last_id is None:
-                # بدون شناسهٔ update امکان deduplication و ذخیرهٔ offset وجود ندارد.
+                # بدون شناسهٔ update، offset را جلو نمی‌بریم.
                 if not db_enqueue_updates(prepared, None):
                     _polling_stop.wait(POLL_ERROR_BACKOFF_START)
                 elif not prepared:
@@ -1198,7 +1334,7 @@ def polling_loop():
                 offset = next_offset
                 backoff = POLL_ERROR_BACKOFF_START
             else:
-                # offset جلو نمی‌رود تا batch در درخواست بعدی دوباره دریافت شود.
+                # در صورت پر بودن صف، offset جلو نمی‌رود.
                 _polling_stop.wait(POLL_ERROR_BACKOFF_START)
 
         except Exception as exc:

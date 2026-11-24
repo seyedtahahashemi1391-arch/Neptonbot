@@ -1,4 +1,5 @@
-name: Soroush Bot Diagnostic
+
+name: Soroush Group Permission Test
 
 on:
   workflow_dispatch:
@@ -10,7 +11,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - name: Check bot token
+      - name: Test group permission
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
         run: |
@@ -21,31 +22,43 @@ jobs:
           import urllib.error
 
           token = os.environ.get("BOT_TOKEN")
-
           if not token:
-              print("ERROR: BOT_TOKEN secret is missing")
-              raise SystemExit(1)
+              raise SystemExit("BOT_TOKEN is missing")
 
-          url = f"https://api.splus.ir/bot{token}/getMe"
-          request = urllib.request.Request(
-              url,
-              headers={"User-Agent": "NeptonBot-Diagnostic/1.0"}
-          )
+          base = f"https://api.splus.ir/bot{token}/"
 
-          try:
-              with urllib.request.urlopen(request, timeout=20) as response:
-                  data = json.loads(response.read().decode("utf-8"))
+          def call(method, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              req = urllib.request.Request(
+                  base + method,
+                  data=data,
+                  headers={"Content-Type": "application/json"}
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      return json.loads(r.read().decode())
+              except urllib.error.HTTPError as e:
+                  try:
+                      return json.loads(e.read().decode())
+                  except Exception:
+                      return {"ok": False, "error_code": e.code}
 
-              print("HTTP:", response.status)
-              print("API response:")
-              print(json.dumps(data, ensure_ascii=False, indent=2))
+          print("1. Requesting group permission...")
+          result = call("setMySettings", {
+              "can_join_groups": True
+          })
+          print("SETTINGS RESULT:", json.dumps(
+              result, ensure_ascii=False
+          ))
 
-          except urllib.error.HTTPError as e:
-              print("HTTP ERROR:", e.code)
-              print("Response:", e.read().decode("utf-8", errors="replace"))
-              raise SystemExit(1)
-
-          except Exception as e:
-              print("CONNECTION ERROR:", type(e).__name__, str(e))
-              raise SystemExit(1)
+          print("2. Checking actual bot settings...")
+          me = call("getMe")
+          if me.get("ok"):
+              bot = me.get("result", {})
+              print("BOT:", bot.get("username"))
+              print("CAN_JOIN_GROUPS:", bot.get("can_join_groups"))
+          else:
+              print("GETME ERROR:", json.dumps(
+                  me, ensure_ascii=False
+              ))
           PY

@@ -28,8 +28,26 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
+ADMIN_USER_ID = os.getenv("NEPTON_ADMIN_USER_ID", "").strip()
+
+# Management controls are deliberately private-chat only. No admin keyboard or
+# management command is sent to a group. The group is selected from the admin DM.
+BTN_PANEL = "🛠 پنل مدیریت"
+BTN_STATUS = "📊 وضعیت سرویس و گروه"
+BTN_SELECT_GROUP = "👥 انتخاب گروه"
+BTN_PAUSE_AI = "⏸ توقف هوش مصنوعی"
+BTN_ENABLE_AI = "▶️ فعال‌سازی هوش مصنوعی"
+BTN_MODE_REPLY = "🎯 فقط پاسخ به ریپلای ربات"
+BTN_MODE_ALL = "💬 پاسخ به همه پیام‌ها"
+BTN_RESET_GROUP = "🧹 پاک‌کردن حافظه گروه"
+BTN_MUTE_MEMBER = "🔇 سکوت عضو"
+BTN_KICK_MEMBER = "🚪 اخراج عضو"
+BTN_CONFIRM_RESET = "✅ تأیید پاک‌کردن حافظه"
+BTN_CANCEL = "↩️ انصراف"
+BTN_CONFIRM_KICK = "⚠️ تأیید عملیات"
+BTN_CLOSE_PANEL = "❌ بستن پنل"
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 CLOUDFLARE_URL = (
@@ -72,8 +90,8 @@ FEEDBACK_TRIGGER_TEXT = "ارسال نظر"
 
 START_MESSAGE = (
     "سلام! من نپتون بات هستم😊👋\n"
-    "جهت ارسال نظرات پیشنهادات و انتقادات بر روی دکمه\n"
-    "آبی کلیک و سپس بر روی ارسال نظر کلیک کنید."
+    "برای ارسال نظر، پیشنهاد یا انتقاد دستور /feedback را بفرست. "
+    "در گفت‌وگوی خصوصی می‌توانی از دکمهٔ «ارسال نظر» هم استفاده کنی."
 )
 
 CREATOR_ANSWER = (
@@ -211,6 +229,12 @@ def init_database():
                     update_id INTEGER,
                     chat_id TEXT NOT NULL,
                     message_text TEXT NOT NULL,
+                    sender_id TEXT,
+                    sender_username TEXT,
+                    chat_type TEXT,
+                    chat_title TEXT,
+                    reply_to_bot INTEGER NOT NULL DEFAULT 0,
+                    is_private INTEGER NOT NULL DEFAULT 0,
                     queued_at REAL NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
@@ -239,6 +263,12 @@ def init_database():
                 ("history_assistant", "TEXT"),
                 ("clear_history", "INTEGER NOT NULL DEFAULT 0"),
                 ("feedback_action", "TEXT"),
+                ("sender_id", "TEXT"),
+                ("sender_username", "TEXT"),
+                ("chat_type", "TEXT"),
+                ("chat_title", "TEXT"),
+                ("reply_to_bot", "INTEGER NOT NULL DEFAULT 0"),
+                ("is_private", "INTEGER NOT NULL DEFAULT 0"),
             )
             for column_name, definition in migrations:
                 _add_column_if_missing(
@@ -275,6 +305,36 @@ def init_database():
             """)
 
             db.execute("""
+                CREATE TABLE IF NOT EXISTS known_chats (
+                    chat_id TEXT PRIMARY KEY,
+                    chat_type TEXT NOT NULL,
+                    title TEXT,
+                    username TEXT,
+                    last_seen REAL NOT NULL
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS known_members (
+                    chat_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username TEXT,
+                    display_name TEXT,
+                    last_seen REAL NOT NULL,
+                    PRIMARY KEY(chat_id, user_id)
+                )
+            """)
+
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS group_settings (
+                    chat_id TEXT PRIMARY KEY,
+                    ai_enabled INTEGER NOT NULL DEFAULT 1,
+                    response_mode TEXT NOT NULL DEFAULT 'all',
+                    updated_at REAL NOT NULL
+                )
+            """)
+
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS conversation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id TEXT NOT NULL,
@@ -303,7 +363,7 @@ def init_database():
                 )
             """)
 
-            db.execute("PRAGMA user_version = 5")
+            db.execute("PRAGMA user_version = 6")
 
     logger.info("SQLite initialized at %s", str(Path(DB_PATH).resolve()))
 
@@ -356,6 +416,57 @@ def db_feedback_is_pending(chat_id):
 
 
 
+def db_list_known_groups():
+    with db_connect() as db:
+        rows = db.execute("""
+            SELECT chat_id, chat_type, title, username, last_seen
+            FROM known_chats
+            WHERE chat_type NOT IN ('private', 'personal', 'user', 'channel')
+            ORDER BY last_seen DESC
+            LIMIT 100
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def db_get_known_group(chat_id):
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT chat_id, chat_type, title, username, last_seen FROM known_chats WHERE chat_id = ?",
+            (str(chat_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def db_get_group_settings(chat_id):
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT ai_enabled, response_mode FROM group_settings WHERE chat_id = ?",
+            (str(chat_id),),
+        ).fetchone()
+    if row is None:
+        return {"ai_enabled": True, "response_mode": "all"}
+    mode = row["response_mode"] if row["response_mode"] in {"all", "reply"} else "all"
+    return {"ai_enabled": bool(row["ai_enabled"]), "response_mode": mode}
+
+
+def db_set_group_settings(chat_id, ai_enabled=None, response_mode=None):
+    current = db_get_group_settings(chat_id)
+    enabled = current["ai_enabled"] if ai_enabled is None else bool(ai_enabled)
+    mode = current["response_mode"] if response_mode is None else str(response_mode)
+    if mode not in {"all", "reply"}:
+        raise ValueError("Invalid group response mode")
+    with db_connect() as db:
+        db.execute("""
+            INSERT INTO group_settings(chat_id, ai_enabled, response_mode, updated_at)
+            VALUES(?, ?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                ai_enabled = excluded.ai_enabled,
+                response_mode = excluded.response_mode,
+                updated_at = excluded.updated_at
+        """, (str(chat_id), 1 if enabled else 0, mode, time.time()))
+    return {"ai_enabled": enabled, "response_mode": mode}
+
+
 def db_recover_interrupted_jobs():
     """Recover claimed rows only after this process owns the singleton runtime lock."""
     with db_connect() as db:
@@ -395,7 +506,7 @@ def db_queue_stats():
 
 
 def db_enqueue_updates(prepared_updates, next_offset):
-    """Persist updates and polling offset atomically, with deduplication."""
+    """Persist updates and sender metadata atomically, with deduplication."""
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
 
@@ -406,7 +517,34 @@ def db_enqueue_updates(prepared_updates, next_offset):
         unique_updates = []
         seen_in_batch = set()
 
-        for update_id, chat_id, text in prepared_updates:
+        for item in prepared_updates:
+            if isinstance(item, dict):
+                update_id = item.get("update_id")
+                chat_id = item.get("chat_id")
+                message_text = item.get("message_text", "")
+                sender_id = item.get("sender_id")
+                sender_username = item.get("sender_username")
+                chat_type = item.get("chat_type") or "group"
+                chat_title = item.get("chat_title")
+                reply_to_bot = bool(item.get("reply_to_bot", False))
+                is_private = bool(item.get("is_private", False))
+            else:
+                values = tuple(item)
+                if len(values) >= 9:
+                    (update_id, chat_id, message_text, sender_id, sender_username,
+                     chat_type, chat_title, reply_to_bot, is_private) = values[:9]
+                elif len(values) >= 3:
+                    update_id, chat_id, message_text = values[:3]
+                    sender_id = sender_username = chat_title = None
+                    chat_type = "group"
+                    reply_to_bot = False
+                    is_private = False
+                else:
+                    logger.warning("Ignoring malformed prepared update")
+                    continue
+
+            if chat_id is None or not isinstance(message_text, str):
+                continue
             if update_id is not None:
                 if update_id in seen_in_batch:
                     continue
@@ -417,7 +555,13 @@ def db_enqueue_updates(prepared_updates, next_offset):
                 ).fetchone()
                 if exists:
                     continue
-            unique_updates.append((update_id, str(chat_id), text))
+
+            unique_updates.append((
+                update_id, str(chat_id), message_text,
+                str(sender_id) if sender_id is not None else None,
+                sender_username, str(chat_type or ("private" if is_private else "group")),
+                chat_title, 1 if reply_to_bot else 0, 1 if is_private else 0,
+            ))
 
         if current_count + len(unique_updates) > MAX_QUEUED_MESSAGES:
             db.rollback()
@@ -425,13 +569,42 @@ def db_enqueue_updates(prepared_updates, next_offset):
             return False
 
         now = time.time()
-        for update_id, chat_id, message_text in unique_updates:
+        for (update_id, chat_id, message_text, sender_id, sender_username,
+             chat_type, chat_title, reply_to_bot, is_private) in unique_updates:
             db.execute("""
                 INSERT INTO message_queue
-                    (update_id, chat_id, message_text, queued_at,
+                    (update_id, chat_id, message_text, sender_id, sender_username,
+                     chat_type, chat_title, reply_to_bot, is_private, queued_at,
                      attempts, status, retry_at)
-                VALUES (?, ?, ?, ?, 0, 'pending', 0)
-            """, (update_id, chat_id, message_text, now))
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 0)
+            """, (
+                update_id, chat_id, message_text, sender_id, sender_username,
+                chat_type, chat_title, reply_to_bot, is_private, now,
+            ))
+
+            if not is_private:
+                db.execute("""
+                    INSERT INTO known_chats(chat_id, chat_type, title, username, last_seen)
+                    VALUES(?, ?, ?, NULL, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        chat_type = excluded.chat_type,
+                        title = COALESCE(excluded.title, known_chats.title),
+                        last_seen = excluded.last_seen
+                """, (chat_id, chat_type, chat_title, now))
+                if sender_id is not None:
+                    db.execute("""
+                        INSERT INTO known_members(chat_id, user_id, username, display_name, last_seen)
+                        VALUES(?, ?, ?, ?, ?)
+                        ON CONFLICT(chat_id, user_id) DO UPDATE SET
+                            username = COALESCE(excluded.username, known_members.username),
+                            display_name = COALESCE(excluded.display_name, known_members.display_name),
+                            last_seen = excluded.last_seen
+                    """, (chat_id, str(sender_id), sender_username, None, now))
+                db.execute("""
+                    INSERT OR IGNORE INTO group_settings
+                        (chat_id, ai_enabled, response_mode, updated_at)
+                    VALUES(?, 1, 'all', ?)
+                """, (chat_id, now))
 
             if update_id is not None:
                 db.execute("""
@@ -774,6 +947,42 @@ def set_admin_chat_id(chat_id):
     return True
 
 
+def get_expected_admin_user_id():
+    """Return the configured or first-verified immutable admin user ID."""
+    return ADMIN_USER_ID or db_get_state("admin_user_id")
+
+
+def register_admin_identity(sender_id, username, chat_id, is_private):
+    """Bootstrap admin identity from the configured username in a private chat.
+
+    Once an ID is stored, username changes do not transfer administrator access.
+    """
+    if not is_private or sender_id is None or chat_id is None:
+        return False
+
+    sender_id = str(sender_id)
+    expected_id = get_expected_admin_user_id()
+    if expected_id is None:
+        normalized = (username or "").strip().lstrip("@").lower()
+        if not ADMIN_USERNAME or normalized != ADMIN_USERNAME:
+            return False
+        db_set_state("admin_user_id", sender_id)
+        expected_id = sender_id
+
+    if str(expected_id) != sender_id:
+        return False
+
+    set_admin_chat_id(chat_id)
+    return True
+
+
+def is_admin_user(sender_id, is_private):
+    if not is_private or sender_id is None:
+        return False
+    expected_id = get_expected_admin_user_id()
+    return expected_id is not None and str(sender_id) == str(expected_id)
+
+
 def get_admin_chat_id():
     with admin_lock:
         return admin_chat_id
@@ -1109,16 +1318,19 @@ def split_message(text, limit=MAX_MESSAGE_LENGTH):
     return chunks
 
 
-def send_one_message(chat_id, text):
+def send_one_message(chat_id, text, reply_markup=None, reply_to_message_id=None):
     if not isinstance(text, str) or not text:
         return False
 
+    payload = {"chat_id": str(chat_id), "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    if reply_to_message_id is not None:
+        payload["reply_to_message_id"] = reply_to_message_id
+
     started = time.perf_counter()
     try:
-        result = soroush_request(
-            "sendMessage",
-            {"chat_id": str(chat_id), "text": text},
-        )
+        result = soroush_request("sendMessage", payload)
         success = api_result_is_success(result)
         if not success:
             logger.error("Soroush sendMessage failed or was rejected")
@@ -1201,53 +1413,72 @@ def extract_message(update):
         or message.get("body")
         or message.get("message_text")
     )
-
     chat = message.get("chat")
-    sender = message.get("from") or message.get("sender") or message.get("user")
-
-    chat_id = (
-        chat.get("id")
-        if isinstance(chat, dict)
-        else message.get("chat_id")
+    sender = (
+        message.get("from") or message.get("from_user")
+        or message.get("sender") or message.get("user")
     )
-    if chat_id is None and isinstance(sender, dict):
-        chat_id = sender.get("id")
+
+    chat_id = chat.get("id") if isinstance(chat, dict) else message.get("chat_id")
+    sender_id = sender.get("id") if isinstance(sender, dict) else None
+    if sender_id is None:
+        sender_id = message.get("sender_id") or message.get("from_id")
+    if chat_id is None and sender_id is not None:
+        chat_id = sender_id
 
     if chat_id is None or message_text is None:
         return None
-
     if not isinstance(message_text, str):
         message_text = str(message_text)
 
     username = sender.get("username") if isinstance(sender, dict) else None
     normalized_username = (
-        username.strip().lstrip("@").lower()
-        if isinstance(username, str)
-        else None
+        username.strip().lstrip("@").lower() if isinstance(username, str) else None
     )
 
-    # Never register a group chat as the administrator's private destination.
-    chat_type = None
-    if isinstance(chat, dict):
-        chat_type = chat.get("type")
+    chat_type = chat.get("type") if isinstance(chat, dict) else None
     if chat_type is None:
         chat_type = message.get("chat_type")
+    chat_type = str(chat_type).strip().lower() if chat_type is not None else None
 
-    sender_id = sender.get("id") if isinstance(sender, dict) else None
-    is_private = (
-        str(chat_type).lower() in {"private", "personal", "user"}
-        if chat_type is not None
-        else (sender_id is not None and str(sender_id) == str(chat_id))
+    if chat_type is not None:
+        is_private = chat_type in {"private", "personal", "user"}
+    else:
+        is_private = sender_id is not None and str(sender_id) == str(chat_id)
+        chat_type = "private" if is_private else "group"
+
+    # In private dialogs the peer ID is the best available fallback if the
+    # update format omits the sender object. Group messages never use this fallback.
+    if is_private and sender_id is None:
+        sender_id = chat_id
+
+    chat_title = None
+    if isinstance(chat, dict):
+        chat_title = chat.get("title") or chat.get("name")
+    if not chat_title and not is_private and isinstance(message, dict):
+        chat_title = message.get("chat_title") or message.get("group_title")
+
+    reply_to_bot = False
+    reply_obj = message.get("reply_to_message") or message.get("reply_to")
+    if isinstance(reply_obj, dict):
+        reply_sender = (
+            reply_obj.get("from") or reply_obj.get("from_user")
+            or reply_obj.get("sender") or reply_obj.get("user")
+        )
+        if isinstance(reply_sender, dict):
+            reply_to_bot = bool(
+                reply_sender.get("is_bot")
+                or reply_sender.get("isBot")
+                or str(reply_sender.get("type", "")).lower() == "bot"
+            )
+
+    register_admin_identity(sender_id, normalized_username, chat_id, is_private)
+
+    return (
+        str(chat_id), message_text,
+        str(sender_id) if sender_id is not None else None,
+        normalized_username, chat_type, chat_title, bool(reply_to_bot), bool(is_private),
     )
-
-    if (
-        normalized_username == ADMIN_USERNAME
-        and is_private
-        and chat_id is not None
-    ):
-        set_admin_chat_id(chat_id)
-
-    return str(chat_id), message_text
 
 
 def get_update_id(update):
@@ -1278,309 +1509,4 @@ def is_creator_question(user_text):
     normalized = normalize_text(user_text)
     exact_phrases = {
         "سازندت کیه",
-        "سازنده ات کیه",
-        "سازنده تو کیه",
-        "سازنده تو چیه",
-        "چه کسی ساختت",
-        "کی ساختت",
-        "تو رو کی ساخته",
-        "تورو کی ساخته",
-        "توسعه دهنده ات کیه",
-        "توسعه دهنده تو کیه",
-        "چه کسی تو را ساخته",
-        "چه کسی تو رو ساخته",
-        "تو توسط چه کسی ساخته شدی",
-        "سازنده تو چه کسیه",
-    }
-    if normalized in exact_phrases:
-        return True
-
-    patterns = (
-        r"^(سازنده|سازند) .{0,18} کیه$",
-        r"^(چه کسی|کی) .{0,10} (ساختت|ساخته|ساخته است)$",
-        r"^(توسعه دهنده) .{0,18} کیه$",
-    )
-    return any(re.search(pattern, normalized) for pattern in patterns)
-
-
-def get_fixed_conversation_answer(user_text):
-    normalized = normalize_text(user_text)
-    answers = {
-        "سلام": "سلام! چطور می‌تونم کمکت کنم؟",
-        "درود": "درود! چطور می‌تونم کمکت کنم؟",
-        "سلام خوبی": "سلام! خوبم، ممنون. تو چطوری؟",
-        "سلام چطوری": "سلام! خوبم، ممنون. تو چطوری؟",
-        "چطوری": "خوبم، ممنون! تو چطوری؟",
-        "خوبی": "خوبم، ممنون! تو چطوری؟",
-        "چه خبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
-        "چخبر": "سلام! خبر خاصی نیست؛ چه کمکی از دستم برمیاد؟",
-        "صبح بخیر": "صبح بخیر! روز خوبی داشته باشی. چطور می‌تونم کمکت کنم؟",
-        "شب بخیر": "شب بخیر! شبت خوش. کاری از دستم برمیاد؟",
-    }
-    return answers.get(normalized)
-
-
-# =========================================================
-# Durable feedback workflow
-# =========================================================
-def process_feedback_message(chat_id, text):
-    stripped = text.strip()
-    normalized = normalize_text(stripped)
-    first_token = stripped.split(maxsplit=1)[0] if stripped else ""
-    command = first_token.split("@", 1)[0].lower() if first_token else ""
-    is_pending = db_feedback_is_pending(chat_id)
-
-    if command == FEEDBACK_CANCEL_COMMAND:
-        if is_pending:
-            return {
-                "responses": [(chat_id, "ارسال نظر لغو شد.")],
-                "feedback_action": "clear",
-            }
-        return {
-            "responses": [(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")],
-            "feedback_action": None,
-        }
-
-    if command == FEEDBACK_COMMAND or normalized == normalize_text(FEEDBACK_TRIGGER_TEXT):
-        return {
-            "responses": [(
-                chat_id,
-                "متن نظر یا پیشنهادت را در پیام بعدی بفرست.\n"
-                "برای لغو، /cancel را ارسال کن.",
-            )],
-            "feedback_action": "set",
-        }
-
-    if not is_pending:
-        return None
-
-    if not stripped:
-        return {
-            "responses": [(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")],
-            "feedback_action": None,
-        }
-
-    if len(stripped) > MAX_MESSAGE_LENGTH:
-        return {
-            "responses": [(
-                chat_id,
-                f"متن نظر طولانی است. لطفاً آن را به حداکثر {MAX_MESSAGE_LENGTH} نویسه کاهش بده.",
-            )],
-            "feedback_action": None,
-        }
-
-    admin_id = get_admin_chat_id()
-    if admin_id is None:
-        return {
-            "responses": [(
-                chat_id,
-                "صندوق پیشنهادها هنوز برای مدیر فعال نشده است. "
-                "مدیر باید ابتدا در گفت‌وگوی خصوصی به ربات پیام بدهد؛ سپس دوباره تلاش کن.",
-            )],
-            "feedback_action": None,
-        }
-
-    admin_message = (
-        "نظر یا پیشنهاد جدید\n"
-        f"شناسهٔ فرستنده: {chat_id}\n\n"
-        f"{stripped}"
-    )
-
-    # Admin delivery is planned before user confirmation. The durable response
-    # cursor prevents resending the admin message after it is acknowledged.
-    return {
-        "responses": [
-            (admin_id, admin_message),
-            (chat_id, "نظر تو برای مدیر ارسال شد. ممنون از بازخوردت."),
-        ],
-        "feedback_action": "clear",
-    }
-
-
-# =========================================================
-# Build a durable response plan (no network sends in this stage)
-# =========================================================
-def build_response_plan(chat_id, text):
-    started = time.perf_counter()
-    text = text.strip()
-    if not text:
-        return {
-            "responses": [],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-
-    if command == "/start":
-        return {
-            "responses": [(chat_id, START_MESSAGE)],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    if command == "/reset":
-        return {
-            "responses": [(chat_id, "حافظه گفت‌وگوی شما پاک شد.")],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": True,
-            "feedback_action": None,
-        }
-
-    feedback_result = process_feedback_message(chat_id, text)
-    if feedback_result is not None:
-        return {
-            "responses": feedback_result["responses"],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": feedback_result.get("feedback_action"),
-        }
-
-    if is_creator_question(text):
-        return {
-            "responses": [(chat_id, CREATOR_ANSWER)],
-            "history_user": text,
-            "history_assistant": CREATOR_ANSWER,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    fixed_answer = get_fixed_conversation_answer(text)
-    if fixed_answer is not None:
-        return {
-            "responses": [(chat_id, fixed_answer)],
-            "history_user": text,
-            "history_assistant": fixed_answer,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    bounded_text = text[:MAX_MESSAGE_LENGTH]
-    history_user = None
-    history_assistant = None
-    try:
-        answer = call_ai(chat_id, bounded_text)
-        history_user = bounded_text
-        history_assistant = answer
-    except UserVisibleError as exc:
-        # Do not pollute future context with transient service-error messages.
-        answer = str(exc)
-    except Exception:
-        logger.exception("Unexpected message processing failure")
-        answer = "در پردازش پیام مشکلی پیش آمد. لطفاً کمی بعد دوباره تلاش کن."
-
-    logger.info(
-        "TIMING build_response_plan_ms=%.0f",
-        (time.perf_counter() - started) * 1000,
-    )
-    return {
-        "responses": [(chat_id, answer)],
-        "history_user": history_user,
-        "history_assistant": history_assistant,
-        "clear_history": False,
-        "feedback_action": None,
-    }
-
-
-def flatten_response_plan(responses):
-    """Convert multi-recipient responses into durable, individually acknowledged chunks."""
-    plan = []
-    for chat_id, text in responses:
-        for chunk in split_message(text):
-            plan.append({"chat_id": str(chat_id), "text": chunk})
-    return plan
-
-
-# =========================================================
-# Queue workers
-# =========================================================
-def _process_claimed_item(item, worker_id):
-    message_id = item["id"]
-
-    response_plan_raw = item.get("response_plan")
-    if not response_plan_raw:
-        result = build_response_plan(item["chat_id"], item["message_text"])
-        plan = flatten_response_plan(result["responses"])
-
-        saved = db_prepare_response_plan(
-            message_id,
-            worker_id,
-            plan,
-            history_user=result.get("history_user"),
-            history_assistant=result.get("history_assistant"),
-            clear_history=result.get("clear_history", False),
-            feedback_action=result.get("feedback_action"),
-        )
-        if not saved:
-            raise RuntimeError("Could not persist response plan or worker lease was lost")
-        response_index = 0
-    else:
-        try:
-            plan = json.loads(response_plan_raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Stored response plan is invalid JSON") from exc
-        response_index = int(item.get("response_index") or 0)
-
-    if not isinstance(plan, list):
-        raise RuntimeError("Stored response plan is not a list")
-
-    while response_index < len(plan):
-        if not db_renew_lease(message_id, worker_id):
-            raise RuntimeError("Worker lease was lost before message delivery")
-
-        part = plan[response_index]
-        if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
-            raise RuntimeError("Stored response plan contains an invalid item")
-
-        success = send_one_message(part["chat_id"], part["text"])
-        if not success:
-            raise RetryableDeliveryError("Soroush sendMessage failed or had an ambiguous result")
-
-        if not db_advance_response(message_id, worker_id, response_index):
-            raise RuntimeError("Could not advance durable response cursor")
-        response_index += 1
-
-    if not db_finish_message(message_id, worker_id):
-        raise RuntimeError("Could not finalize queue item")
-
-
-def chat_worker():
-    worker_id = _worker_id()
-    logger.info("Worker started id=%s", worker_id)
-
-    while not _polling_stop.is_set():
-        item = None
-        try:
-            item = db_claim_next_message(worker_id)
-            if item is None:
-                _polling_stop.wait(WORKER_IDLE_WAIT)
-                continue
-
-            _process_claimed_item(item, worker_id)
-
-        except Exception as exc:
-            logger.error(
-                "Worker processing failed type=%s",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            if item is not None:
-                try:
-                    attempts = int(item.get("attempts", 0))
-                    if attempts >= MAX_WORKER_RETRIES:
-                        db_dead_letter(item["id"], worker_id, str(exc))
-                    else:
-                        db_retry_message(
-                            item["id"],
-                            worker_id,
-                            attempts,
-                            str(exc),
-                        )
-                except Exception:
-          
+        "سا

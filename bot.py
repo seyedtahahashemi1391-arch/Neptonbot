@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, Response, request, Response
 
 try:
     import fcntl
@@ -28,7 +28,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -38,6 +38,25 @@ CLOUDFLARE_URL = (
 )
 
 DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3").strip()
+
+# Optional Redis cache: improves repeated history reads; SQLite remains authoritative.
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_HISTORY_TTL = 300
+_redis_client = None
+if REDIS_URL:
+    try:
+        import redis
+        _redis_client = redis.Redis.from_url(
+            REDIS_URL, decode_responses=True,
+            socket_connect_timeout=2, socket_timeout=2,
+            health_check_interval=30,
+        )
+        _redis_client.ping()
+        logger_redis_ready = True
+    except Exception:
+        _redis_client = None
+        logger_redis_ready = False
+
 
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
@@ -109,7 +128,6 @@ if _missing:
 if not DB_PATH:
     raise RuntimeError("NEPTON_DB_PATH cannot be empty")
 
-
 # =========================================================
 # Logging
 # =========================================================
@@ -118,6 +136,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s pid=%(process)d %(threadName)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
+if REDIS_URL:
+    logger.info("Redis history cache: %s", "enabled" if _redis_client is not None else "unavailable; using SQLite")
 
 logger.info("Starting NeptonBot version=%s model=%s", VERSION, MODEL)
 
@@ -228,7 +248,8 @@ def init_database():
             """)
 
             # Safe, additive migrations from the 2.4.x database.
-            migrations = (
+
+migrations = (
                 ("retry_at", "REAL NOT NULL DEFAULT 0"),
                 ("last_error", "TEXT"),
                 ("response_plan", "TEXT"),
@@ -354,8 +375,6 @@ def db_feedback_is_pending(chat_id):
         ).fetchone()
     return row is not None
 
-
-
 def db_recover_interrupted_jobs():
     """Recover claimed rows only after this process owns the singleton runtime lock."""
     with db_connect() as db:
@@ -467,7 +486,7 @@ def db_claim_next_message(worker_id):
             WHERE status = 'processing' AND lease_until < ?
         """, (now,))
 
-        row = db.execute("""
+row = db.execute("""
             SELECT q.*
             FROM message_queue AS q
             WHERE q.status = 'pending'
@@ -593,7 +612,8 @@ def db_finish_message(message_id, worker_id):
             now = time.time()
             db.executemany("""
                 INSERT INTO conversation_history(chat_id, role, content, created_at)
-                VALUES(?, ?, ?, ?)
+
+VALUES(?, ?, ?, ?)
             """, (
                 (chat_id, "user", row["history_user"], now),
                 (chat_id, "assistant", row["history_assistant"], now),
@@ -635,6 +655,14 @@ def db_finish_message(message_id, worker_id):
 
         db.execute("DELETE FROM message_queue WHERE id = ?", (message_id,))
         db.commit()
+        if _redis_client is not None and (
+            row["clear_history"] or
+            (row["history_user"] is not None and row["history_assistant"] is not None)
+        ):
+            try:
+                _redis_client.delete(f"nepton:history:{chat_id}")
+            except Exception:
+                pass
         return True
 
 
@@ -698,7 +726,6 @@ def db_dead_letter(message_id, worker_id, reason):
         logger.error("Queue item moved to dead-letter storage id=%s", message_id)
         return True
 
-
 def retry_delay(attempts):
     exponent = min(max(0, int(attempts)), 10)
     base = min(RETRY_BACKOFF_START * (2 ** exponent), RETRY_BACKOFF_MAX)
@@ -730,7 +757,7 @@ def db_cleanup_old_records():
 # =========================================================
 # Runtime state and Flask app
 # =========================================================
-app = Flask(__name__)
+app = Flask(name)
 
 admin_lock = threading.Lock()
 admin_chat_id = None
@@ -813,6 +840,77 @@ def acquire_runtime_lock():
     return True
 
 
+# Admin dashboard: Basic Auth, disabled until a password is configured.
+DASHBOARD_USER = os.getenv("NEPTON_DASHBOARD_USER", "admin").strip()
+DASHBOARD_PASSWORD = os.getenv("NEPTON_DASHBOARD_PASSWORD", "").strip()
+
+
+def _dashboard_auth_ok():
+    import hmac
+    auth = request.authorization
+    return bool(DASHBOARD_PASSWORD and auth and auth.username == DASHBOARD_USER
+                and hmac.compare_digest(auth.password or "", DASHBOARD_PASSWORD))
+
+
+def _dashboard_401():
+    return Response("Authentication required", 401,
+                    {"WWW-Authenticate": 'Basic realm="Nepton Admin"'})
+
+
+@app.get("/admin")
+def admin_dashboard():
+    if not _dashboard_auth_ok():
+        return _dashboard_401()
+    page = """<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8">
+
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nepton Admin</title><style>
+body{font:16px system-ui;background:#f4f6fa;color:#172033;margin:0;padding:20px}
+main{max-width:900px;margin:auto}input,button{font:inherit;padding:10px;border:1px solid #ccd2df;border-radius:8px}
+input{width:min(100%,360px)}button{cursor:pointer;background:#172033;color:white}
+.chat{background:white;border:1px solid #e1e5ed;border-radius:12px;margin:10px 0;padding:14px}
+.msg{padding:10px;margin:8px 0;border-radius:8px;background:#f2f4f8;white-space:pre-wrap;overflow-wrap:anywhere}
+.user{border-right:4px solid #4676d7}.assistant{border-right:4px solid #2c9a71}
+</style><main><h2>پنل گفتگوهای نپتون</h2>
+<p>جست‌وجو بر اساس شناسهٔ کاربر یا متن پیام</p>
+<input id="q" placeholder="عبارت جست‌وجو"><button onclick="loadChats()">جست‌وجو</button>
+<div id="list">در حال بارگذاری…</div><script>
+async function loadChats(){let box=document.getElementById('list');box.textContent='در حال بارگذاری…';
+try{let r=await fetch('/admin/api/chats?q='+encodeURIComponent(document.getElementById('q').value));
+if(!r.ok)throw Error('دریافت پیام‌ها ناموفق بود');let data=await r.json();box.replaceChildren();
+if(!data.chats.length){box.textContent='گفتگویی پیدا نشد';return}
+for(let c of data.chats){let card=document.createElement('section');card.className='chat';
+let h=document.createElement('h3');h.textContent='شناسهٔ کاربر: '+c.chat_id;card.append(h);
+for(let m of c.messages){let d=document.createElement('div');d.className='msg '+m.role;
+let b=document.createElement('b');b.textContent=m.role==='user'?'کاربر: ':'نپتون: ';
+let t=document.createElement('span');t.textContent=m.content;d.append(b,t);card.append(d)}box.append(card)}
+}catch(e){box.textContent=e.message}}loadChats();</script></main></html>"""
+    return Response(page, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/admin/api/chats")
+def admin_dashboard_chats():
+    if not _dashboard_auth_ok():
+        return _dashboard_401()
+    q = request.args.get("q", "").strip()[:100]
+    with db_connect() as db:
+        if q:
+            rows = db.execute("""SELECT chat_id, role, content, created_at
+                FROM conversation_history WHERE chat_id LIKE ? OR content LIKE ?
+                ORDER BY id DESC LIMIT 300""", (f"%{q}%", f"%{q}%")).fetchall()
+        else:
+            rows = db.execute("""SELECT chat_id, role, content, created_at
+                FROM conversation_history ORDER BY id DESC LIMIT 300""").fetchall()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["chat_id"], []).append({
+            "role": row["role"], "content": row["content"],
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"]))
+        })
+    return jsonify({"chats": [{"chat_id": cid, "messages": list(reversed(msgs))}
+                              for cid, msgs in grouped.items()]})
+
+
 @app.get("/")
 def home():
     return jsonify({
@@ -848,11 +946,18 @@ def health():
         logger.exception("Health check failed")
         return jsonify({"status": "unhealthy", "version": VERSION}), 503
 
-
 # =========================================================
 # Conversation history
 # =========================================================
 def get_history(chat_id):
+    key = f"nepton:history:{chat_id}"
+    if _redis_client is not None:
+        try:
+            cached = _redis_client.get(key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
     with db_connect() as db:
         rows = db.execute("""
             SELECT role, content
@@ -861,10 +966,16 @@ def get_history(chat_id):
             ORDER BY id DESC
             LIMIT ?
         """, (str(chat_id), MAX_HISTORY_MESSAGES)).fetchall()
-    return [
+    history = [
         {"role": row["role"], "content": row["content"]}
         for row in reversed(rows)
     ]
+    if _redis_client is not None:
+        try:
+            _redis_client.setex(key, REDIS_HISTORY_TTL, json.dumps(history, ensure_ascii=False))
+        except Exception:
+            pass
+    return history
 
 
 def reset_history(chat_id):
@@ -873,6 +984,11 @@ def reset_history(chat_id):
             "DELETE FROM conversation_history WHERE chat_id = ?",
             (str(chat_id),),
         )
+    if _redis_client is not None:
+        try:
+            _redis_client.delete(f"nepton:history:{chat_id}")
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -964,7 +1080,7 @@ def call_ai(chat_id, user_text):
         "stream": False,
     }
 
-    started = time.perf_counter()
+started = time.perf_counter()
     try:
         with cloudflare_post_with_retry(
             get_http_session("cloudflare_session"), payload
@@ -999,7 +1115,7 @@ def call_ai(chat_id, user_text):
             "زمان پاسخ‌گویی هوش مصنوعی بیش از حد طول کشید. دوباره تلاش کن."
         ) from exc
     except requests.exceptions.RequestException as exc:
-        logger.error("Cloudflare network error type=%s", type(exc).__name__)
+        logger.error("Cloudflare network error type=%s", type(exc).name)
         raise UserVisibleError(
             "ارتباط با سرویس هوش مصنوعی برقرار نشد. کمی بعد دوباره تلاش کن."
         ) from exc
@@ -1051,7 +1167,7 @@ def soroush_request(method, payload=None):
         logger.error(
             "Soroush network error method=%s type=%s",
             method,
-            type(exc).__name__,
+            type(exc).name,
         )
         return None
 
@@ -1061,7 +1177,7 @@ def api_result_is_success(result):
         return False
     if isinstance(result, dict) and "ok" in result:
         return result.get("ok") is True
-    # Some Soroush-compatible responses may omit the Telegram-style `ok` key.
+    # Some Soroush-compatible responses may omit the Telegram-style ok key.
     return isinstance(result, (dict, list))
 
 
@@ -1084,7 +1200,6 @@ def register_bot_commands():
 
     logger.info("Bot commands registered")
     return True
-
 
 def split_message(text, limit=MAX_MESSAGE_LENGTH):
     """Split long text near line boundaries without splitting Unicode characters."""
@@ -1233,7 +1348,7 @@ def extract_message(update):
     if chat_type is None:
         chat_type = message.get("chat_type")
 
-    sender_id = sender.get("id") if isinstance(sender, dict) else None
+sender_id = sender.get("id") if isinstance(sender, dict) else None
     is_private = (
         str(chat_type).lower() in {"private", "personal", "user"}
         if chat_type is not None
@@ -1246,17 +1361,6 @@ def extract_message(update):
         and chat_id is not None
     ):
         set_admin_chat_id(chat_id)
-
-    # Group-control commands are marked only when sent by the configured owner.
-    # The marker is internal queue metadata; ordinary messages are unchanged.
-    is_group = str(chat_type or "").lower() in {"group", "supergroup", "chat"}
-    if (
-        is_group
-        and normalized_username == ADMIN_USERNAME
-        and message_text.strip().split(maxsplit=1)[0].split("@", 1)[0].lower()
-            in {"/grouphelp", "/groupstatus", "/rules", "/setrules", "/delrules", "/announce"}
-    ):
-        message_text = "__NEPTON_OWNER_GROUP_COMMAND__" + message_text
 
     return str(chat_id), message_text
 
@@ -1365,7 +1469,7 @@ def process_feedback_message(chat_id, text):
     if not is_pending:
         return None
 
-    if not stripped:
+if not stripped:
         return {
             "responses": [(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")],
             "feedback_action": None,
@@ -1423,51 +1527,6 @@ def build_response_plan(chat_id, text):
             "feedback_action": None,
         }
 
-    if text.startswith("__NEPTON_OWNER_GROUP_COMMAND__"):
-        owner_command = text[len("__NEPTON_OWNER_GROUP_COMMAND__"):].strip()
-        command = owner_command.split(maxsplit=1)[0].split("@", 1)[0].lower()
-        args = owner_command.split(maxsplit=1)
-        argument = args[1].strip() if len(args) > 1 else ""
-        if command == "/grouphelp":
-            answer = (
-                "فرمان‌های آزمایشی گروه (فقط سازنده):\\n"
-                "/grouphelp — راهنما\\n"
-                "/groupstatus — وضعیت ربات\\n"
-                "/rules — نمایش قوانین گروه\\n"
-                "/setrules متن قوانین — ثبت/جایگزینی قوانین\\n"
-                "/delrules — پاک‌کردن قوانین\\n"
-                "/announce متن — ارسال اطلاعیه در همین گروه\\n"
-                "فرمان‌های حذف پیام، سکوت یا اخراج در این نسخه فعال نیستند."
-            )
-        elif command == "/groupstatus":
-            answer = "ربات پاسخ‌گوست؛ فرمان‌های مدیریتی فقط برای سازنده فعال‌اند. وضعیت اتصال/API سروش‌پلاس از این فرمان قابل تأیید نیست."
-        elif command == "/rules":
-            with db_connect() as db:
-                row = db.execute("SELECT value FROM bot_state WHERE key = ?", (f"group_rules:{chat_id}",)).fetchone()
-            answer = f"قوانین گروه:\\n{row['value']}" if row and row["value"] else "برای این گروه هنوز قانونی ثبت نشده است."
-        elif command == "/setrules":
-            if not argument:
-                answer = "روش استفاده: /setrules متن قوانین"
-            else:
-                with db_connect() as db:
-                    db.execute("INSERT INTO bot_state(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"group_rules:{chat_id}", argument[:3500]))
-                answer = "قوانین این گروه ذخیره شد."
-        elif command == "/delrules":
-            with db_connect() as db:
-                db.execute("DELETE FROM bot_state WHERE key = ?", (f"group_rules:{chat_id}",))
-            answer = "قوانین این گروه پاک شد."
-        elif command == "/announce":
-            answer = f"اطلاعیه مدیر:\\n{argument}" if argument else "روش استفاده: /announce متن اطلاعیه"
-        else:
-            answer = "فرمان مدیریتی ناشناخته است."
-        return {
-            "responses": [(chat_id, answer)],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
 
     if command == "/start":
@@ -1489,76 +1548,4 @@ def build_response_plan(chat_id, text):
         }
 
     feedback_result = process_feedback_message(chat_id, text)
-    if feedback_result is not None:
-        return {
-            "responses": feedback_result["responses"],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": feedback_result.get("feedback_action"),
-        }
-
-    if is_creator_question(text):
-        return {
-            "responses": [(chat_id, CREATOR_ANSWER)],
-            "history_user": text,
-            "history_assistant": CREATOR_ANSWER,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    fixed_answer = get_fixed_conversation_answer(text)
-    if fixed_answer is not None:
-        return {
-            "responses": [(chat_id, fixed_answer)],
-            "history_user": text,
-            "history_assistant": fixed_answer,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    bounded_text = text[:MAX_MESSAGE_LENGTH]
-    history_user = None
-    history_assistant = None
-    try:
-        answer = call_ai(chat_id, bounded_text)
-        history_user = bounded_text
-        history_assistant = answer
-    except UserVisibleError as exc:
-        # Do not pollute future context with transient service-error messages.
-        answer = str(exc)
-    except Exception:
-        logger.exception("Unexpected message processing failure")
-        answer = "در پردازش پیام مشکلی پیش آمد. لطفاً کمی بعد دوباره تلاش کن."
-
-    logger.info(
-        "TIMING build_response_plan_ms=%.0f",
-        (time.perf_counter() - started) * 1000,
-    )
-    return {
-        "responses": [(chat_id, answer)],
-        "history_user": history_user,
-        "history_assistant": history_assistant,
-        "clear_history": False,
-        "feedback_action": None,
-    }
-
-
-def flatten_response_plan(responses):
-    """Convert multi-recipient responses into durable, individually acknowledged chunks."""
-    plan = []
-    for chat_id, text in responses:
-        for chunk in split_message(text):
-            plan.append({"chat_id": str(chat_id), "text": chunk})
-    return plan
-
-
-# =========================================================
-# Queue workers
-# =========================================================
-def _process_claimed_item(item, worker_id):
-    message_id = item["id"]
-
-    response_plan_raw = item.get("response_plan")
-    if not response_plan_raw:
-        result = build
+    if f

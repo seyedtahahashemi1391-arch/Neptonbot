@@ -12,7 +12,7 @@ from pathlib import Path
 
 import requests
 from requests.adapters import HTTPAdapter
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, Response, request, Response
 
 try:
     import fcntl
@@ -28,7 +28,7 @@ CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -38,6 +38,25 @@ CLOUDFLARE_URL = (
 )
 
 DB_PATH = os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3").strip()
+
+# Optional Redis cache: improves repeated history reads; SQLite remains authoritative.
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_HISTORY_TTL = 300
+_redis_client = None
+if REDIS_URL:
+    try:
+        import redis
+        _redis_client = redis.Redis.from_url(
+            REDIS_URL, decode_responses=True,
+            socket_connect_timeout=2, socket_timeout=2,
+            health_check_interval=30,
+        )
+        _redis_client.ping()
+        logger_redis_ready = True
+    except Exception:
+        _redis_client = None
+        logger_redis_ready = False
+
 
 AI_TIMEOUT = (15, 150)
 SOROUSH_TIMEOUT = (10, 35)
@@ -118,6 +137,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s pid=%(process)d %(threadName)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
+if REDIS_URL:
+    logger.info("Redis history cache: %s", "enabled" if _redis_client is not None else "unavailable; using SQLite")
 
 logger.info("Starting NeptonBot version=%s model=%s", VERSION, MODEL)
 
@@ -635,6 +656,14 @@ def db_finish_message(message_id, worker_id):
 
         db.execute("DELETE FROM message_queue WHERE id = ?", (message_id,))
         db.commit()
+        if _redis_client is not None and (
+            row["clear_history"] or
+            (row["history_user"] is not None and row["history_assistant"] is not None)
+        ):
+            try:
+                _redis_client.delete(f"nepton:history:{chat_id}")
+            except Exception:
+                pass
         return True
 
 
@@ -813,6 +842,76 @@ def acquire_runtime_lock():
     return True
 
 
+# Admin dashboard: Basic Auth, disabled until a password is configured.
+DASHBOARD_USER = os.getenv("NEPTON_DASHBOARD_USER", "admin").strip()
+DASHBOARD_PASSWORD = os.getenv("NEPTON_DASHBOARD_PASSWORD", "").strip()
+
+
+def _dashboard_auth_ok():
+    import hmac
+    auth = request.authorization
+    return bool(DASHBOARD_PASSWORD and auth and auth.username == DASHBOARD_USER
+                and hmac.compare_digest(auth.password or "", DASHBOARD_PASSWORD))
+
+
+def _dashboard_401():
+    return Response("Authentication required", 401,
+                    {"WWW-Authenticate": 'Basic realm="Nepton Admin"'})
+
+
+@app.get("/admin")
+def admin_dashboard():
+    if not _dashboard_auth_ok():
+        return _dashboard_401()
+    page = """<!doctype html><html lang="fa" dir="rtl"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nepton Admin</title><style>
+body{font:16px system-ui;background:#f4f6fa;color:#172033;margin:0;padding:20px}
+main{max-width:900px;margin:auto}input,button{font:inherit;padding:10px;border:1px solid #ccd2df;border-radius:8px}
+input{width:min(100%,360px)}button{cursor:pointer;background:#172033;color:white}
+.chat{background:white;border:1px solid #e1e5ed;border-radius:12px;margin:10px 0;padding:14px}
+.msg{padding:10px;margin:8px 0;border-radius:8px;background:#f2f4f8;white-space:pre-wrap;overflow-wrap:anywhere}
+.user{border-right:4px solid #4676d7}.assistant{border-right:4px solid #2c9a71}
+</style><main><h2>پنل گفتگوهای نپتون</h2>
+<p>جست‌وجو بر اساس شناسهٔ کاربر یا متن پیام</p>
+<input id="q" placeholder="عبارت جست‌وجو"><button onclick="loadChats()">جست‌وجو</button>
+<div id="list">در حال بارگذاری…</div><script>
+async function loadChats(){let box=document.getElementById('list');box.textContent='در حال بارگذاری…';
+try{let r=await fetch('/admin/api/chats?q='+encodeURIComponent(document.getElementById('q').value));
+if(!r.ok)throw Error('دریافت پیام‌ها ناموفق بود');let data=await r.json();box.replaceChildren();
+if(!data.chats.length){box.textContent='گفتگویی پیدا نشد';return}
+for(let c of data.chats){let card=document.createElement('section');card.className='chat';
+let h=document.createElement('h3');h.textContent='شناسهٔ کاربر: '+c.chat_id;card.append(h);
+for(let m of c.messages){let d=document.createElement('div');d.className='msg '+m.role;
+let b=document.createElement('b');b.textContent=m.role==='user'?'کاربر: ':'نپتون: ';
+let t=document.createElement('span');t.textContent=m.content;d.append(b,t);card.append(d)}box.append(card)}
+}catch(e){box.textContent=e.message}}loadChats();</script></main></html>"""
+    return Response(page, mimetype="text/html; charset=utf-8")
+
+
+@app.get("/admin/api/chats")
+def admin_dashboard_chats():
+    if not _dashboard_auth_ok():
+        return _dashboard_401()
+    q = request.args.get("q", "").strip()[:100]
+    with db_connect() as db:
+        if q:
+            rows = db.execute("""SELECT chat_id, role, content, created_at
+                FROM conversation_history WHERE chat_id LIKE ? OR content LIKE ?
+                ORDER BY id DESC LIMIT 300""", (f"%{q}%", f"%{q}%")).fetchall()
+        else:
+            rows = db.execute("""SELECT chat_id, role, content, created_at
+                FROM conversation_history ORDER BY id DESC LIMIT 300""").fetchall()
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["chat_id"], []).append({
+            "role": row["role"], "content": row["content"],
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"]))
+        })
+    return jsonify({"chats": [{"chat_id": cid, "messages": list(reversed(msgs))}
+                              for cid, msgs in grouped.items()]})
+
+
 @app.get("/")
 def home():
     return jsonify({
@@ -853,6 +952,14 @@ def health():
 # Conversation history
 # =========================================================
 def get_history(chat_id):
+    key = f"nepton:history:{chat_id}"
+    if _redis_client is not None:
+        try:
+            cached = _redis_client.get(key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
     with db_connect() as db:
         rows = db.execute("""
             SELECT role, content
@@ -861,10 +968,16 @@ def get_history(chat_id):
             ORDER BY id DESC
             LIMIT ?
         """, (str(chat_id), MAX_HISTORY_MESSAGES)).fetchall()
-    return [
+    history = [
         {"role": row["role"], "content": row["content"]}
         for row in reversed(rows)
     ]
+    if _redis_client is not None:
+        try:
+            _redis_client.setex(key, REDIS_HISTORY_TTL, json.dumps(history, ensure_ascii=False))
+        except Exception:
+            pass
+    return history
 
 
 def reset_history(chat_id):
@@ -873,6 +986,11 @@ def reset_history(chat_id):
             "DELETE FROM conversation_history WHERE chat_id = ?",
             (str(chat_id),),
         )
+    if _redis_client is not None:
+        try:
+            _redis_client.delete(f"nepton:history:{chat_id}")
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -1433,345 +1551,4 @@ def build_response_plan(chat_id, text):
         }
 
     feedback_result = process_feedback_message(chat_id, text)
-    if feedback_result is not None:
-        return {
-            "responses": feedback_result["responses"],
-            "history_user": None,
-            "history_assistant": None,
-            "clear_history": False,
-            "feedback_action": feedback_result.get("feedback_action"),
-        }
-
-    if is_creator_question(text):
-        return {
-            "responses": [(chat_id, CREATOR_ANSWER)],
-            "history_user": text,
-            "history_assistant": CREATOR_ANSWER,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    fixed_answer = get_fixed_conversation_answer(text)
-    if fixed_answer is not None:
-        return {
-            "responses": [(chat_id, fixed_answer)],
-            "history_user": text,
-            "history_assistant": fixed_answer,
-            "clear_history": False,
-            "feedback_action": None,
-        }
-
-    bounded_text = text[:MAX_MESSAGE_LENGTH]
-    history_user = None
-    history_assistant = None
-    try:
-        answer = call_ai(chat_id, bounded_text)
-        history_user = bounded_text
-        history_assistant = answer
-    except UserVisibleError as exc:
-        # Do not pollute future context with transient service-error messages.
-        answer = str(exc)
-    except Exception:
-        logger.exception("Unexpected message processing failure")
-        answer = "در پردازش پیام مشکلی پیش آمد. لطفاً کمی بعد دوباره تلاش کن."
-
-    logger.info(
-        "TIMING build_response_plan_ms=%.0f",
-        (time.perf_counter() - started) * 1000,
-    )
-    return {
-        "responses": [(chat_id, answer)],
-        "history_user": history_user,
-        "history_assistant": history_assistant,
-        "clear_history": False,
-        "feedback_action": None,
-    }
-
-
-def flatten_response_plan(responses):
-    """Convert multi-recipient responses into durable, individually acknowledged chunks."""
-    plan = []
-    for chat_id, text in responses:
-        for chunk in split_message(text):
-            plan.append({"chat_id": str(chat_id), "text": chunk})
-    return plan
-
-
-# =========================================================
-# Queue workers
-# =========================================================
-def _process_claimed_item(item, worker_id):
-    message_id = item["id"]
-
-    response_plan_raw = item.get("response_plan")
-    if not response_plan_raw:
-        result = build_response_plan(item["chat_id"], item["message_text"])
-        plan = flatten_response_plan(result["responses"])
-
-        saved = db_prepare_response_plan(
-            message_id,
-            worker_id,
-            plan,
-            history_user=result.get("history_user"),
-            history_assistant=result.get("history_assistant"),
-            clear_history=result.get("clear_history", False),
-            feedback_action=result.get("feedback_action"),
-        )
-        if not saved:
-            raise RuntimeError("Could not persist response plan or worker lease was lost")
-        response_index = 0
-    else:
-        try:
-            plan = json.loads(response_plan_raw)
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("Stored response plan is invalid JSON") from exc
-        response_index = int(item.get("response_index") or 0)
-
-    if not isinstance(plan, list):
-        raise RuntimeError("Stored response plan is not a list")
-
-    while response_index < len(plan):
-        if not db_renew_lease(message_id, worker_id):
-            raise RuntimeError("Worker lease was lost before message delivery")
-
-        part = plan[response_index]
-        if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
-            raise RuntimeError("Stored response plan contains an invalid item")
-
-        success = send_one_message(part["chat_id"], part["text"])
-        if not success:
-            raise RetryableDeliveryError("Soroush sendMessage failed or had an ambiguous result")
-
-        if not db_advance_response(message_id, worker_id, response_index):
-            raise RuntimeError("Could not advance durable response cursor")
-        response_index += 1
-
-    if not db_finish_message(message_id, worker_id):
-        raise RuntimeError("Could not finalize queue item")
-
-
-def chat_worker():
-    worker_id = _worker_id()
-    logger.info("Worker started id=%s", worker_id)
-
-    while not _polling_stop.is_set():
-        item = None
-        try:
-            item = db_claim_next_message(worker_id)
-            if item is None:
-                _polling_stop.wait(WORKER_IDLE_WAIT)
-                continue
-
-            _process_claimed_item(item, worker_id)
-
-        except Exception as exc:
-            logger.error(
-                "Worker processing failed type=%s",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            if item is not None:
-                try:
-                    attempts = int(item.get("attempts", 0))
-                    if attempts >= MAX_WORKER_RETRIES:
-                        db_dead_letter(item["id"], worker_id, str(exc))
-                    else:
-                        db_retry_message(
-                            item["id"],
-                            worker_id,
-                            attempts,
-                            str(exc),
-                        )
-                except Exception:
-                    logger.exception("Could not update failed queue item")
-            _polling_stop.wait(0.5)
-
-    logger.info("Worker stopped id=%s", worker_id)
-
-
-def _start_or_replace_workers():
-    global _worker_threads
-    with _service_lock:
-        alive = [worker for worker in _worker_threads if worker.is_alive()]
-        _worker_threads = alive
-        missing = max(0, MAX_PARALLEL_CHATS - len(_worker_threads))
-        for index in range(missing):
-            worker = threading.Thread(
-                target=chat_worker,
-                name=f"NeptonWorker-{len(_worker_threads) + 1}",
-                daemon=True,
-            )
-            worker.start()
-            _worker_threads.append(worker)
-        if missing:
-            logger.info("Started %s queue worker(s)", missing)
-
-
-# =========================================================
-# Polling and update batch handling
-# =========================================================
-def prepare_update_batch(updates):
-    prepared = []
-    last_update_id = None
-
-    for update in updates:
-        update_id = get_update_id(update)
-        if update_id is not None:
-            last_update_id = (
-                update_id if last_update_id is None
-                else max(last_update_id, update_id)
-            )
-
-        extracted = extract_message(update)
-        if extracted is not None:
-            chat_id, message_text = extracted
-            prepared.append((update_id, chat_id, message_text))
-
-    return prepared, last_update_id
-
-
-def polling_loop():
-    offset = db_get_offset()
-    backoff = POLL_ERROR_BACKOFF_START
-    idle_wait = POLL_EMPTY_WAIT
-    last_cleanup = time.monotonic()
-
-    logger.info("Soroush polling started saved_offset=%s", offset)
-
-    while not _polling_stop.is_set():
-        try:
-            if time.monotonic() - last_cleanup >= DB_CLEANUP_INTERVAL:
-                try:
-                    db_cleanup_old_records()
-                except Exception:
-                    logger.exception("Database cleanup failed")
-                last_cleanup = time.monotonic()
-
-            payload = {"offset": offset} if offset is not None else {}
-            started = time.perf_counter()
-            data = soroush_request("getUpdates", payload)
-            logger.info(
-                "TIMING get_updates_ms=%.0f",
-                (time.perf_counter() - started) * 1000,
-            )
-
-            if data is None or not has_update_container(data):
-                logger.error("Unexpected or failed Soroush getUpdates response")
-                wait = min(backoff + random.uniform(0, backoff * 0.2), POLL_ERROR_BACKOFF_MAX)
-                _polling_stop.wait(wait)
-                backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
-                continue
-
-            updates = extract_updates(data)
-            if not updates:
-                backoff = POLL_ERROR_BACKOFF_START
-                _polling_stop.wait(idle_wait)
-                idle_wait = min(idle_wait * 1.5, POLL_EMPTY_WAIT_MAX)
-                continue
-
-            idle_wait = POLL_EMPTY_WAIT
-            prepared, last_id = prepare_update_batch(updates)
-
-            if last_id is None:
-                if not db_enqueue_updates(prepared, None):
-                    _polling_stop.wait(POLL_ERROR_BACKOFF_START)
-                elif not prepared:
-                    _polling_stop.wait(idle_wait)
-                    idle_wait = min(idle_wait * 1.5, POLL_EMPTY_WAIT_MAX)
-                else:
-                    backoff = POLL_ERROR_BACKOFF_START
-                continue
-
-            next_offset = last_id + 1
-            if db_enqueue_updates(prepared, next_offset):
-                offset = next_offset
-                backoff = POLL_ERROR_BACKOFF_START
-            else:
-                # Do not move offset while the durable queue is full.
-                _polling_stop.wait(POLL_ERROR_BACKOFF_START)
-
-        except Exception:
-            logger.exception("Polling iteration failed")
-            _polling_stop.wait(backoff)
-            backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
-
-    logger.info("Soroush polling stopped")
-
-
-def _polling_main():
-    try:
-        polling_loop()
-    except Exception:
-        logger.exception("Polling thread stopped unexpectedly")
-
-
-def start_polling():
-    global _polling_thread
-    with _service_lock:
-        if _polling_thread is not None and _polling_thread.is_alive():
-            return
-        _polling_thread = threading.Thread(
-            target=_polling_main,
-            name="SoroushPolling",
-            daemon=True,
-        )
-        _polling_thread.start()
-        logger.info("Polling thread started")
-
-
-def runtime_supervisor():
-    logger.info("Runtime supervisor started")
-    while not _polling_stop.wait(SUPERVISOR_INTERVAL):
-        try:
-            _start_or_replace_workers()
-            start_polling()
-        except Exception:
-            logger.exception("Runtime supervisor iteration failed")
-    logger.info("Runtime supervisor stopped")
-
-
-def start_runtime_services():
-    global _runtime_active, _supervisor_thread
-    if _runtime_active:
-        return
-
-    if not acquire_runtime_lock():
-        return
-
-    # Database initialization and recovery happen only in the lock-owning process.
-    # This prevents secondary WSGI workers from resetting live queue claims.
-    init_database()
-    db_recover_interrupted_jobs()
-    load_persistent_runtime_state()
-    register_bot_commands()
-    _start_or_replace_workers()
-    start_polling()
-
-    _supervisor_thread = threading.Thread(
-        target=runtime_supervisor,
-        name="NeptonSupervisor",
-        daemon=True,
-    )
-    _supervisor_thread.start()
-    _runtime_active = True
-    logger.info("NeptonBot %s runtime services started", VERSION)
-
-
-def shutdown_runtime():
-    _polling_stop.set()
-    logger.info("NeptonBot shutdown requested")
-
-
-atexit.register(shutdown_runtime)
-
-
-# =========================================================
-# Startup
-# =========================================================
-if os.getenv("NEPTON_DISABLE_AUTOSTART", "0").strip().lower() not in {"1", "true", "yes"}:
-    start_runtime_services()
-else:
-    init_database()
-    logger.warning("NEPTON_DISABLE_AUTOSTART is enabled; background services were not started")
-
-logger.info("NeptonBot %s module initialized", VERSION)
+    if f

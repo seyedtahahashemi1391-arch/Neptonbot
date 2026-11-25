@@ -52,7 +52,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.4"
+VERSION = "3.3.5"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"

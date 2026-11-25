@@ -221,6 +221,9 @@ def get_http_session(name):
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+elif DATABASE_URL and "://" not in DATABASE_URL:
+    # Supabase's pooler URI may be copied without its URL scheme.
+    DATABASE_URL = "postgresql://" + DATABASE_URL
 USE_POSTGRES = bool(DATABASE_URL)
 
 _db_init_lock = threading.Lock()

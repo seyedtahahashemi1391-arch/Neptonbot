@@ -216,8 +216,13 @@ def get_http_session(name):
 
 
 # =========================================================
-# SQLite database
+# Database: PostgreSQL on Render; SQLite fallback for local development
 # =========================================================
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+USE_POSTGRES = bool(DATABASE_URL)
+
 _db_init_lock = threading.Lock()
 _queue_wakeup = threading.Event()
 _lease_sweep_lock = threading.Lock()
@@ -225,19 +230,75 @@ _last_lease_sweep = 0.0
 LEASE_SWEEP_INTERVAL = 5.0
 
 
+class PostgresConnection:
+    """Small DB-API compatibility adapter for the existing SQLite-oriented queries."""
+    def __init__(self, connection):
+        self._connection = connection
+
+    @property
+    def in_transaction(self):
+        return self._connection.info.transaction_status != 0
+
+    @staticmethod
+    def _sql(query):
+        query = query.replace("?", "%s")
+        query = re.sub(
+            r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT",
+            "BIGSERIAL PRIMARY KEY",
+            query,
+            flags=re.IGNORECASE,
+        )
+        query = re.sub(r"\bupdate_id\s+INTEGER\b", "update_id BIGINT", query, flags=re.IGNORECASE)
+        query = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", query, flags=re.IGNORECASE)
+        return query
+
+    def execute(self, query, params=()):
+        return self._connection.execute(self._sql(query), params or ())
+
+    def executemany(self, query, params):
+        cursor = self._connection.cursor()
+        cursor.executemany(self._sql(query), params)
+        return cursor
+
+    def commit(self):
+        if self.in_transaction:
+            self._connection.execute("COMMIT")
+
+    def rollback(self):
+        if self.in_transaction:
+            self._connection.execute("ROLLBACK")
+
+    def close(self):
+        self._connection.close()
+
+
 @contextmanager
 def db_connect():
-    connection = sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        isolation_level=None,
-        check_same_thread=True,
-    )
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA synchronous = FULL")
-    connection.execute("PRAGMA temp_store = MEMORY")
+    if USE_POSTGRES:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        raw_connection = psycopg.connect(
+            DATABASE_URL,
+            connect_timeout=10,
+            application_name="NeptonBot",
+            sslmode="require",
+            autocommit=True,
+            row_factory=dict_row,
+        )
+        connection = PostgresConnection(raw_connection)
+    else:
+        connection = sqlite3.connect(
+            DB_PATH,
+            timeout=30,
+            isolation_level=None,
+            check_same_thread=True,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.execute("PRAGMA temp_store = MEMORY")
     try:
         yield connection
     except BaseException:
@@ -251,6 +312,15 @@ def db_connect():
 
 
 def _table_columns(db, table_name):
+    if USE_POSTGRES:
+        return {
+            row["name"]
+            for row in db.execute(
+                "SELECT column_name AS name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = ?",
+                (table_name,),
+            ).fetchall()
+        }
     return {
         row["name"]
         for row in db.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -265,14 +335,16 @@ def _add_column_if_missing(db, table_name, column_name, definition):
 
 
 def init_database():
-    """Create/migrate the durable SQLite schema. Safe to call more than once."""
+    """Create or migrate the configured persistent database; safe to call repeatedly."""
     with _db_init_lock:
-        db_parent = Path(DB_PATH).expanduser().resolve().parent
-        db_parent.mkdir(parents=True, exist_ok=True)
+        if not USE_POSTGRES:
+            db_parent = Path(DB_PATH).expanduser().resolve().parent
+            db_parent.mkdir(parents=True, exist_ok=True)
 
         with db_connect() as db:
-            db.execute("PRAGMA journal_mode = WAL")
-            db.execute("PRAGMA wal_autocheckpoint = 1000")
+            if not USE_POSTGRES:
+                db.execute("PRAGMA journal_mode = WAL")
+                db.execute("PRAGMA wal_autocheckpoint = 1000")
 
             db.execute("""
                 CREATE TABLE IF NOT EXISTS message_queue (
@@ -379,9 +451,13 @@ def init_database():
                     failed_at REAL NOT NULL
                 )
             """)
-            db.execute("PRAGMA user_version = 6")
+            if not USE_POSTGRES:
+                db.execute("PRAGMA user_version = 6")
 
-    logger.info("SQLite initialized at %s", str(Path(DB_PATH).expanduser().resolve()))
+    if USE_POSTGRES:
+        logger.info("PostgreSQL database initialized")
+    else:
+        logger.info("SQLite initialized at %s", str(Path(DB_PATH).expanduser().resolve()))
 
 
 def db_get_state(key, default=None):
@@ -544,8 +620,9 @@ def db_enqueue_updates(prepared_updates, next_offset):
             """, (update_id, chat_id, message_text, now))
             if update_id is not None:
                 db.execute("""
-                    INSERT OR IGNORE INTO processed_updates(update_id, processed_at)
+                    INSERT INTO processed_updates(update_id, processed_at)
                     VALUES(?, ?)
+                    ON CONFLICT(update_id) DO NOTHING
                 """, (update_id, now))
 
         if next_offset is not None:
@@ -601,7 +678,8 @@ def db_claim_next_message(worker_id):
         return None
     with db_connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        row = db.execute(eligible_sql, (now,)).fetchone()
+        claim_sql = eligible_sql + (" FOR UPDATE OF q SKIP LOCKED" if USE_POSTGRES else "")
+        row = db.execute(claim_sql, (now,)).fetchone()
 
         if row is None:
             db.commit()
@@ -685,7 +763,7 @@ def db_finish_message(message_id, worker_id):
         row = db.execute("""
             SELECT * FROM message_queue
             WHERE id = ? AND status = 'processing' AND locked_by = ?
-        """, (message_id, worker_id)).fetchone()
+        """ + (" FOR UPDATE" if USE_POSTGRES else ""), (message_id, worker_id)).fetchone()
         if row is None:
             db.rollback()
             return False
@@ -725,7 +803,7 @@ def db_finish_message(message_id, worker_id):
 
         if row["feedback_action"] == "set":
             db.execute(
-                "INSERT OR IGNORE INTO feedback_pending(chat_id) VALUES(?)",
+                "INSERT INTO feedback_pending(chat_id) VALUES(?) ON CONFLICT(chat_id) DO NOTHING",
                 (chat_id,),
             )
         elif row["feedback_action"] == "clear":
@@ -770,7 +848,7 @@ def db_dead_letter(message_id, worker_id, reason):
         row = db.execute("""
             SELECT * FROM message_queue
             WHERE id = ? AND status = 'processing' AND locked_by = ?
-        """, (message_id, worker_id)).fetchone()
+        """ + (" FOR UPDATE" if USE_POSTGRES else ""), (message_id, worker_id)).fetchone()
         if row is None:
             db.rollback()
             return None
@@ -814,7 +892,8 @@ def db_cleanup_old_records():
                 GROUP BY chat_id ORDER BY MAX(created_at) DESC LIMIT ?
             )
         """, (MAX_CONVERSATIONS,))
-        db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        if not USE_POSTGRES:
+            db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
 
 # =========================================================

@@ -122,7 +122,7 @@ HELP_MESSAGE = (
     "🧹 /reset — پاک‌کردن حافظهٔ گفت‌وگو\n"
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
     "✖ /cancel — لغو ارسال نظر\n"
-    "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\\n"
+    "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
 
@@ -1158,18 +1158,18 @@ def get_live_weather(user_text):
     current = forecast.get("current", {})
     daily = forecast.get("daily", {})
     return (
-        "گزارش هواشناسی بر پایهٔ برآورد مدل Open-Meteo\\n"
-        f"مکان: {loc.get('name', place)}, {loc.get('country', '')}\\n"
-        f"زمان داده: {current.get('time', 'نامشخص')} ({forecast.get('timezone', 'زمان محلی')})\\n"
-        f"دمای هوای برآوردی: {current.get('temperature_2m', 'نامشخص')}°C\\n"
-        f"دمای احساسیِ محاسبه‌شده: {current.get('apparent_temperature', 'نامشخص')}°C\\n"
+        "گزارش هواشناسی بر پایهٔ برآورد مدل Open-Meteo\n"
+        f"مکان: {loc.get('name', place)}, {loc.get('country', '')}\n"
+        f"زمان داده: {current.get('time', 'نامشخص')} ({forecast.get('timezone', 'زمان محلی')})\n"
+        f"دمای هوای برآوردی: {current.get('temperature_2m', 'نامشخص')}°C\n"
+        f"دمای احساسیِ محاسبه‌شده: {current.get('apparent_temperature', 'نامشخص')}°C\n"
         f"رطوبت: {current.get('relative_humidity_2m', 'نامشخص')}٪؛ "
         f"باد: {current.get('wind_speed_10m', 'نامشخص')} km/h؛ "
-        f"بارش فعلی: {current.get('precipitation', 'نامشخص')} mm\\n"
+        f"بارش فعلی: {current.get('precipitation', 'نامشخص')} mm\n"
         f"امروز: کمینه {daily.get('temperature_2m_min', ['نامشخص'])[0]}°C، "
         f"بیشینه {daily.get('temperature_2m_max', ['نامشخص'])[0]}°C، "
-        f"احتمال بیشینه بارش {daily.get('precipitation_probability_max', ['نامشخص'])[0]}٪\\n"
-        "نکته: دمای هوا و دمای احساسی دو شاخص متفاوت‌اند؛ این داده‌ها برآورد مدل‌اند، نه اندازه‌گیری مستقیم دماسنج محلی.\\n"
+        f"احتمال بیشینه بارش {daily.get('precipitation_probability_max', ['نامشخص'])[0]}٪\n"
+        "نکته: دمای هوا و دمای احساسی دو شاخص متفاوت‌اند؛ این داده‌ها برآورد مدل‌اند، نه اندازه‌گیری مستقیم دماسنج محلی.\n"
         "منبع: https://open-meteo.com/"
     )
 

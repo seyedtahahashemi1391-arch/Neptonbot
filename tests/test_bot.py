@@ -1,8 +1,10 @@
+import importlib.util
 import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 _TEST_DIR = tempfile.TemporaryDirectory(prefix="neptonbot-tests-")
@@ -18,6 +20,13 @@ os.environ.update({
 })
 
 import bot
+
+_CONFIG_SPEC = importlib.util.spec_from_file_location(
+    "nepton_gunicorn_config",
+    Path(__file__).resolve().parents[1] / "gunicorn.conf.py",
+)
+GUNICORN_CONFIG = importlib.util.module_from_spec(_CONFIG_SPEC)
+_CONFIG_SPEC.loader.exec_module(GUNICORN_CONFIG)
 
 
 class ParsingTests(unittest.TestCase):
@@ -48,6 +57,29 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(bot.has_update_container({"ok": True, "result": []}))
         self.assertFalse(bot.has_update_container({"ok": False, "result": []}))
         self.assertFalse(bot.has_update_container({"unexpected": "shape"}))
+
+
+
+class GunicornLifecycleTests(unittest.TestCase):
+    def test_runtime_starts_only_after_worker_initialization(self):
+        worker = SimpleNamespace(pid=123)
+        with patch.object(bot, "start_runtime_services", return_value=False) as start, patch.object(
+            bot, "_start_runtime_acquirer"
+        ) as retry:
+            GUNICORN_CONFIG.post_worker_init(worker)
+        start.assert_called_once_with()
+        retry.assert_called_once_with()
+
+    def test_worker_exit_releases_lease_for_that_worker_pid(self):
+        worker = SimpleNamespace(pid=321)
+        GUNICORN_CONFIG.worker_exit(SimpleNamespace(log=SimpleNamespace(exception=lambda *a, **k: None)), worker)
+        # SQLite test mode intentionally has no PostgreSQL lease to release.
+        self.assertFalse(bot.USE_POSTGRES)
+        self.assertFalse(bot.release_runtime_lease_for_process(worker.pid))
+
+    def test_gunicorn_does_not_preload_application(self):
+        self.assertFalse(GUNICORN_CONFIG.preload_app)
+        self.assertEqual(GUNICORN_CONFIG.graceful_timeout, 35)
 
 
 class DatabaseWorkflowTests(unittest.TestCase):

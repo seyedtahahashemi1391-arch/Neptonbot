@@ -1520,16 +1520,29 @@ def get_live_web_results(query):
         params={"q": query[:400], "count": LIVE_INFO_MAX_RESULTS},
         headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_SEARCH_API_KEY},
     )
-    rows = data.get("web", {}).get("results", []) if isinstance(data, dict) else []
-    if not rows:
-        return "جست‌وجوی زنده نتیجه‌ای نداشت؛ این را صریح بگو و اطلاعات فعلی را حدس نزن."
+    web_data = data.get("web") if isinstance(data, dict) else None
+    rows = web_data.get("results") if isinstance(web_data, dict) else None
+    if not isinstance(rows, list):
+        rows = []
     snippets = []
-    for index, row in enumerate(rows[:LIVE_INFO_MAX_RESULTS], 1):
-        title = str(row.get("title", "نتیجه بدون عنوان"))[:250]
-        url = str(row.get("url", ""))[:1000]
-        description = str(row.get("description", ""))[:900]
-        snippets.append(f"{index}. {title}\n{description}\nمنبع: {url}")
-    return "نتایج جست‌وجوی وب زنده؛ اطلاعات را فقط در حد این منابع بیان کن و لینک منبع را در پاسخ بیاور:\n" + "\n\n".join(snippets)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("title") or "نتیجه بدون عنوان")[:250]
+        url = str(row.get("url") or "")[:1000]
+        description = str(row.get("description") or "")[:900]
+        if not url.startswith(("https://", "http://")):
+            continue
+        snippets.append((title, description, url))
+        if len(snippets) >= LIVE_INFO_MAX_RESULTS:
+            break
+    if not snippets:
+        return "جست‌وجوی زنده نتیجهٔ معتبر و قابل‌استفاده‌ای نداشت؛ اطلاعات فعلی را حدس نمی‌زنم."
+    formatted = [
+        f"{index}. {title}\n{description}\nمنبع: {url}"
+        for index, (title, description, url) in enumerate(snippets, 1)
+    ]
+    return "نتایج جست‌وجوی وب زنده؛ اطلاعات را فقط در حد این منابع بیان کن و لینک منبع را در پاسخ بیاور:\n" + "\n\n".join(formatted)
 
 
 _MARKET_MARKERS = (
@@ -1556,6 +1569,8 @@ def get_live_market_prices():
     """Fetch published Iranian market snapshots and show their actual update time."""
     payload = _get_json(MARKET_DATA_URL)
     rows = payload.get("data", []) if isinstance(payload, dict) else []
+    if not isinstance(rows, list):
+        rows = []
     by_symbol = {row.get("symbol"): row for row in rows if isinstance(row, dict)}
     wanted = (
         ("USD_IRR_FREE", "دلار آزاد"),
@@ -1576,7 +1591,9 @@ def get_live_market_prices():
         found += 1
     if not found:
         return "منبع قیمت بازار دادهٔ قابل‌استفاده نداد؛ عددی حدس نمی‌زنم."
-    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    if not isinstance(meta, dict):
+        meta = {}
     published = meta.get("published_at") or "نامشخص"
     lines.append(f"به‌روزرسانی فایل: {published}")
     lines.append("منبع: Iran Market Data؛ داده‌ها با فاصلهٔ انتشار حدود ۳۰ دقیقه‌ای هستند، نه تیک‌به‌تیک.")

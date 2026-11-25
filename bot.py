@@ -105,7 +105,8 @@ START_MESSAGE = (
     "سلام! خوش اومدی 👋\n"
     "من دستیار هوشمند نپتونم؛ سؤال یا درخواستت رو همین‌جا بنویس.\n\n"
     "┌ راهنمای سریع\n"
-    "│ 🌦 دکمهٔ «هواشناسی» را بزن و نام هر شهر ایران را بفرست\n"
+    "│ 🌦 هواشناسی: دکمه را بزن و نام شهر را بفرست\n"
+    "│ اگر دکمه دیده نشد، /weather را بفرست\n"
     "│ 💬 گفت‌وگو: پیام خودت رو بفرست\n"
     "│ 🧹 /reset — پاک‌کردن حافظهٔ گفتگو\n"
     "│ 💡 /feedback — ارسال نظر یا پیشنهاد\n"
@@ -121,6 +122,7 @@ HELP_MESSAGE = (
     "🧹 /reset — پاک‌کردن حافظهٔ گفت‌وگو\n"
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
     "✖ /cancel — لغو ارسال نظر\n"
+    "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
 
@@ -1147,22 +1149,27 @@ def get_live_weather(user_text):
             "latitude": loc["latitude"], "longitude": loc["longitude"],
             "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m",
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+            "temperature_unit": "celsius",
+            "wind_speed_unit": "kmh",
+            "precipitation_unit": "mm",
             "forecast_days": 2, "timezone": "auto",
         },
     )
     current = forecast.get("current", {})
     daily = forecast.get("daily", {})
     return (
-        "اطلاعات زنده هواشناسی از Open-Meteo (زمان محلی مکان):\n"
-        f"مکان: {loc.get('name', place)}, {loc.get('country', '')}\n"
-        f"دمای فعلی: {current.get('temperature_2m', 'نامشخص')}°C؛ "
-        f"دمای احساسی: {current.get('apparent_temperature', 'نامشخص')}°C؛ "
+        "گزارش هواشناسی بر پایهٔ برآورد مدل Open-Meteo\\n"
+        f"مکان: {loc.get('name', place)}, {loc.get('country', '')}\\n"
+        f"زمان داده: {current.get('time', 'نامشخص')} ({forecast.get('timezone', 'زمان محلی')})\\n"
+        f"دمای هوای برآوردی: {current.get('temperature_2m', 'نامشخص')}°C\\n"
+        f"دمای احساسیِ محاسبه‌شده: {current.get('apparent_temperature', 'نامشخص')}°C\\n"
         f"رطوبت: {current.get('relative_humidity_2m', 'نامشخص')}٪؛ "
         f"باد: {current.get('wind_speed_10m', 'نامشخص')} km/h؛ "
-        f"بارش فعلی: {current.get('precipitation', 'نامشخص')} mm\n"
+        f"بارش فعلی: {current.get('precipitation', 'نامشخص')} mm\\n"
         f"امروز: کمینه {daily.get('temperature_2m_min', ['نامشخص'])[0]}°C، "
         f"بیشینه {daily.get('temperature_2m_max', ['نامشخص'])[0]}°C، "
-        f"احتمال بیشینه بارش {daily.get('precipitation_probability_max', ['نامشخص'])[0]}٪\n"
+        f"احتمال بیشینه بارش {daily.get('precipitation_probability_max', ['نامشخص'])[0]}٪\\n"
+        "نکته: دمای هوا و دمای احساسی دو شاخص متفاوت‌اند؛ این داده‌ها برآورد مدل‌اند، نه اندازه‌گیری مستقیم دماسنج محلی.\\n"
         "منبع: https://open-meteo.com/"
     )
 
@@ -1773,7 +1780,7 @@ def build_response_plan(chat_id, text):
         }
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-    if text.strip() == "🌦 هواشناسی":
+    if text.strip() == "🌦 هواشناسی" or command == "/weather":
         db_set_state(f"weather_pending_{chat_id}", "1")
         return {
             "responses": [(chat_id, "نام شهر ایران را بفرست؛ مثلاً: مشهد یا کاشمر")],

@@ -200,6 +200,7 @@ if SENTRY_ENABLED:
         profile_session_sample_rate=_env_float(
             "SENTRY_PROFILE_SESSION_SAMPLE_RATE", 0.05, 0.0, 1.0
         ),
+        profile_lifecycle="trace",
         integrations=[
             LoggingIntegration(
                 level=logging.INFO,

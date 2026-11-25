@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 _TEST_DIR = tempfile.TemporaryDirectory(prefix="neptonbot-tests-")
 os.environ.update({
@@ -108,7 +109,20 @@ class DatabaseWorkflowTests(unittest.TestCase):
         bot.db_set_state("weather_pending_789", str(int(time.time()) - 1))
         result = bot.build_response_plan("789", "سلام")
         self.assertIn("سلام", result["responses"][0][1])
-        self.assertEqual(bot.db_get_state("weather_pending_789"), "0")
+        self.assertIsNone(bot.db_get_state("weather_pending_789"))
+
+    def test_market_command_uses_structured_market_provider(self):
+        with patch.object(bot, "get_live_market_prices", return_value="market snapshot") as provider:
+            result = bot.build_response_plan("123", "/market")
+        self.assertEqual(result["responses"], [("123", "market snapshot")])
+        provider.assert_called_once_with()
+
+    def test_cleanup_removes_expired_weather_states(self):
+        bot.db_set_state("weather_pending_expired", "0")
+        bot.db_set_state("weather_pending_active", str(int(time.time()) + 300))
+        bot.db_cleanup_old_records()
+        self.assertIsNone(bot.db_get_state("weather_pending_expired"))
+        self.assertIsNotNone(bot.db_get_state("weather_pending_active"))
 
 
 if __name__ == "__main__":

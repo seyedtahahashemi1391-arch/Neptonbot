@@ -53,7 +53,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.7"
+VERSION = "3.3.8"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -2135,6 +2135,17 @@ def build_response_plan(chat_id, text):
         }
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    weather_state_key = f"weather_pending_{chat_id}"
+    weather_pending_until = db_get_state(weather_state_key)
+    if (
+        (command.startswith("/") and command not in {"/weather", "/cancel"})
+        or text.strip() == "💰 قیمت بازار"
+        or normalize_text(text) == normalize_text(FEEDBACK_TRIGGER_TEXT)
+    ):
+        if weather_pending_until is not None:
+            db_delete_state(weather_state_key)
+            weather_pending_until = None
+
     if command == "/remember":
         memory_text = text.partition(" ")[2].strip()
         if not memory_text:
@@ -2213,9 +2224,6 @@ def build_response_plan(chat_id, text):
             "responses": [(chat_id, result)], "history_user": query,
             "history_assistant": result, "clear_history": False, "feedback_action": None,
         }
-
-    weather_state_key = f"weather_pending_{chat_id}"
-    weather_pending_until = db_get_state(weather_state_key)
 
     if text.strip() == "🌦 هواشناسی" or command == "/weather":
         expires_at = int(time.time()) + 300

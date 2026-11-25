@@ -108,7 +108,10 @@ START_MESSAGE = (
     "│ 🌦 هواشناسی: دکمه را بزن و نام شهر را بفرست\n"
     "│ اگر دکمه دیده نشد، /weather را بفرست\n"
     "│ 💬 گفت‌وگو: پیام خودت رو بفرست\n"
-    "│ 🧹 /reset — پاک‌کردن حافظهٔ گفتگو\n"
+    "│ 🧠 /remember متن — ذخیره یادداشت اختیاری\n"
+    "│ 📚 /memory و /forget — نمایش و حذف یادداشت\n"
+    "│ 🔎 /search عبارت — جست‌وجوی وب\n"
+    "│ 🧹 /reset — پاک‌کردن تاریخچه گفتگو\n"
     "│ 💡 /feedback — ارسال نظر یا پیشنهاد\n"
     "│ ❔ /help — نمایش راهنما\n"
     "└━━━━━━━━━━━━━━━━━━\n"
@@ -119,7 +122,11 @@ HELP_MESSAGE = (
     "✦ راهنمای NeptonBot\n"
     "━━━━━━━━━━━━━━━━━━\n"
     "💬 برای گفت‌وگو، سؤال یا درخواستت رو مستقیم بفرست.\n"
-    "🧹 /reset — پاک‌کردن حافظهٔ گفت‌وگو\n"
+    "🧹 /reset — پاک‌کردن تاریخچهٔ گفت‌وگو\n"
+    "🧠 /remember متن — ذخیره یادداشت اختیاری برای گفتگوهای بعدی\n"
+    "📚 /memory — نمایش یادداشت ذخیره‌شده\n"
+    "🗑 /forget — حذف یادداشت شخصی\n"
+    "🔎 /search عبارت — جست‌وجوی وب (نیازمند کلید Brave)\n"
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
     "✖ /cancel — لغو ارسال نظر\n"
     "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
@@ -1238,8 +1245,7 @@ def get_live_web_results(query):
     """Use Brave Search API when configured; never fabricate search results."""
     if not BRAVE_SEARCH_API_KEY:
         return (
-            "جست‌وجوی وب زنده برای این درخواست لازم به نظر می‌رسد، اما "
-            "BRAVE_SEARCH_API_KEY تنظیم نشده است. به‌جای حدس‌زدن، این محدودیت را به کاربر بگو."
+            "جست‌وجوی وب زنده هنوز برای ربات فعال نشده است؛ مدیر باید کلید BRAVE_SEARCH_API_KEY را در تنظیمات محیطی سرویس ثبت کند."
         )
     data = _get_json(
         "https://api.search.brave.com/res/v1/web/search",
@@ -1542,6 +1548,7 @@ def register_bot_commands():
         {"command": "memory", "description": "نمایش یادداشت شخصی"},
         {"command": "forget", "description": "حذف یادداشت شخصی"},
         {"command": "search", "description": "جست‌وجوی وب"},
+        {"command": "admin", "description": "وضعیت مدیریتی ربات"},
         {"command": "reset", "description": "پاک کردن حافظه گفتگو"},
     ]
     try:
@@ -1882,7 +1889,37 @@ def build_response_plan(chat_id, text):
             "history_assistant": None, "clear_history": False, "feedback_action": None,
         }
 
-    if command == "/search":
+    if command == "/admin":
+        admin_id = get_admin_chat_id()
+        if admin_id is None or str(chat_id) != str(admin_id):
+            message = "این دستور فقط برای مدیر ربات فعال است."
+        else:
+            stats = db_queue_stats()
+            with _service_lock:
+                alive_workers = sum(worker.is_alive() for worker in _worker_threads)
+            with _poll_health_lock:
+                last_ok = _last_poll_success_at
+                poll_error = _last_poll_error_type
+            age = round(time.time() - last_ok, 1) if last_ok is not None else "نامشخص"
+            runtime_label = "فعال" if _runtime_active else "غیرفعال"
+            message = (
+                "🛠 پنل مدیریتی Nepton\n"
+                f"نسخه: {VERSION}\n"
+                f"وضعیت Runtime: {runtime_label}\n"
+                f"Worker فعال: {alive_workers}/{MAX_PARALLEL_CHATS}\n"
+                f"آخرین Poll موفق: {age} ثانیه قبل\n"
+                f"خطای آخر Poll: {poll_error or 'ندارد'}\n"
+                f"پیام‌های صف: {stats['queued_messages']} (در انتظار: {stats['pending_messages']})\n"
+                f"در حال پردازش: {stats['processing_messages']}\n"
+                f"Dead-letter: {stats['dead_letters']}\n"
+                f"قدیمی‌ترین پیام صف: {stats['oldest_queue_age_seconds']} ثانیه"
+            )
+        return {
+            "responses": [(chat_id, message)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+        }
+
+    if command == "/search":    if command == "/search":
         query = text.partition(" ")[2].strip()
         if not query:
             return {

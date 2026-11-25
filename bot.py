@@ -49,7 +49,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.0"
+VERSION = "3.3.1"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -1285,22 +1285,30 @@ def _get_json(url, *, params=None, headers=None):
 
 
 def get_live_weather(user_text):
-    """Return a concise weather summary with only useful conditions."""
+    """Return a concise weather summary; malformed provider data never poisons the queue."""
     place = _weather_location(user_text)
     if not place:
         return "نام شهر را بفرست تا وضعیت هوا را بگویم."
+
     geo = _get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": place, "count": 1, "language": "fa", "format": "json", "countryCode": "IR"},
     )
     results = geo.get("results") if isinstance(geo, dict) else None
-    if not results:
+    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
         return f"شهر «{place}» پیدا نشد؛ نام شهر را دقیق‌تر بفرست."
+
     loc = results[0]
+    latitude = loc.get("latitude")
+    longitude = loc.get("longitude")
+    if not isinstance(latitude, (int, float)) or not isinstance(longitude, (int, float)):
+        logger.warning("Weather geocoding response omitted valid coordinates")
+        return "سرویس مکان‌یابی پاسخ معتبری نداد؛ کمی بعد دوباره تلاش کن."
+
     forecast = _get_json(
         "https://api.open-meteo.com/v1/forecast",
         params={
-            "latitude": loc["latitude"], "longitude": loc["longitude"],
+            "latitude": latitude, "longitude": longitude,
             "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
             "temperature_unit": "celsius",
@@ -1309,19 +1317,32 @@ def get_live_weather(user_text):
             "forecast_days": 2, "timezone": "auto",
         },
     )
-    current = forecast.get("current", {})
-    daily = forecast.get("daily", {})
-    city = loc.get("name", place)
-    country = loc.get("country", "")
+    current = forecast.get("current") if isinstance(forecast, dict) else None
+    daily = forecast.get("daily") if isinstance(forecast, dict) else None
+    if not isinstance(current, dict) or not isinstance(daily, dict):
+        logger.warning("Weather forecast response had an unexpected structure")
+        return "سرویس هواشناسی پاسخ کاملی نداد؛ کمی بعد دوباره تلاش کن."
+
+    def _daily_value(key):
+        values = daily.get(key)
+        return values[0] if isinstance(values, list) and values else "—"
+
+    city = str(loc.get("name") or place)[:80]
+    country = str(loc.get("country") or "")[:80]
+    temperature = current.get("temperature_2m", "—")
+    feels_like = current.get("apparent_temperature", "—")
+    humidity = current.get("relative_humidity_2m", "—")
+    wind = current.get("wind_speed_10m", "—")
+    updated_at = current.get("time")
+    updated_line = f"\nزمان داده: {updated_at}" if isinstance(updated_at, str) and updated_at else ""
     return (
         f"🌦 هواشناسی {city}{', ' + country if country else ''}\n"
-        f"اکنون: {current.get('temperature_2m', '—')}°C"
-        f" (احساسی: {current.get('apparent_temperature', '—')}°C)\n"
-        f"امروز: {daily.get('temperature_2m_min', ['—'])[0]}° تا "
-        f"{daily.get('temperature_2m_max', ['—'])[0]}°C\n"
-        f"احتمال بارش: {daily.get('precipitation_probability_max', ['—'])[0]}٪؛ "
-        f"باد: {current.get('wind_speed_10m', '—')} km/h؛ "
-        f"رطوبت: {current.get('relative_humidity_2m', '—')}٪"
+        f"اکنون: {temperature}°C (احساسی: {feels_like}°C)\n"
+        f"امروز: {_daily_value('temperature_2m_min')}° تا "
+        f"{_daily_value('temperature_2m_max')}°C\n"
+        f"احتمال بارش: {_daily_value('precipitation_probability_max')}٪؛ "
+        f"باد: {wind} km/h؛ رطوبت: {humidity}٪"
+        f"{updated_line}"
     )
 
 def get_live_web_results(query):

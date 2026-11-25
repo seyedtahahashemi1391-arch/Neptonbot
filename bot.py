@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -91,6 +92,10 @@ RETRY_BACKOFF_MAX = 120
 WORKER_IDLE_WAIT = _env_float("NEPTON_WORKER_IDLE_WAIT", 0.25, 0.05, 1.0)
 WORKER_LEASE_SECONDS = _env_int("NEPTON_WORKER_LEASE_SECONDS", 600, 420, 900)
 SUPERVISOR_INTERVAL = 5
+RUNTIME_LEASE_SECONDS = _env_int("NEPTON_RUNTIME_LEASE_SECONDS", 180, 90, 600)
+RUNTIME_LEASE_RENEW_INTERVAL = _env_int("NEPTON_RUNTIME_LEASE_RENEW_INTERVAL", 15, 5, 30)
+RUNTIME_ACQUIRE_RETRY_INTERVAL = _env_int("NEPTON_RUNTIME_ACQUIRE_RETRY_INTERVAL", 5, 2, 30)
+RUNTIME_LEASE_FAILURE_LIMIT = 3
 
 PROCESSED_UPDATE_RETENTION_DAYS = 30
 DEAD_LETTER_RETENTION_DAYS = 30
@@ -943,6 +948,11 @@ admin_chat_id = None
 _runtime_lock_file = None
 _runtime_lock_acquired = False
 _runtime_active = False
+_runtime_owner_id = f"{os.getpid()}:{uuid.uuid4().hex}"
+_runtime_lease_lost = threading.Event()
+_runtime_heartbeat_thread = None
+_runtime_acquire_thread = None
+_runtime_acquire_thread_lock = threading.Lock()
 
 _polling_thread = None
 _polling_stop = threading.Event()
@@ -1017,19 +1027,60 @@ def get_admin_chat_id():
 
 
 def acquire_runtime_lock():
-    """Acquire a process-wide lock so only one process polls and consumes the queue."""
+    """Acquire the singleton runtime lock using PostgreSQL or a local SQLite lock."""
     global _runtime_lock_file, _runtime_lock_acquired
+
+    if USE_POSTGRES:
+        now = time.time()
+        with db_connect() as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS nepton_runtime_leases (
+                    lock_name TEXT PRIMARY KEY,
+                    owner_id TEXT NOT NULL,
+                    lease_until DOUBLE PRECISION NOT NULL,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+            """)
+            db.execute("ALTER TABLE nepton_runtime_leases ENABLE ROW LEVEL SECURITY")
+            row = db.execute("""
+                INSERT INTO nepton_runtime_leases(lock_name, owner_id, lease_until, updated_at)
+                VALUES('primary', ?, ?, ?)
+                ON CONFLICT(lock_name) DO UPDATE SET
+                    owner_id = excluded.owner_id,
+                    lease_until = excluded.lease_until,
+                    updated_at = excluded.updated_at
+                WHERE nepton_runtime_leases.lease_until < ?
+                   OR nepton_runtime_leases.owner_id = ?
+                RETURNING owner_id
+            """, (
+                _runtime_owner_id,
+                now + RUNTIME_LEASE_SECONDS,
+                now,
+                now,
+                _runtime_owner_id,
+            )).fetchone()
+
+        if row is None:
+            _runtime_lock_acquired = False
+            logger.info("Another instance owns the PostgreSQL runtime lease; this instance is HTTP-only")
+            return False
+
+        _runtime_lock_acquired = True
+        _runtime_lease_lost.clear()
+        logger.info(
+            "PostgreSQL runtime lease acquired owner=%s lease_seconds=%s",
+            _runtime_owner_id,
+            RUNTIME_LEASE_SECONDS,
+        )
+        return True
+
     lock_path = str(Path(DB_PATH).expanduser().resolve()) + ".runtime.lock"
     Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
     handle = open(lock_path, "a+")
 
     if fcntl is None:
-        logger.warning(
-            "fcntl unavailable: cross-process runtime locking is disabled; use one process only"
-        )
-        _runtime_lock_file = handle
-        _runtime_lock_acquired = True
-        return True
+        handle.close()
+        raise RuntimeError("fcntl is unavailable; SQLite runtime requires a process lock")
 
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1044,15 +1095,80 @@ def acquire_runtime_lock():
 
     _runtime_lock_file = handle
     _runtime_lock_acquired = True
-    logger.info("Runtime lock acquired")
+    _runtime_lease_lost.clear()
+    logger.info("Local runtime lock acquired")
     return True
+
+
+def _renew_runtime_lock():
+    if not _runtime_lock_acquired:
+        return False
+    if not USE_POSTGRES:
+        return _runtime_lock_file is not None and not _runtime_lease_lost.is_set()
+
+    now = time.time()
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE nepton_runtime_leases
+            SET lease_until = ?, updated_at = ?
+            WHERE lock_name = 'primary'
+              AND owner_id = ?
+              AND lease_until > ?
+        """, (
+            now + RUNTIME_LEASE_SECONDS,
+            now,
+            _runtime_owner_id,
+            now,
+        )).rowcount
+    return changed == 1
+
+
+def runtime_lease_heartbeat():
+    failures = 0
+    while not _polling_stop.wait(RUNTIME_LEASE_RENEW_INTERVAL):
+        try:
+            if not _renew_runtime_lock():
+                _runtime_lease_lost.set()
+                _polling_stop.set()
+                _queue_wakeup.set()
+                logger.critical("Runtime lease ownership was lost; polling and workers are stopping")
+                return
+            failures = 0
+        except Exception:
+            failures += 1
+            logger.exception(
+                "Runtime lease renewal failed (%s/%s)",
+                failures,
+                RUNTIME_LEASE_FAILURE_LIMIT,
+            )
+            if failures >= RUNTIME_LEASE_FAILURE_LIMIT:
+                _runtime_lease_lost.set()
+                _polling_stop.set()
+                _queue_wakeup.set()
+                logger.critical("Runtime lease could not be renewed; stopping to prevent split-brain")
+                return
 
 
 def _release_runtime_lock():
     global _runtime_lock_file, _runtime_lock_acquired
     handle = _runtime_lock_file
     _runtime_lock_file = None
+    was_acquired = _runtime_lock_acquired
     _runtime_lock_acquired = False
+
+    if USE_POSTGRES:
+        if was_acquired:
+            try:
+                with db_connect() as db:
+                    db.execute("""
+                        DELETE FROM nepton_runtime_leases
+                        WHERE lock_name = 'primary' AND owner_id = ?
+                    """, (_runtime_owner_id,))
+                logger.info("PostgreSQL runtime lease released")
+            except Exception:
+                logger.exception("Could not release PostgreSQL runtime lease; it will expire")
+        return
+
     if handle is None:
         return
     try:
@@ -2282,7 +2398,7 @@ def chat_worker():
     worker_id = _worker_id()
     logger.info("Worker started id=%s", worker_id)
 
-    while not _polling_stop.is_set():
+    while not _polling_stop.is_set() and not _runtime_lease_lost.is_set():
         item = None
         try:
             item = db_claim_next_message(worker_id)
@@ -2372,7 +2488,7 @@ def polling_loop():
     last_cleanup = time.monotonic()
     logger.info("Soroush polling started offset_present=%s", offset is not None)
 
-    while not _polling_stop.is_set():
+    while not _polling_stop.is_set() and not _runtime_lease_lost.is_set():
         try:
             if time.monotonic() - last_cleanup >= DB_CLEANUP_INTERVAL:
                 try:
@@ -2386,6 +2502,8 @@ def polling_loop():
             data = soroush_request("getUpdates", payload)
             logger.debug("TIMING get_updates_ms=%.0f", (time.perf_counter() - started) * 1000)
 
+            if _runtime_lease_lost.is_set():
+                break
             if not has_update_container(data):
                 raise TransientAPIError("Unexpected Soroush getUpdates response")
 
@@ -2453,9 +2571,44 @@ def start_polling():
         logger.info("Polling thread started")
 
 
+def _start_runtime_acquirer():
+    global _runtime_acquire_thread
+    with _runtime_acquire_thread_lock:
+        if _runtime_acquire_thread is not None and _runtime_acquire_thread.is_alive():
+            return
+        _runtime_acquire_thread = threading.Thread(
+            target=_runtime_acquisition_loop,
+            name="NeptonRuntimeAcquirer",
+            daemon=True,
+        )
+        _runtime_acquire_thread.start()
+
+
+def _runtime_acquisition_loop():
+    logger.info("Runtime acquisition retry loop started")
+    while not _runtime_active:
+        time.sleep(RUNTIME_ACQUIRE_RETRY_INTERVAL)
+        if _runtime_active:
+            break
+        try:
+            if start_runtime_services():
+                logger.info("Runtime ownership acquired after retry")
+                return
+        except Exception:
+            logger.exception("Runtime acquisition retry failed")
+    logger.info("Runtime acquisition retry loop stopped")
+
+
 def runtime_supervisor():
     logger.info("Runtime supervisor started")
-    while not _polling_stop.wait(SUPERVISOR_INTERVAL):
+    while True:
+        if _runtime_lease_lost.is_set():
+            logger.error("Runtime supervisor detected lease loss; handing over ownership")
+            shutdown_runtime()
+            _start_runtime_acquirer()
+            return
+        if _polling_stop.wait(SUPERVISOR_INTERVAL):
+            break
         try:
             _start_or_replace_workers()
             start_polling()
@@ -2465,7 +2618,7 @@ def runtime_supervisor():
 
 
 def start_runtime_services():
-    global _runtime_active, _supervisor_thread
+    global _runtime_active, _supervisor_thread, _runtime_heartbeat_thread
     with _runtime_start_lock:
         if _runtime_active:
             return True
@@ -2480,6 +2633,16 @@ def start_runtime_services():
 
             _polling_stop.clear()
             _queue_wakeup.clear()
+            _runtime_lease_lost.clear()
+
+            if USE_POSTGRES:
+                _runtime_heartbeat_thread = threading.Thread(
+                    target=runtime_lease_heartbeat,
+                    name="NeptonLeaseHeartbeat",
+                    daemon=True,
+                )
+                _runtime_heartbeat_thread.start()
+
             _start_or_replace_workers()
             start_polling()
 
@@ -2506,7 +2669,12 @@ def shutdown_runtime():
     with _service_lock:
         worker_snapshot = list(_worker_threads)
     threads = [
-        thread for thread in [_polling_thread, _supervisor_thread, *worker_snapshot]
+        thread for thread in [
+            _polling_thread,
+            _supervisor_thread,
+            _runtime_heartbeat_thread,
+            *worker_snapshot,
+        ]
         if thread is not None and thread is not current and thread.is_alive()
     ]
     deadline = time.monotonic() + 8.0
@@ -2534,7 +2702,8 @@ atexit.register(shutdown_runtime)
 # Startup
 # =========================================================
 if os.getenv("NEPTON_DISABLE_AUTOSTART", "0").strip().lower() not in {"1", "true", "yes"}:
-    start_runtime_services()
+    if not start_runtime_services():
+        _start_runtime_acquirer()
 else:
     logger.info("NEPTON_DISABLE_AUTOSTART is enabled; runtime will start in the post-worker hook")
 

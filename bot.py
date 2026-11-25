@@ -2085,13 +2085,22 @@ def build_response_plan(chat_id, text):
             "clear_history": False, "feedback_action": None,
         }
 
-    if command == "/cancel" and weather_pending_until is not None:
-        db_set_state(weather_state_key, "0")
-        return {
-            "responses": [(chat_id, "درخواست هواشناسی لغو شد.")],
-            "history_user": None, "history_assistant": None,
-            "clear_history": False, "feedback_action": None,
-        }
+    if command == "/cancel":
+        try:
+            weather_cancel_active = int(weather_pending_until or 0) > int(time.time())
+        except (TypeError, ValueError):
+            weather_cancel_active = False
+
+        if weather_cancel_active:
+            db_set_state(weather_state_key, "0")
+            return {
+                "responses": [(chat_id, "درخواست هواشناسی لغو شد.")],
+                "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+
+        if weather_pending_until is not None:
+            db_set_state(weather_state_key, "0")
 
     if weather_pending_until is not None and not text.startswith("/"):
         try:

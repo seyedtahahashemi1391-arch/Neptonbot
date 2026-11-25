@@ -124,6 +124,18 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIsNone(bot.db_get_state("weather_pending_expired"))
         self.assertIsNotNone(bot.db_get_state("weather_pending_active"))
 
+    def test_weather_pending_does_not_capture_other_commands_or_buttons(self):
+        bot.db_set_state("weather_pending_123", str(int(time.time()) + 300))
+        with patch.object(bot, "get_live_market_prices", return_value="market snapshot"):
+            market_result = bot.build_response_plan("123", "💰 قیمت بازار")
+        self.assertEqual(market_result["responses"], [("123", "market snapshot")])
+        self.assertIsNone(bot.db_get_state("weather_pending_123"))
+
+        bot.db_set_state("weather_pending_123", str(int(time.time()) + 300))
+        help_result = bot.build_response_plan("123", "/help")
+        self.assertIn("راهنمای NeptonBot", help_result["responses"][0][1])
+        self.assertIsNone(bot.db_get_state("weather_pending_123"))
+
 
 if __name__ == "__main__":
     unittest.main()

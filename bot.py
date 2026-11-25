@@ -1919,7 +1919,7 @@ def build_response_plan(chat_id, text):
             "history_assistant": None, "clear_history": False, "feedback_action": None,
         }
 
-    if command == "/search":    if command == "/search":
+    if command == "/search":
         query = text.partition(" ")[2].strip()
         if not query:
             return {

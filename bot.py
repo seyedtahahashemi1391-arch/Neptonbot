@@ -13,6 +13,9 @@ from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
 from flask import Flask, jsonify
+import sentry_sdk
+from sentry_sdk import metrics as sentry_metrics
+from sentry_sdk.integrations.logging import LoggingIntegration
 
 try:
     import fcntl
@@ -49,7 +52,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.2"
+VERSION = "3.3.3"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -180,6 +183,34 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s pid=%(process)d %(threadName)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
+
+SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+SENTRY_ENABLED = bool(SENTRY_DSN)
+
+if SENTRY_ENABLED:
+    sentry_sdk.init(
+        dsn=SENTRY_DSN,
+        environment=os.getenv("SENTRY_ENVIRONMENT", "production").strip() or "production",
+        release=f"neptonbot@{VERSION}",
+        send_default_pii=False,
+        include_local_variables=False,
+        max_breadcrumbs=50,
+        enable_logs=True,
+        traces_sample_rate=_env_float("SENTRY_TRACES_SAMPLE_RATE", 0.10, 0.0, 1.0),
+        profile_session_sample_rate=_env_float(
+            "SENTRY_PROFILE_SESSION_SAMPLE_RATE", 0.05, 0.0, 1.0
+        ),
+        integrations=[
+            LoggingIntegration(
+                level=logging.INFO,
+                event_level=logging.ERROR,
+                capture_sentry_logs=True,
+            )
+        ],
+    )
+    logger.info("Sentry telemetry initialized environment=%s", os.getenv("SENTRY_ENVIRONMENT", "production"))
+else:
+    logger.info("Sentry telemetry disabled; SENTRY_DSN is not configured")
 
 logger.info("Starting NeptonBot version=%s model=%s", VERSION, MODEL)
 
@@ -2134,7 +2165,7 @@ def flatten_response_plan(responses, reply_markup=None):
 # =========================================================
 # Queue workers
 # =========================================================
-def _process_claimed_item(item, worker_id):
+def _process_claimed_item_impl(item, worker_id):
     message_id = item["id"]
     queue_age_ms = max(0.0, (time.time() - float(item.get("queued_at") or time.time())) * 1000)
     logger.info("TIMING queue_wait_ms=%.0f", queue_age_ms)
@@ -2187,10 +2218,26 @@ def _process_claimed_item(item, worker_id):
     if not db_finish_message(message_id, worker_id):
         raise RuntimeError("Could not finalize queue item")
 
-    logger.info(
-        "TIMING queue_total_ms=%.0f",
-        max(0.0, (time.time() - float(item.get("queued_at") or time.time())) * 1000),
+    total_ms = max(
+        0.0, (time.time() - float(item.get("queued_at") or time.time())) * 1000
     )
+    logger.info("TIMING queue_total_ms=%.0f", total_ms)
+    if SENTRY_ENABLED:
+        sentry_metrics.count("neptonbot.messages.processed", 1)
+        sentry_metrics.distribution("neptonbot.queue.total_ms", total_ms)
+        sentry_metrics.distribution("neptonbot.queue.wait_ms", queue_age_ms)
+
+
+def _process_claimed_item(item, worker_id):
+    if not SENTRY_ENABLED:
+        return _process_claimed_item_impl(item, worker_id)
+    with sentry_sdk.start_transaction(
+        op="task",
+        name="neptonbot.process_message",
+    ) as transaction:
+        transaction.set_tag("component", "queue_worker")
+        transaction.set_tag("worker", threading.current_thread().name)
+        return _process_claimed_item_impl(item, worker_id)
 
 
 def chat_worker():

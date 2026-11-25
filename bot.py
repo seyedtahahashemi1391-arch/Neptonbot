@@ -53,7 +53,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.6"
+VERSION = "3.3.7"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -136,8 +136,9 @@ HELP_MESSAGE = (
     "🗑 /forget — حذف یادداشت شخصی\n"
     "🔎 /search عبارت — جست‌وجوی وب (نیازمند کلید Brave)\n"
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
-    "✖ /cancel — لغو ارسال نظر\n"
+    "✖ /cancel — لغو ارسال نظر یا هواشناسی\n"
     "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
+    "💰 /market — دریافت قیمت‌های بازار ایران\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
 
@@ -517,6 +518,11 @@ def db_set_state(key, value):
             VALUES(?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """, (key, str(value)))
+
+
+def db_delete_state(key):
+    with db_connect() as db:
+        return db.execute("DELETE FROM bot_state WHERE key = ?", (key,)).rowcount > 0
 
 
 def db_get_offset():
@@ -933,6 +939,16 @@ def db_cleanup_old_records():
                 GROUP BY chat_id ORDER BY MAX(created_at) DESC LIMIT ?
             )
         """, (MAX_CONVERSATIONS,))
+        weather_states = db.execute(
+            "SELECT key, value FROM bot_state WHERE key LIKE 'weather_pending_%'"
+        ).fetchall()
+        for state in weather_states:
+            try:
+                expired = int(state["value"] or 0) <= now
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                db.execute("DELETE FROM bot_state WHERE key = ?", (state["key"],))
         if not USE_POSTGRES:
             db.execute("PRAGMA wal_checkpoint(PASSIVE)")
 
@@ -1804,6 +1820,8 @@ def register_bot_commands():
         {"command": "memory", "description": "نمایش یادداشت شخصی"},
         {"command": "forget", "description": "حذف یادداشت شخصی"},
         {"command": "search", "description": "جست‌وجوی وب"},
+        {"command": "weather", "description": "هواشناسی"},
+        {"command": "market", "description": "قیمت‌های بازار ایران"},
         {"command": "admin", "description": "وضعیت مدیریتی ربات"},
         {"command": "reset", "description": "پاک کردن حافظه گفتگو"},
     ]
@@ -2175,6 +2193,13 @@ def build_response_plan(chat_id, text):
             "history_assistant": None, "clear_history": False, "feedback_action": None,
         }
 
+    if command == "/market":
+        result = get_live_market_prices()
+        return {
+            "responses": [(chat_id, result)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+        }
+
     if command == "/search":
         query = text.partition(" ")[2].strip()
         if not query:
@@ -2208,7 +2233,7 @@ def build_response_plan(chat_id, text):
             weather_cancel_active = False
 
         if weather_cancel_active:
-            db_set_state(weather_state_key, "0")
+            db_delete_state(weather_state_key)
             return {
                 "responses": [(chat_id, "درخواست هواشناسی لغو شد.")],
                 "history_user": None, "history_assistant": None,
@@ -2216,7 +2241,7 @@ def build_response_plan(chat_id, text):
             }
 
         if weather_pending_until is not None:
-            db_set_state(weather_state_key, "0")
+            db_delete_state(weather_state_key)
 
     if weather_pending_until is not None and not text.startswith("/"):
         try:
@@ -2232,7 +2257,7 @@ def build_response_plan(chat_id, text):
             else:
                 # Keep the pending state on transient errors so the durable queue
                 # can retry the same update without losing the requested city flow.
-                db_set_state(weather_state_key, "0")
+                db_delete_state(weather_state_key)
 
             return {
                 "responses": [(chat_id, weather_result)],
@@ -2240,7 +2265,7 @@ def build_response_plan(chat_id, text):
                 "clear_history": False, "feedback_action": None,
             }
 
-        db_set_state(weather_state_key, "0")
+        db_delete_state(weather_state_key)
     if command in {"/start", "/help"}:
         message = START_MESSAGE if command == "/start" else HELP_MESSAGE
         return {

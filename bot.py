@@ -53,7 +53,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.8"
+VERSION = "3.3.9"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -1047,7 +1047,6 @@ def acquire_runtime_lock():
     global _runtime_lock_file, _runtime_lock_acquired
 
     if USE_POSTGRES:
-        now = time.time()
         with db_connect() as db:
             db.execute("""
                 CREATE TABLE IF NOT EXISTS nepton_runtime_leases (
@@ -1060,19 +1059,22 @@ def acquire_runtime_lock():
             db.execute("ALTER TABLE nepton_runtime_leases ENABLE ROW LEVEL SECURITY")
             row = db.execute("""
                 INSERT INTO nepton_runtime_leases(lock_name, owner_id, lease_until, updated_at)
-                VALUES('primary', ?, ?, ?)
+                VALUES(
+                    'primary',
+                    ?,
+                    EXTRACT(EPOCH FROM clock_timestamp()) + ?,
+                    EXTRACT(EPOCH FROM clock_timestamp())
+                )
                 ON CONFLICT(lock_name) DO UPDATE SET
                     owner_id = excluded.owner_id,
                     lease_until = excluded.lease_until,
                     updated_at = excluded.updated_at
-                WHERE nepton_runtime_leases.lease_until < ?
+                WHERE nepton_runtime_leases.lease_until < EXTRACT(EPOCH FROM clock_timestamp())
                    OR nepton_runtime_leases.owner_id = ?
                 RETURNING owner_id
             """, (
                 _runtime_owner_id,
-                now + RUNTIME_LEASE_SECONDS,
-                now,
-                now,
+                RUNTIME_LEASE_SECONDS,
                 _runtime_owner_id,
             )).fetchone()
 
@@ -1122,19 +1124,18 @@ def _renew_runtime_lock():
     if not USE_POSTGRES:
         return _runtime_lock_file is not None and not _runtime_lease_lost.is_set()
 
-    now = time.time()
     with db_connect() as db:
         changed = db.execute("""
             UPDATE nepton_runtime_leases
-            SET lease_until = ?, updated_at = ?
+            SET
+                lease_until = EXTRACT(EPOCH FROM clock_timestamp()) + ?,
+                updated_at = EXTRACT(EPOCH FROM clock_timestamp())
             WHERE lock_name = 'primary'
               AND owner_id = ?
-              AND lease_until > ?
+              AND lease_until > EXTRACT(EPOCH FROM clock_timestamp())
         """, (
-            now + RUNTIME_LEASE_SECONDS,
-            now,
+            RUNTIME_LEASE_SECONDS,
             _runtime_owner_id,
-            now,
         )).rowcount
     return changed == 1
 

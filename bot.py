@@ -52,7 +52,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.3"
+VERSION = "3.3.4"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -2073,21 +2073,49 @@ def build_response_plan(chat_id, text):
             "history_assistant": result, "clear_history": False, "feedback_action": None,
         }
 
+    weather_state_key = f"weather_pending_{chat_id}"
+    weather_pending_until = db_get_state(weather_state_key)
+
     if text.strip() == "🌦 هواشناسی" or command == "/weather":
-        db_set_state(f"weather_pending_{chat_id}", "1")
+        expires_at = int(time.time()) + 300
+        db_set_state(weather_state_key, str(expires_at))
         return {
-            "responses": [(chat_id, "نام شهر ایران را بفرست؛ مثلاً: مشهد یا کاشمر")],
+            "responses": [(chat_id, "نام شهر ایران را بفرست؛ مثلاً: مشهد یا کاشمر\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعال می‌ماند.")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }
-    if db_get_state(f"weather_pending_{chat_id}") == "1" and not text.startswith("/"):
-        db_set_state(f"weather_pending_{chat_id}", "0")
-        weather_result = get_live_weather("هواشناسی " + text.strip())
+
+    if command == "/cancel" and weather_pending_until is not None:
+        db_set_state(weather_state_key, "0")
         return {
-            "responses": [(chat_id, weather_result)],
+            "responses": [(chat_id, "درخواست هواشناسی لغو شد.")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }
+
+    if weather_pending_until is not None and not text.startswith("/"):
+        try:
+            pending_active = int(weather_pending_until) > int(time.time())
+        except (TypeError, ValueError):
+            pending_active = False
+
+        if pending_active:
+            try:
+                weather_result = get_live_weather("هواشناسی " + text.strip())
+            except UserVisibleError as exc:
+                weather_result = str(exc)
+            else:
+                # Keep the pending state on transient errors so the durable queue
+                # can retry the same update without losing the requested city flow.
+                db_set_state(weather_state_key, "0")
+
+            return {
+                "responses": [(chat_id, weather_result)],
+                "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+
+        db_set_state(weather_state_key, "0")
     if command in {"/start", "/help"}:
         message = START_MESSAGE if command == "/start" else HELP_MESSAGE
         return {

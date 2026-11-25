@@ -53,7 +53,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.9"
+VERSION = "3.3.10"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -1198,6 +1198,28 @@ def _release_runtime_lock():
             handle.close()
         except OSError:
             pass
+
+
+def release_runtime_lease_for_process(process_id):
+    """Release a dead Gunicorn worker's lease from the master after worker exit."""
+    if not USE_POSTGRES:
+        return False
+    try:
+        pid = int(process_id)
+    except (TypeError, ValueError):
+        return False
+
+    with db_connect() as db:
+        row = db.execute("""
+            DELETE FROM nepton_runtime_leases
+            WHERE lock_name = 'primary' AND owner_id LIKE ?
+            RETURNING owner_id
+        """, (f"{pid}:%",)).fetchone()
+
+    if row is not None:
+        logger.info("Released PostgreSQL runtime lease for exited worker pid=%s", pid)
+        return True
+    return False
 
 
 @app.get("/")

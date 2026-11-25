@@ -1081,6 +1081,8 @@ def _weather_location(text):
 
     # First handle explicit constructions such as «هوا در کاشمر چطوره؟».
     patterns = (
+        # «هواشناسی کاشمر» / «هواشناسیِ کاشمر»
+        r"هواشناسی(?:\s*ی)?\s+(.+)",
         r"(?:آب\s*و\s*هوا|وضعیت\s*هوا|پیش\s*بینی\s*هوا|هوا|دما)\s*(?:ی)?\s*(?:در|تو|برای)\s+(.+)",
         r"(?:weather|forecast|temperature)\s+(?:in|for|at)\s+(.+)",
         # Also accepts «آب و هوای کاشمر الان چطوره؟» and «هوای تهران».

@@ -105,6 +105,7 @@ START_MESSAGE = (
     "سلام! خوش اومدی 👋\n"
     "من دستیار هوشمند نپتونم؛ سؤال یا درخواستت رو همین‌جا بنویس.\n\n"
     "┌ راهنمای سریع\n"
+    "│ 🌦 دکمهٔ «هواشناسی» را بزن و نام هر شهر ایران را بفرست\n"
     "│ 💬 گفت‌وگو: پیام خودت رو بفرست\n"
     "│ 🧹 /reset — پاک‌کردن حافظهٔ گفتگو\n"
     "│ 💡 /feedback — ارسال نظر یا پیشنهاد\n"
@@ -1134,7 +1135,7 @@ def get_live_weather(user_text):
         )
     geo = _get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": place, "count": 1, "language": "fa", "format": "json"},
+        params={"name": place, "count": 1, "language": "fa", "format": "json", "countryCode": "IR"},
     )
     results = geo.get("results") if isinstance(geo, dict) else None
     if not results:
@@ -1190,6 +1191,57 @@ def get_live_web_results(query):
     return "نتایج جست‌وجوی وب زنده؛ اطلاعات را فقط در حد این منابع بیان کن و لینک منبع را در پاسخ بیاور:\n" + "\n\n".join(snippets)
 
 
+_MARKET_MARKERS = (
+    "قیمت دلار", "قیمت طلا", "قیمت طلای", "قیمت سکه", "قیمت ارز", "قیمت بازار",
+    "نرخ دلار", "نرخ طلا", "نرخ ارز", "قیمت تتر", "قیمت یورو", "دلار چنده", "طلا چنده",
+    "قیمت پوند", "قیمت درهم", "قیمت بیت کوین", "قیمت بیت‌کوین",
+)
+MARKET_DATA_URL = "https://raw.githubusercontent.com/iran-market/iran-market.github.io/main/data/popular.json"
+
+
+def _needs_market(text):
+    lowered = str(text or "").lower().replace("ي", "ی").replace("ك", "ک")
+    return any(marker in lowered for marker in _MARKET_MARKERS)
+
+
+def _fa_number(value):
+    try:
+        return f"{float(value):,.0f}".translate(str.maketrans("0123456789,.-", "۰۱۲۳۴۵۶۷۸۹٬٫−"))
+    except (TypeError, ValueError):
+        return "ناموجود"
+
+
+def get_live_market_prices():
+    """Fetch published Iranian market snapshots and show their actual update time."""
+    payload = _get_json(MARKET_DATA_URL)
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    by_symbol = {row.get("symbol"): row for row in rows if isinstance(row, dict)}
+    wanted = (
+        ("USD_IRR_FREE", "دلار آزاد"),
+        ("GOLD_18K_IRR", "طلای ۱۸ عیار / گرم"),
+        ("COIN_EMAMI_IRR", "سکهٔ امامی"),
+        ("EUR_IRR_FREE", "یورو آزاد"),
+        ("USDT_IRR", "تتر"),
+    )
+    lines = ["قیمت‌های بازار ایران"]
+    found = 0
+    for symbol, label in wanted:
+        item = by_symbol.get(symbol)
+        if not item or item.get("price") is None or item.get("stale") is True:
+            continue
+        currency = item.get("currency")
+        unit = "تومان" if currency == "IRT" else ("ریال" if currency == "IRR" else str(currency or ""))
+        lines.append(f"{label}: {_fa_number(item['price'])} {unit}".strip())
+        found += 1
+    if not found:
+        return "منبع قیمت بازار دادهٔ قابل‌استفاده نداد؛ عددی حدس نمی‌زنم."
+    meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+    published = meta.get("published_at") or "نامشخص"
+    lines.append(f"به‌روزرسانی فایل: {published}")
+    lines.append("منبع: Iran Market Data؛ داده‌ها با فاصلهٔ انتشار حدود ۳۰ دقیقه‌ای هستند، نه تیک‌به‌تیک.")
+    return "\n".join(lines)
+
+
 def get_live_context(user_text):
     try:
         if _needs_weather(user_text):
@@ -1207,6 +1259,14 @@ def get_live_context(user_text):
 
 
 def call_ai(chat_id, user_text):
+    if _needs_market(user_text):
+        try:
+            return get_live_market_prices()
+        except (TransientAPIError, UserVisibleError):
+            raise
+        except Exception:
+            logger.warning("Live market price request failed", exc_info=True)
+            return "منبع قیمت بازار فعلاً در دسترس نیست؛ عددی حدس نمی‌زنم."
     # Weather is a structured live-data request: return the provider result directly
     # so the language model cannot ignore it or replace it with generic seasonal advice.
     if _needs_weather(user_text):
@@ -1441,13 +1501,13 @@ def split_message(text, limit=MAX_MESSAGE_LENGTH):
     return chunks
 
 
-def send_one_message(chat_id, text):
+def send_one_message(chat_id, text, reply_markup=None):
     if not isinstance(text, str) or not text:
         raise PermanentAPIError("Refusing to send an empty message")
-    result = soroush_request(
-        "sendMessage",
-        {"chat_id": str(chat_id), "text": text},
-    )
+    payload = {"chat_id": str(chat_id), "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
+    result = soroush_request("sendMessage", payload)
     if not api_result_is_success(result):
         raise RetryableDeliveryError("Soroush did not confirm sendMessage success")
     return True
@@ -1713,11 +1773,31 @@ def build_response_plan(chat_id, text):
         }
 
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+    if text.strip() == "🌦 هواشناسی":
+        db_set_state(f"weather_pending_{chat_id}", "1")
+        return {
+            "responses": [(chat_id, "نام شهر ایران را بفرست؛ مثلاً: مشهد یا کاشمر")],
+            "history_user": None, "history_assistant": None,
+            "clear_history": False, "feedback_action": None,
+        }
+    if db_get_state(f"weather_pending_{chat_id}") == "1" and not text.startswith("/"):
+        db_set_state(f"weather_pending_{chat_id}", "0")
+        weather_result = get_live_weather("هواشناسی " + text.strip())
+        return {
+            "responses": [(chat_id, weather_result)],
+            "history_user": None, "history_assistant": None,
+            "clear_history": False, "feedback_action": None,
+        }
     if command in {"/start", "/help"}:
         message = START_MESSAGE if command == "/start" else HELP_MESSAGE
         return {
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
+            "reply_markup": {
+                "keyboard": [[{"text": "🌦 هواشناسی"}], [{"text": "💰 قیمت بازار"}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            } if command == "/start" else None,
         }
     if command == "/reset":
         return {
@@ -1771,12 +1851,15 @@ def build_response_plan(chat_id, text):
     }
 
 
-def flatten_response_plan(responses):
-    """Convert multi-recipient responses into durable, individually acknowledged chunks."""
+def flatten_response_plan(responses, reply_markup=None):
+    """Convert responses into durable, individually acknowledged chunks."""
     plan = []
     for chat_id, text in responses:
         for chunk in split_message(text):
-            plan.append({"chat_id": str(chat_id), "text": chunk})
+            item = {"chat_id": str(chat_id), "text": chunk}
+            if reply_markup is not None:
+                item["reply_markup"] = reply_markup
+            plan.append(item)
     return plan
 
 
@@ -1791,7 +1874,9 @@ def _process_claimed_item(item, worker_id):
     response_plan_raw = item.get("response_plan")
     if not response_plan_raw:
         result = build_response_plan(item["chat_id"], item["message_text"])
-        plan = flatten_response_plan(result["responses"])
+        plan = flatten_response_plan(
+            result["responses"], reply_markup=result.get("reply_markup")
+        )
         saved = db_prepare_response_plan(
             message_id, worker_id, plan,
             history_user=result.get("history_user"),
@@ -1824,7 +1909,9 @@ def _process_claimed_item(item, worker_id):
         ):
             raise RuntimeError("Stored response plan contains an invalid item")
 
-        send_one_message(part["chat_id"], part["text"])
+        send_one_message(
+            part["chat_id"], part["text"], reply_markup=part.get("reply_markup")
+        )
         if not db_advance_response(message_id, worker_id, response_index):
             raise RuntimeError("Could not advance durable response cursor")
         response_index += 1

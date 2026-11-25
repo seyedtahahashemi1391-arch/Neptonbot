@@ -249,6 +249,7 @@ class PostgresConnection:
             flags=re.IGNORECASE,
         )
         query = re.sub(r"\bupdate_id\s+INTEGER\b", "update_id BIGINT", query, flags=re.IGNORECASE)
+        query = re.sub(r"\bREAL\b", "DOUBLE PRECISION", query, flags=re.IGNORECASE)
         query = re.sub(r"\bBEGIN\s+IMMEDIATE\b", "BEGIN", query, flags=re.IGNORECASE)
         return query
 

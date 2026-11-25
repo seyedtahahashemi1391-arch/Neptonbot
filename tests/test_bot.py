@@ -117,6 +117,30 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(result["responses"], [("123", "market snapshot")])
         provider.assert_called_once_with()
 
+    def test_malformed_search_results_are_filtered(self):
+        response = {
+            "web": {
+                "results": [
+                    None,
+                    "invalid row",
+                    {"title": "Valid", "url": "https://example.com", "description": "Snippet"},
+                    {"title": "Unsafe URL", "url": "javascript:alert(1)", "description": "Ignore"},
+                ]
+            }
+        }
+        with patch.object(bot, "BRAVE_SEARCH_API_KEY", "test-key"), patch.object(
+            bot, "_get_json", return_value=response
+        ):
+            result = bot.get_live_web_results("test query")
+        self.assertIn("Valid", result)
+        self.assertIn("https://example.com", result)
+        self.assertNotIn("javascript:", result)
+
+    def test_malformed_market_payload_returns_no_prices(self):
+        with patch.object(bot, "_get_json", return_value={"data": "invalid", "meta": []}):
+            result = bot.get_live_market_prices()
+        self.assertIn("دادهٔ قابل‌استفاده نداد", result)
+
     def test_cleanup_removes_expired_weather_states(self):
         bot.db_set_state("weather_pending_expired", "0")
         bot.db_set_state("weather_pending_active", str(int(time.time()) + 300))

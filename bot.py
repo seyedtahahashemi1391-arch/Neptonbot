@@ -49,7 +49,7 @@ LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.1"
+VERSION = "3.3.2"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -1572,6 +1572,10 @@ def soroush_request(method, payload=None):
 
     with response:
         status = response.status_code
+        # A 409 from getUpdates commonly means two instances briefly polled
+        # during a rolling deploy. Treat it as a transient polling conflict.
+        if status == 409 and method == "getUpdates":
+            raise TransientAPIError("Soroush getUpdates polling conflict (HTTP 409)")
         if status == 429 or status >= 500 or status in (408, 425):
             retry_after = None
             try:

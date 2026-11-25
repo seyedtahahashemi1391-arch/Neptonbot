@@ -1128,26 +1128,23 @@ def _get_json(url, *, params=None, headers=None):
 
 
 def get_live_weather(user_text):
-    """Return compact current/forecast data from Open-Meteo; no API key required."""
+    """Return a concise weather summary with only useful conditions."""
     place = _weather_location(user_text)
     if not place:
-        return (
-            "درخواست آب‌وهوا تشخیص داده شد، اما شهر یا منطقه مشخص نیست. "
-            "برای اطلاعات زنده باید از کاربر نام شهر را بپرسی."
-        )
+        return "نام شهر را بفرست تا وضعیت هوا را بگویم."
     geo = _get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
         params={"name": place, "count": 1, "language": "fa", "format": "json", "countryCode": "IR"},
     )
     results = geo.get("results") if isinstance(geo, dict) else None
     if not results:
-        return f"مکان «{place}» در سرویس هواشناسی پیدا نشد؛ از کاربر بخواه نام شهر/کشور را دقیق‌تر کند."
+        return f"شهر «{place}» پیدا نشد؛ نام شهر را دقیق‌تر بفرست."
     loc = results[0]
     forecast = _get_json(
         "https://api.open-meteo.com/v1/forecast",
         params={
             "latitude": loc["latitude"], "longitude": loc["longitude"],
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,is_day,precipitation,weather_code,wind_speed_10m",
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
             "temperature_unit": "celsius",
             "wind_speed_unit": "kmh",
@@ -1157,22 +1154,18 @@ def get_live_weather(user_text):
     )
     current = forecast.get("current", {})
     daily = forecast.get("daily", {})
+    city = loc.get("name", place)
+    country = loc.get("country", "")
     return (
-        "گزارش هواشناسی بر پایهٔ برآورد مدل Open-Meteo\n"
-        f"مکان: {loc.get('name', place)}, {loc.get('country', '')}\n"
-        f"زمان داده: {current.get('time', 'نامشخص')} ({forecast.get('timezone', 'زمان محلی')})\n"
-        f"دمای هوای برآوردی: {current.get('temperature_2m', 'نامشخص')}°C\n"
-        f"دمای احساسیِ محاسبه‌شده: {current.get('apparent_temperature', 'نامشخص')}°C\n"
-        f"رطوبت: {current.get('relative_humidity_2m', 'نامشخص')}٪؛ "
-        f"باد: {current.get('wind_speed_10m', 'نامشخص')} km/h؛ "
-        f"بارش فعلی: {current.get('precipitation', 'نامشخص')} mm\n"
-        f"امروز: کمینه {daily.get('temperature_2m_min', ['نامشخص'])[0]}°C، "
-        f"بیشینه {daily.get('temperature_2m_max', ['نامشخص'])[0]}°C، "
-        f"احتمال بیشینه بارش {daily.get('precipitation_probability_max', ['نامشخص'])[0]}٪\n"
-        "نکته: دمای هوا و دمای احساسی دو شاخص متفاوت‌اند؛ این داده‌ها برآورد مدل‌اند، نه اندازه‌گیری مستقیم دماسنج محلی.\n"
-        "منبع: https://open-meteo.com/"
+        f"🌦 هواشناسی {city}{', ' + country if country else ''}\n"
+        f"اکنون: {current.get('temperature_2m', '—')}°C"
+        f" (احساسی: {current.get('apparent_temperature', '—')}°C)\n"
+        f"امروز: {daily.get('temperature_2m_min', ['—'])[0]}° تا "
+        f"{daily.get('temperature_2m_max', ['—'])[0]}°C\n"
+        f"احتمال بارش: {daily.get('precipitation_probability_max', ['—'])[0]}٪؛ "
+        f"باد: {current.get('wind_speed_10m', '—')} km/h؛ "
+        f"رطوبت: {current.get('relative_humidity_2m', '—')}٪"
     )
-
 
 def get_live_web_results(query):
     """Use Brave Search API when configured; never fabricate search results."""

@@ -1513,7 +1513,7 @@ def soroush_request(method, payload=None):
                     f"Soroush API temporary rejection: {method}",
                     retry_after=retry_after,
                 )
-            raise PermanentAPIError(f"Soroush API rejected {method}")
+            raise PermanentAPIError(f"Soroush API rejected {method} (code={code if code is not None else 'unknown'})")
         if data.get("error"):
             raise PermanentAPIError(f"Soroush API returned an error: {method}")
     return data
@@ -2227,7 +2227,7 @@ def polling_loop():
             backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
         except PermanentAPIError as exc:
             _record_poll_error(exc)
-            logger.error("Polling request rejected type=%s", type(exc).__name__)
+            logger.error("Polling request rejected type=%s reason=%s", type(exc).__name__, str(exc)[:180])
             _polling_stop.wait(backoff)
             backoff = min(backoff * 2, POLL_ERROR_BACKOFF_MAX)
         except Exception as exc:

@@ -2412,9 +2412,23 @@ def build_response_plan(chat_id, text):
         try:
             voice_meta = json.loads(text[len(VOICE_MEDIA_PREFIX):])
             transcript = transcribe_soroush_voice(voice_meta)
-            if is_music_search_request(transcript):
-                music_result = search_music_links(transcript)
-                response_text = music_result
+
+            # A voice sent after tapping the music button is a music-search query
+            # even when the transcript contains only a song title or artist name.
+            music_state_key = f"music_search_pending_{chat_id}"
+            music_pending_until = db_get_state(music_state_key)
+            music_pending_active = False
+            if music_pending_until is not None:
+                try:
+                    music_pending_active = int(music_pending_until) > int(time.time())
+                except (TypeError, ValueError):
+                    music_pending_active = False
+
+            if music_pending_active:
+                db_delete_state(music_state_key)
+                response_text = search_music_links(transcript)
+            elif is_music_search_request(transcript):
+                response_text = search_music_links(transcript)
             else:
                 response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
         except UserVisibleError as exc:

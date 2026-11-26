@@ -58,7 +58,7 @@ VOICE_MAX_BYTES = 8 * 1024 * 1024
 MUSIC_MAX_BYTES = 12 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.14"
+VERSION = "3.3.15"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"

@@ -1189,8 +1189,9 @@ def _release_runtime_lock():
         return
     try:
         if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)    except OSError:
-        logger.warning("Could not release runtime lock cleanly")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            logger.warning("Could not release runtime lock cleanly")
     finally:
         try:
             handle.close()

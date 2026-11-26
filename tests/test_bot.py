@@ -46,6 +46,38 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot._weather_location("هواشناسی کاشمر"), "کاشمر")
         self.assertEqual(bot._weather_location("هوا در مشهد چطوره؟"), "مشهد")
 
+    def test_weather_geocoding_retries_without_strict_country_filter(self):
+        geo_fallback = {
+            "results": [{
+                "name": "Bushehr",
+                "country": "Iran",
+                "country_code": "IR",
+                "latitude": 28.9684,
+                "longitude": 50.8385,
+            }]
+        }
+        forecast = {
+            "current": {
+                "temperature_2m": 25,
+                "apparent_temperature": 26,
+                "relative_humidity_2m": 60,
+                "wind_speed_10m": 12,
+                "time": "2026-11-26T09:00",
+            },
+            "daily": {
+                "temperature_2m_min": [20],
+                "temperature_2m_max": [28],
+                "precipitation_probability_max": [0],
+            },
+        }
+        with patch.object(bot, "_get_json", side_effect=[{"results": []}, geo_fallback, forecast]) as provider:
+            result = bot.get_live_weather("هواشناسی بوشهر")
+
+        self.assertIn("Bushehr", result)
+        self.assertIn("25°C", result)
+        self.assertEqual(provider.call_count, 3)
+        self.assertNotIn("countryCode", provider.call_args_list[1].kwargs.get("params", {}))
+
     def test_split_message_preserves_content_and_limit(self):
         source = "آزمون پیام " * 500
         chunks = bot.split_message(source, limit=120)

@@ -68,7 +68,7 @@ DB_PATH = os.path.expanduser(os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3")
 
 AI_TIMEOUT = (
     _env_int("NEPTON_AI_CONNECT_TIMEOUT", 15, 5, 30),
-    _env_int("NEPTON_AI_READ_TIMEOUT", 120, 20, 180),
+    _env_int("NEPTON_AI_READ_TIMEOUT", 35, 20, 90),
 )
 SOROUSH_TIMEOUT = (
     _env_int("NEPTON_API_CONNECT_TIMEOUT", 8, 3, 20),
@@ -76,7 +76,10 @@ SOROUSH_TIMEOUT = (
 )
 MAX_HISTORY_MESSAGES = 10
 MAX_CONTEXT_CHARS = _env_int("NEPTON_MAX_CONTEXT_CHARS", 6000, 1500, 20000)
-MAX_COMPLETION_TOKENS = _env_int("NEPTON_MAX_COMPLETION_TOKENS", 1536, 256, 2048)
+MAX_COMPLETION_TOKENS = _env_int("NEPTON_MAX_COMPLETION_TOKENS", 768, 256, 2048)
+LONG_COMPLETION_TOKENS = _env_int(
+    "NEPTON_LONG_COMPLETION_TOKENS", 1536, MAX_COMPLETION_TOKENS, 2048
+)
 MAX_CONVERSATIONS = 500
 HISTORY_RETENTION_DAYS = 30
 MAX_MESSAGE_LENGTH = 3500
@@ -1388,8 +1391,14 @@ def cloudflare_post_with_retry(session, payload):
             timeout=AI_TIMEOUT,
             allow_redirects=False,
         )
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-        raise TransientAPIError("Cloudflare transport failure") from None
+    except requests.exceptions.Timeout:
+        # Do not keep a user message stuck through repeated long provider timeouts.
+        raise UserVisibleError(
+            "پاسخ سرویس هوش مصنوعی این بار بیش از حد طول کشید. "
+            "لطفاً کمی بعد دوباره پیام بده."
+        ) from None
+    except requests.exceptions.ConnectionError:
+        raise TransientAPIError("Cloudflare connection failure") from None
     except requests.exceptions.RequestException:
         raise TransientAPIError("Cloudflare request failure") from None
 
@@ -1780,6 +1789,22 @@ def _chamran_40_line_essay():
     return "\n".join(lines)
 
 
+def completion_token_budget(user_text):
+    """Keep ordinary replies brisk while preserving room for explicitly long tasks."""
+    text = str(user_text or "")
+    long_request = (
+        len(text) >= 450
+        or re.search(
+            r"(?:کامل|جامع|مفصل|با جزئیات|مرحله\s*به\s*مرحله|انشا|مقاله|تحقیق|"
+            r"کد|برنامه(?:\s*نویسی)?|فایل|مقایسه|بررسی جامع|گزارش|طولانی|"
+            r"comprehensive|in detail|step by step|full code|long form)",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    return LONG_COMPLETION_TOKENS if long_request else MAX_COMPLETION_TOKENS
+
+
 def call_ai(chat_id, user_text):
     if _is_chamran_40_line_essay_request(user_text):
         logger.info("Using reviewed deterministic 40-line essay for Shahid Chamran request")
@@ -1841,7 +1866,7 @@ def call_ai(chat_id, user_text):
         "model": MODEL,
         "messages": messages,
         "temperature": 0.25,
-        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        "max_completion_tokens": completion_token_budget(user_text),
         "chat_template_kwargs": {"enable_thinking": False},
         "stream": False,
     }

@@ -1917,6 +1917,32 @@ def send_one_message(chat_id, text, reply_markup=None):
     return True
 
 
+def is_music_search_request(text):
+    normalized = normalize_text(text)
+    markers = (
+        "اهنگ", "موزیک", "ترانه", "خواننده", "اسم این اهنگ",
+        "پیدا کن", "پیداش کن", "لینک اهنگ", "لینک موزیک",
+        "پخش کن", "بفرست اهنگ", "بفرست موزیک",
+    )
+    return any(marker in normalized for marker in markers)
+
+
+def search_music_links(request_text):
+    """Return source links for a requested track; never download or redistribute copyrighted audio."""
+    if not BRAVE_SEARCH_API_KEY:
+        return (
+            "درخواست آهنگ تشخیص داده شد، اما جست‌وجوی لینک هنوز پیکربندی نشده است. "
+            "مدیر باید BRAVE_SEARCH_API_KEY را در تنظیمات سرویس ثبت کند."
+        )
+    query = request_text[:300] + " official audio YouTube Spotify"
+    try:
+        results = get_live_web_results(query)
+    except Exception:
+        logger.exception("Music link search failed")
+        return "جست‌وجوی آهنگ موقتاً ناموفق شد؛ لطفاً دوباره ویس بفرست."
+    return "🎵 برای درخواستت این نتایج پیدا شد:\n" + results
+
+
 def transcribe_soroush_voice(metadata):
     """Download a Soroush voice/audio attachment and transcribe it with Cloudflare Whisper."""
     file_id = metadata.get("file_id") if isinstance(metadata, dict) else None
@@ -2261,13 +2287,18 @@ def build_response_plan(chat_id, text):
         try:
             voice_meta = json.loads(text[len(VOICE_MEDIA_PREFIX):])
             transcript = transcribe_soroush_voice(voice_meta)
+            if is_music_search_request(transcript):
+                music_result = search_music_links(transcript)
+                response_text = music_result
+            else:
+                response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
         except UserVisibleError as exc:
-            transcript = str(exc)
+            response_text = str(exc)
         except Exception:
             logger.exception("Voice transcription failed")
-            transcript = "پردازش ویس ناموفق شد؛ لطفاً دوباره بفرست."
+            response_text = "پردازش ویس ناموفق شد؛ لطفاً دوباره بفرست."
         return {
-            "responses": [(chat_id, f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}")],
+            "responses": [(chat_id, response_text)],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }

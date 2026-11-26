@@ -2451,7 +2451,7 @@ def build_response_plan(chat_id, text):
     if text == MUSIC_BUTTON_TEXT:
         db_set_state(music_state_key, str(int(time.time()) + 300))
         return {
-            "responses": [(chat_id, "اسم آهنگ یا خواننده را بفرست؛ می‌تونی سبک یا بخشی از نام آهنگ رو هم بنویسی.\\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعاله.")],
+            "responses": [(chat_id, "ویسِ اسم آهنگ یا خواننده را بفرست؛ می‌تونی نام آهنگ را هم تایپ کنی یا سبک/بخشی از نامش را بنویسی.\\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعاله.")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }

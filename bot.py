@@ -1398,7 +1398,8 @@ def _needs_web_search(text):
 
 
 def _weather_location(text):    """Extract a city from common Persian and English weather questions."""
-    cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")    cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
+    cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")
+    cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
     cleaned = re.sub(r"\s+", " ", cleaned)
 
     # First handle explicit constructions such as «هوا در کاشمر چطوره؟».
@@ -2096,7 +2097,9 @@ def transcribe_soroush_voice(metadata):
                 except ValueError:
                     pass
             audio = bytearray()
-            for chunk in response.iter_content(chunk_size=65536):                if chunk:                    audio.extend(chunk)
+            for chunk in response.iter_content(chunk_size=65536):
+                if chunk:
+                    audio.extend(chunk)
                     if len(audio) > VOICE_MAX_BYTES:
                         raise UserVisibleError("ویس بیش از حد مجاز است؛ لطفاً یک ویس کوتاه‌تر بفرست.")
     except UserVisibleError:
@@ -2804,7 +2807,8 @@ def chat_worker():
     logger.info("Worker stopped id=%s", worker_id)
 
 
-def _start_or_replace_workers():    global _worker_threads
+def _start_or_replace_workers():
+    global _worker_threads
     with _service_lock:
         _worker_threads = [worker for worker in _worker_threads if worker.is_alive()]
         missing = max(0, MAX_PARALLEL_CHATS - len(_worker_threads))
@@ -2829,7 +2833,8 @@ def prepare_update_batch(updates):
 
     for update in updates:
         update_id = get_update_id(update)
-        if update_id is not None:            last_update_id = (
+        if update_id is not None:
+            last_update_id = (
                 update_id if last_update_id is None
                 else max(last_update_id, update_id)
             )

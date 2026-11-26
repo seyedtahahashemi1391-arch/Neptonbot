@@ -2426,8 +2426,16 @@ def build_response_plan(chat_id, text):
 
             if music_pending_active:
                 db_delete_state(music_state_key)
+                db_set_state(
+                    f"music_last_query_{chat_id}",
+                    json.dumps({"query": transcript[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
+                )
                 response_text = search_music_links(transcript)
             elif is_music_search_request(transcript):
+                db_set_state(
+                    f"music_last_query_{chat_id}",
+                    json.dumps({"query": transcript[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
+                )
                 response_text = search_music_links(transcript)
             else:
                 response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
@@ -2448,6 +2456,30 @@ def build_response_plan(chat_id, text):
         }
 
     music_state_key = f"music_search_pending_{chat_id}"
+    followup_search_phrases = {
+        "خب جستجو کن", "جستجو کن", "پس جستجو کن", "خب بگرد", "بگرد",
+        "ادامه بده", "پیداش کن", "همون رو جستجو کن", "همونو جستجو کن",
+    }
+    if normalize_text(text) in {normalize_text(item) for item in followup_search_phrases}:
+        last_query_raw = db_get_state(f"music_last_query_{chat_id}")
+        last_query = None
+        if last_query_raw:
+            try:
+                last_query_data = json.loads(last_query_raw)
+                if int(last_query_data.get("expires", 0)) > int(time.time()):
+                    last_query = str(last_query_data.get("query") or "").strip()
+            except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
+                last_query = None
+        if last_query:
+            result = search_music_links(last_query)
+        else:
+            result = "برای جست‌وجو، لطفاً اسم آهنگ یا خواننده را بفرست یا دکمهٔ «🎵 جست‌وجوی موزیک» را بزن."
+        return {
+            "responses": [(chat_id, result)],
+            "history_user": None, "history_assistant": None,
+            "clear_history": False, "feedback_action": None,
+        }
+
     if text == MUSIC_BUTTON_TEXT:
         db_set_state(music_state_key, str(int(time.time()) + 300))
         return {
@@ -2464,6 +2496,10 @@ def build_response_plan(chat_id, text):
             music_pending_active = False
         if music_pending_active and not text.startswith("/"):
             db_delete_state(music_state_key)
+            db_set_state(
+                f"music_last_query_{chat_id}",
+                json.dumps({"query": text[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
+            )
             result = search_music_links(text)
             return {
                 "responses": [(chat_id, result)],
@@ -2475,6 +2511,10 @@ def build_response_plan(chat_id, text):
 
     # Route explicit typed music requests to music search instead of the general AI.
     if is_music_search_request(text):
+        db_set_state(
+            f"music_last_query_{chat_id}",
+            json.dumps({"query": text[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
+        )
         result = search_music_links(text)
         return {
             "responses": [(chat_id, result)],

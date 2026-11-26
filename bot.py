@@ -58,7 +58,7 @@ VOICE_MAX_BYTES = 8 * 1024 * 1024
 MUSIC_MAX_BYTES = 12 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.12"
+VERSION = "3.3.13"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -110,6 +110,7 @@ FEEDBACK_COMMAND = "/feedback"
 FEEDBACK_CANCEL_COMMAND = "/cancel"
 FEEDBACK_COMMAND_DESCRIPTION = "ارسال نظر"
 FEEDBACK_TRIGGER_TEXT = "ارسال نظر"
+MUSIC_BUTTON_TEXT = "🎵 جست‌وجوی موزیک"
 
 START_MESSAGE = (
     "╭━━━━━━━━━━━━━━━━━━╮\n"
@@ -119,6 +120,7 @@ START_MESSAGE = (
     "من دستیار هوشمند نپتونم؛ سؤال یا درخواستت رو همین‌جا بنویس.\n\n"
     "┌ راهنمای سریع\n"
     "│ 🌦 هواشناسی: دکمه را بزن و نام شهر را بفرست\n"
+    "│ 🎵 جست‌وجوی موزیک: دکمه را بزن و اسم آهنگ یا خواننده را بفرست\n"
     "│ اگر دکمه دیده نشد، /weather را بفرست\n"
     "│ 💬 گفت‌وگو: پیام خودت رو بفرست\n"
     "│ 🧠 /remember متن — ذخیره یادداشت اختیاری\n"
@@ -143,6 +145,7 @@ HELP_MESSAGE = (
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
     "✖ /cancel — لغو ارسال نظر یا هواشناسی\n"
     "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
+    "🎵 دکمهٔ جست‌وجوی موزیک — جست‌وجوی آهنگ و دریافت لینک شنیدن\n"
     "💰 /market — دریافت قیمت‌های بازار ایران\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
@@ -697,8 +700,7 @@ def _worker_id():
 
 def db_claim_next_message(worker_id):
     """Claim one eligible row atomically; later messages in a chat remain ordered."""
-    global _last_lease_sweep
-    now = time.time()
+    global _last_lease_sweep    now = time.time()
     monotonic_now = time.monotonic()
 
     if monotonic_now - _last_lease_sweep >= LEASE_SWEEP_INTERVAL:
@@ -1397,8 +1399,7 @@ def _needs_web_search(text):
 
 def _weather_location(text):
     """Extract a city from common Persian and English weather questions."""
-    cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")
-    cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
+    cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")    cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
     cleaned = re.sub(r"\s+", " ", cleaned)
 
     # First handle explicit constructions such as «هوا در کاشمر چطوره؟».
@@ -2097,8 +2098,7 @@ def transcribe_soroush_voice(metadata):
                     pass
             audio = bytearray()
             for chunk in response.iter_content(chunk_size=65536):
-                if chunk:
-                    audio.extend(chunk)
+                if chunk:                    audio.extend(chunk)
                     if len(audio) > VOICE_MAX_BYTES:
                         raise UserVisibleError("ویس بیش از حد مجاز است؛ لطفاً یک ویس کوتاه‌تر بفرست.")
     except UserVisibleError:
@@ -2431,6 +2431,32 @@ def build_response_plan(chat_id, text):
             "clear_history": False, "feedback_action": None,
         }
 
+    music_state_key = f"music_search_pending_{chat_id}"
+    if text == MUSIC_BUTTON_TEXT:
+        db_set_state(music_state_key, str(int(time.time()) + 300))
+        return {
+            "responses": [(chat_id, "اسم آهنگ یا خواننده را بفرست؛ می‌تونی سبک یا بخشی از نام آهنگ رو هم بنویسی.\\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعاله.")],
+            "history_user": None, "history_assistant": None,
+            "clear_history": False, "feedback_action": None,
+        }
+
+    music_pending_until = db_get_state(music_state_key)
+    if music_pending_until is not None:
+        try:
+            music_pending_active = int(music_pending_until) > int(time.time())
+        except (TypeError, ValueError):
+            music_pending_active = False
+        if music_pending_active and not text.startswith("/"):
+            db_delete_state(music_state_key)
+            result = search_music_links(text)
+            return {
+                "responses": [(chat_id, result)],
+                "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+        if not music_pending_active or text.startswith("/"):
+            db_delete_state(music_state_key)
+
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
     weather_state_key = f"weather_pending_{chat_id}"
     weather_pending_until = db_get_state(weather_state_key)
@@ -2577,7 +2603,7 @@ def build_response_plan(chat_id, text):
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
             "reply_markup": {
-                "keyboard": [[{"text": "🌦 هواشناسی"}], [{"text": "💰 قیمت بازار"}]],
+                "keyboard": [[{"text": "🌦 هواشناسی"}, {"text": "💰 قیمت بازار"}], [{"text": MUSIC_BUTTON_TEXT}]],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
             } if command == "/start" else None,
@@ -2797,8 +2823,7 @@ def prepare_update_batch(updates):
 
     for update in updates:
         update_id = get_update_id(update)
-        if update_id is not None:
-            last_update_id = (
+        if update_id is not None:            last_update_id = (
                 update_id if last_update_id is None
                 else max(last_update_id, update_id)
             )

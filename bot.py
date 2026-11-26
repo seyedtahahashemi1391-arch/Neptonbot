@@ -58,7 +58,7 @@ VOICE_MAX_BYTES = 8 * 1024 * 1024
 MUSIC_MAX_BYTES = 12 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.11"
+VERSION = "3.3.12"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -2014,7 +2014,7 @@ def is_music_search_request(text):
 
 
 def search_music_links(request_text):
-    """Search Jamendo and return a media marker only for explicitly downloadable tracks."""
+    """Search broadly for official listening links; only deliver files explicitly licensed for download."""
     if JAMENDO_CLIENT_ID:
         try:
             response = get_http_session("music_session").get(
@@ -2055,16 +2055,16 @@ def search_music_links(request_text):
 
     if not BRAVE_SEARCH_API_KEY:
         return (
-            "در Jamendo آهنگِ قابل‌ارسال پیدا نشد یا اتصال آن پیکربندی نشده است؛ "
-            "فعلاً لینک جست‌وجوی جایگزین فعال نیست."
+            "برای جست‌وجوی گستردهٔ آهنگ‌ها، مدیر ربات باید کلید BRAVE_SEARCH_API_KEY را "
+            "در تنظیمات محیطی Render ثبت کند. بدون آن، فقط فایل‌های مجاز Jamendo قابل‌جست‌وجو هستند."
         )
     try:
-        results = get_live_web_results(request_text[:300] + " official audio")
+        query = request_text[:250] + " official song listen YouTube Spotify"
+        results = get_live_web_results(query)
     except Exception:
         logger.exception("Music link search failed")
         return "جست‌وجوی آهنگ موقتاً ناموفق شد؛ لطفاً دوباره ویس بفرست."
-    return "🎵 لینک‌های پیدا‌شده:\n" + results
-
+    return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + results
 
 def transcribe_soroush_voice(metadata):
     """Download a Soroush voice/audio attachment and transcribe it with Cloudflare Whisper."""

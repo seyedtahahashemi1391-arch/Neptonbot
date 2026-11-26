@@ -1187,16 +1187,15 @@ def _release_runtime_lock():
 
     if handle is None:
         return
-    try:
-        if fcntl is not None:
+    if fcntl is not None:
+        try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         except OSError:
             logger.warning("Could not release runtime lock cleanly")
-    finally:
-        try:
-            handle.close()
-        except OSError:
-            pass
+    try:
+        handle.close()
+    except OSError:
+        pass
 
 
 def release_runtime_lease_for_process(process_id):

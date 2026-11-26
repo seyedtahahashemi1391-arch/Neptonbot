@@ -1720,7 +1720,7 @@ def _normalize_persian_digits(value):
 def _is_chamran_40_line_essay_request(user_text):
     normalized = _normalize_persian_digits(user_text).lower()
     asks_essay = any(token in normalized for token in ("انشا", "essay", "مقاله"))
-    asks_40_lines = bool(re.search(r"(?:40|چهل)\\s*(?:خط|line)", normalized))
+    asks_40_lines = bool(re.search(r"(?:40|چهل)\s*(?:خط|line)", normalized))
     mentions_chamran = "چمران" in normalized
     return asks_essay and asks_40_lines and mentions_chamran
 

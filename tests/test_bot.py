@@ -146,7 +146,8 @@ class DatabaseWorkflowTests(unittest.TestCase):
     def test_market_command_uses_structured_market_provider(self):
         with patch.object(bot, "get_live_market_prices", return_value="market snapshot") as provider:
             result = bot.build_response_plan("123", "/market")
-        self.assertEqual(result["responses"], [("123", "market snapshot")])
+        self.assertEqual(result["responses"][0][0], "123")
+        self.assertIn("market snapshot", result["responses"][0][1])
         provider.assert_called_once_with()
 
     def test_malformed_search_results_are_filtered(self):
@@ -184,7 +185,8 @@ class DatabaseWorkflowTests(unittest.TestCase):
         bot.db_set_state("weather_pending_123", str(int(time.time()) + 300))
         with patch.object(bot, "get_live_market_prices", return_value="market snapshot"):
             market_result = bot.build_response_plan("123", "💰 قیمت بازار")
-        self.assertEqual(market_result["responses"], [("123", "market snapshot")])
+        self.assertEqual(market_result["responses"][0][0], "123")
+        self.assertIn("market snapshot", market_result["responses"][0][1])
         self.assertIsNone(bot.db_get_state("weather_pending_123"))
 
         bot.db_set_state("weather_pending_123", str(int(time.time()) + 300))

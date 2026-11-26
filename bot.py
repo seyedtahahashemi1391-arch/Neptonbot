@@ -397,8 +397,7 @@ def init_database():
                 db.execute("PRAGMA wal_autocheckpoint = 1000")
 
             db.execute("""
-                CREATE TABLE IF NOT EXISTS message_queue (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                CREATE TABLE IF NOT EXISTS message_queue (                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     update_id INTEGER,
                     chat_id TEXT NOT NULL,
                     message_text TEXT NOT NULL,
@@ -797,8 +796,7 @@ def db_advance_response(message_id, worker_id, expected_index):
         changed = db.execute("""
             UPDATE message_queue
             SET response_index = response_index + 1,
-                lease_until = ?
-            WHERE id = ?
+                lease_until = ?            WHERE id = ?
               AND status = 'processing'
               AND locked_by = ?
               AND response_index = ?
@@ -1197,8 +1195,7 @@ def _release_runtime_lock():
         return
     try:
         if fcntl is not None:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except OSError:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)    except OSError:
         logger.warning("Could not release runtime lock cleanly")
     finally:
         try:
@@ -1597,8 +1594,7 @@ def _fa_number(value):
 
 def get_live_market_prices():
     """Fetch published Iranian market snapshots and show their actual update time."""
-    payload = _get_json(MARKET_DATA_URL)
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    payload = _get_json(MARKET_DATA_URL)    rows = payload.get("data", []) if isinstance(payload, dict) else []
     if not isinstance(rows, list):
         rows = []
     by_symbol = {row.get("symbol"): row for row in rows if isinstance(row, dict)}
@@ -1997,8 +1993,7 @@ def send_one_message(chat_id, text, reply_markup=None):
             if isinstance(media, dict) and media.get("source_url"):
                 text += "\nلینک رسمی: " + str(media["source_url"])
     payload = {"chat_id": str(chat_id), "text": text}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup
+    if reply_markup is not None:        payload["reply_markup"] = reply_markup
     result = soroush_request("sendMessage", payload)
     if not api_result_is_success(result):
         raise RetryableDeliveryError("Soroush did not confirm sendMessage success")
@@ -2016,7 +2011,51 @@ def is_music_search_request(text):
 
 
 def search_music_links(request_text):
-    """Search broadly for official listening links; only deliver files explicitly licensed for download."""
+    """Search Apple music storefront catalogs first; fall back to licensed Jamendo tracks."""
+    formatted = []
+    seen = set()
+    # Search multiple storefronts: UAE/UK/US catalog coverage, not US-only.
+    # Keep the user's query intact so Persian and funk searches remain specific.
+    for country in ("ae", "gb", "us"):
+        try:
+            response = get_http_session("music_session").get(
+                "https://itunes.apple.com/search",
+                params={
+                    "term": request_text[:250],
+                    "media": "music",
+                    "entity": "song",
+                    "limit": 5,
+                    "country": country,
+                },
+                timeout=LIVE_INFO_TIMEOUT,
+            )
+            with response:
+                response.raise_for_status()
+                payload = response.json()
+            rows = payload.get("results", []) if isinstance(payload, dict) else []
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("trackName") or "").strip()
+                artist = str(row.get("artistName") or "").strip()
+                url = str(row.get("trackViewUrl") or "").strip()
+                key = (title.casefold(), artist.casefold())
+                if title and artist and url.startswith("https://") and key not in seen:
+                    seen.add(key)
+                    formatted.append(f"• {title} — {artist}\\n{url}")
+                if len(formatted) >= 8:
+                    break
+            if len(formatted) >= 8:
+                break
+        except Exception:
+            logger.exception("Apple music catalog search failed storefront=%s", country)
+
+    if formatted:
+        return "🎵 نتیجه‌های جست‌وجوی کاتالوگ موسیقی (چند فروشگاه):\\n" + "\\n\\n".join(formatted)
+
+    # Jamendo is a fallback only; its catalog is not a reliable source for Iranian hits.
     if JAMENDO_CLIENT_ID:
         try:
             response = get_http_session("music_session").get(
@@ -2055,55 +2094,18 @@ def search_music_links(request_text):
         except Exception:
             logger.exception("Jamendo track search failed")
 
-    # Apple provides a public catalog search endpoint that does not require a paid API key.
-    # Return only catalog-backed results; never pretend this is a general web search.
-    try:
-        response = get_http_session("music_session").get(
-            "https://itunes.apple.com/search",
-            params={
-                "term": request_text[:250],
-                "media": "music",
-                "entity": "song",
-                "limit": 5,
-                "country": "us",
-            },
-            timeout=LIVE_INFO_TIMEOUT,
-        )
-        with response:
-            response.raise_for_status()
-            payload = response.json()
-        rows = payload.get("results", []) if isinstance(payload, dict) else []
-        formatted = []
-        if isinstance(rows, list):
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                title = str(row.get("trackName") or "").strip()
-                artist = str(row.get("artistName") or "").strip()
-                url = str(row.get("trackViewUrl") or "").strip()
-                if title and artist and url.startswith("https://"):
-                    formatted.append(f"• {title} — {artist}\\n{url}")
-                if len(formatted) >= 5:
-                    break
-        if formatted:
-            return "🎵 نتیجه‌های کاتالوگ موسیقی اپل (جست‌وجوی رایگان):\\n" + "\\n\\n".join(formatted)
-        if BRAVE_SEARCH_API_KEY:
-            query = request_text[:250] + " official song listen YouTube Spotify"
-            results = get_live_web_results(query)
-            return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + results
-        return (
-            "در کاتالوگ موسیقی اپل نتیجه‌ای پیدا نشد و جست‌وجوی عمومی وب هم فعال نیست. "
-            "می‌تونی اسم دقیق‌تر آهنگ یا خواننده را بفرستی."
-        )
-    except Exception:
-        logger.exception("Free music catalog search failed")
-        if BRAVE_SEARCH_API_KEY:
-            try:
-                query = request_text[:250] + " official song listen YouTube Spotify"
-                return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + get_live_web_results(query)
-            except Exception:
-                logger.exception("Music link search failed")
-        return "جست‌وجوی کاتالوگ موسیقی موقتاً ناموفق شد؛ لطفاً کمی بعد دوباره تلاش کن."
+    if BRAVE_SEARCH_API_KEY:
+        try:
+            query = request_text[:250] + " official listening link"
+            return "🎵 نتیجه‌های جست‌وجوی آهنگ:\\n" + get_live_web_results(query)
+        except Exception:
+            logger.exception("Music web search failed")
+    return (
+        "در کاتالوگ‌های موسیقی نتیجه‌ای پیدا نشد. "
+        "اسم دقیق‌تر آهنگ یا خواننده را بفرست؛ برای سبک فانک هم می‌توانی «funk» را به عبارت اضافه کنی."
+    )
+
+
 def transcribe_soroush_voice(metadata):
     """Download a Soroush voice/audio attachment and transcribe it with Cloudflare Whisper."""
     file_id = metadata.get("file_id") if isinstance(metadata, dict) else None
@@ -2397,8 +2399,7 @@ def process_feedback_message(chat_id, text):
 
     if not stripped:
         return {
-            "responses": [(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")],
-            "feedback_action": None,
+            "responses": [(chat_id, "متن نظر خالی است؛ لطفاً دوباره بفرست.")],            "feedback_action": None,
         }
 
     if len(stripped) > MAX_MESSAGE_LENGTH:
@@ -2797,8 +2798,7 @@ def _process_claimed_item_impl(item, worker_id):
         if not saved:
             raise RuntimeError("Could not persist response plan or worker lease was lost")
         response_index = 0
-    else:
-        try:
+    else:        try:
             plan = json.loads(response_plan_raw)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("Stored response plan is invalid JSON") from exc

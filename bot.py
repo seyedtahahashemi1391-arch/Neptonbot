@@ -49,13 +49,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
-JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "").strip()
 LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 VOICE_MEDIA_PREFIX = "__NEPTON_VOICE__:"
-MUSIC_MEDIA_PREFIX = "__NEPTON_MUSIC__:"
 VOICE_MAX_BYTES = 8 * 1024 * 1024
-MUSIC_MAX_BYTES = 12 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
 VERSION = "3.3.15"
@@ -110,7 +107,6 @@ FEEDBACK_COMMAND = "/feedback"
 FEEDBACK_CANCEL_COMMAND = "/cancel"
 FEEDBACK_COMMAND_DESCRIPTION = "ارسال نظر"
 FEEDBACK_TRIGGER_TEXT = "ارسال نظر"
-MUSIC_BUTTON_TEXT = "🎵 جست‌وجوی موزیک"
 
 START_MESSAGE = (
     "╭━━━━━━━━━━━━━━━━━━╮\n"
@@ -120,7 +116,6 @@ START_MESSAGE = (
     "من دستیار هوشمند نپتونم؛ سؤال یا درخواستت رو همین‌جا بنویس.\n\n"
     "┌ راهنمای سریع\n"
     "│ 🌦 هواشناسی: دکمه را بزن و نام شهر را بفرست\n"
-    "│ 🎵 جست‌وجوی موزیک: دکمه را بزن و اسم آهنگ یا خواننده را بفرست\n"
     "│ اگر دکمه دیده نشد، /weather را بفرست\n"
     "│ 💬 گفت‌وگو: پیام خودت رو بفرست\n"
     "│ 🧠 /remember متن — ذخیره یادداشت اختیاری\n"
@@ -145,7 +140,6 @@ HELP_MESSAGE = (
     "💡 /feedback — ثبت نظر، پیشنهاد یا انتقاد\n"
     "✖ /cancel — لغو ارسال نظر یا هواشناسی\n"
     "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
-    "🎵 دکمهٔ جست‌وجوی موزیک — جست‌وجوی آهنگ و دریافت لینک شنیدن\n"
     "💰 /market — دریافت قیمت‌های بازار ایران\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
@@ -1906,204 +1900,15 @@ def split_message(text, limit=MAX_MESSAGE_LENGTH):
     return chunks
 
 
-def send_jamendo_audio(chat_id, media):
-    """Send only a Jamendo track whose API explicitly permits downloading."""
-    if not JAMENDO_CLIENT_ID:
-        raise UserVisibleError("ارسال فایل آهنگ از منبع مجاز پیکربندی نشده است.")
-
-    try:
-        response = get_http_session("music_session").get(
-            "https://api.jamendo.com/v3.0/tracks/file/",
-            params={
-                "client_id": JAMENDO_CLIENT_ID,
-                "id": str(media["track_id"]),
-                "action": "download",
-                "audioformat": "mp31",
-            },
-            timeout=LIVE_INFO_TIMEOUT,
-            stream=True,
-            allow_redirects=True,
-        )
-    except requests.exceptions.RequestException:
-        raise TransientAPIError("Jamendo download request failed") from None
-
-    with response:
-        if response.status_code != 200:
-            raise UserVisibleError("دانلود این آهنگ از منبع مجاز در دسترس نیست.")
-        final_host = (response.url.split("/", 3)[2] if "://" in response.url else "").lower()
-        if not (final_host == "jamendo.com" or final_host.endswith(".jamendo.com")):
-            raise UserVisibleError("مقصد دانلود آهنگ معتبر تشخیص داده نشد.")
-        length = response.headers.get("Content-Length")
-        if length:
-            try:
-                if int(length) > MUSIC_MAX_BYTES:
-                    raise UserVisibleError("حجم فایل از سقف ارسال ربات بیشتر است.")
-            except ValueError:
-                pass
-        audio = bytearray()
-        for chunk in response.iter_content(chunk_size=65536):
-            if chunk:
-                audio.extend(chunk)
-                if len(audio) > MUSIC_MAX_BYTES:
-                    raise UserVisibleError("حجم فایل از سقف ارسال ربات بیشتر است.")
-        content_type = response.headers.get("Content-Type", "").lower()
-        if not audio or ("audio" not in content_type and "octet-stream" not in content_type):
-            raise UserVisibleError("فایل دریافتی صوتی معتبر تشخیص داده نشد.")
-
-    title = str(media.get("title") or "آهنگ")[:150]
-    artist = str(media.get("artist") or "نامشخص")[:150]
-    caption = f"🎵 {title} — {artist}\nمنبع: {media['source_url']}"
-    if media.get("license_url"):
-        caption += f"\nمجوز: {media['license_url']}"
-    filename = re.sub(r"[^A-Za-z0-9._-]+", "_", title)[:80] or "track"
-    try:
-        response = get_http_session("soroush_session").post(
-            f"{SOROUSH_API}/sendAudio",
-            data={"chat_id": str(chat_id), "caption": caption[:900]},
-            files={"audio": (filename + ".mp3", bytes(audio), "audio/mpeg")},
-            timeout=(SOROUSH_TIMEOUT[0], max(SOROUSH_TIMEOUT[1], 60)),
-            allow_redirects=False,
-        )
-    except requests.exceptions.RequestException:
-        raise RetryableDeliveryError("Soroush sendAudio transport failure") from None
-    with response:
-        if response.status_code == 429 or response.status_code >= 500:
-            raise RetryableDeliveryError(f"Soroush sendAudio temporary failure ({response.status_code})")
-        if not 200 <= response.status_code < 300:
-            raise UserVisibleError("سروش ارسال فایل صوتی را نپذیرفت.")
-        try:
-            result = response.json()
-        except ValueError:
-            raise RetryableDeliveryError("Soroush sendAudio returned invalid JSON") from None
-    if not api_result_is_success(result):
-        raise RetryableDeliveryError("Soroush did not confirm sendAudio success")
-    return True
-
-
 def send_one_message(chat_id, text, reply_markup=None):
     if not isinstance(text, str) or not text:
         raise PermanentAPIError("Refusing to send an empty message")
-    if text.startswith(MUSIC_MEDIA_PREFIX):
-        try:
-            media = json.loads(text[len(MUSIC_MEDIA_PREFIX):])
-            return send_jamendo_audio(chat_id, media)
-        except UserVisibleError as exc:
-            media = locals().get("media", {})
-            text = str(exc)
-            if isinstance(media, dict) and media.get("source_url"):
-                text += "\nلینک رسمی: " + str(media["source_url"])
     payload = {"chat_id": str(chat_id), "text": text}
     if reply_markup is not None:        payload["reply_markup"] = reply_markup
     result = soroush_request("sendMessage", payload)
     if not api_result_is_success(result):
         raise RetryableDeliveryError("Soroush did not confirm sendMessage success")
     return True
-
-
-def is_music_search_request(text):
-    normalized = normalize_text(text)
-    markers = (
-        "اهنگ", "موزیک", "ترانه", "خواننده", "اسم این اهنگ",
-        "پیدا کن", "پیداش کن", "لینک اهنگ", "لینک موزیک",
-        "پخش کن", "بفرست اهنگ", "بفرست موزیک",
-    )
-    return any(marker in normalized for marker in markers)
-
-
-def search_music_links(request_text):
-    """Search Apple music storefront catalogs first; fall back to licensed Jamendo tracks."""
-    formatted = []
-    seen = set()
-    # Search multiple storefronts: UAE/UK/US catalog coverage, not US-only.
-    # Keep the user's query intact so Persian and funk searches remain specific.
-    for country in ("ae", "gb", "us"):
-        try:
-            response = get_http_session("music_session").get(
-                "https://itunes.apple.com/search",
-                params={
-                    "term": request_text[:250],
-                    "media": "music",
-                    "entity": "song",
-                    "limit": 5,
-                    "country": country,
-                },
-                timeout=LIVE_INFO_TIMEOUT,
-            )
-            with response:
-                response.raise_for_status()
-                payload = response.json()
-            rows = payload.get("results", []) if isinstance(payload, dict) else []
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                title = str(row.get("trackName") or "").strip()
-                artist = str(row.get("artistName") or "").strip()
-                url = str(row.get("trackViewUrl") or "").strip()
-                key = (title.casefold(), artist.casefold())
-                if title and artist and url.startswith("https://") and key not in seen:
-                    seen.add(key)
-                    formatted.append(f"• {title} — {artist}\\n{url}")
-                if len(formatted) >= 8:
-                    break
-            if len(formatted) >= 8:
-                break
-        except Exception:
-            logger.exception("Apple music catalog search failed storefront=%s", country)
-
-    if formatted:
-        return "🎵 نتیجه‌های جست‌وجوی کاتالوگ موسیقی (چند فروشگاه):\\n" + "\\n\\n".join(formatted)
-
-    # Jamendo is a fallback only; its catalog is not a reliable source for Iranian hits.
-    if JAMENDO_CLIENT_ID:
-        try:
-            response = get_http_session("music_session").get(
-                "https://api.jamendo.com/v3.0/tracks/",
-                params={
-                    "client_id": JAMENDO_CLIENT_ID,
-                    "format": "json",
-                    "search": request_text[:250],
-                    "limit": 5,
-                    "audiodlformat": "mp31",
-                    "track_type": "single albumtrack",
-                },
-                timeout=LIVE_INFO_TIMEOUT,
-            )
-            with response:
-                response.raise_for_status()
-                payload = response.json()
-            tracks = payload.get("results", []) if isinstance(payload, dict) else []
-            if isinstance(tracks, list):
-                for track in tracks:
-                    if not isinstance(track, dict) or track.get("audiodownload_allowed") is not True:
-                        continue
-                    track_id = track.get("id")
-                    title = str(track.get("name") or "").strip()
-                    artist = str(track.get("artist_name") or "").strip()
-                    source_url = str(track.get("shareurl") or "").strip()
-                    if not track_id or not title or not source_url.startswith("https://"):
-                        continue
-                    return MUSIC_MEDIA_PREFIX + json.dumps({
-                        "track_id": str(track_id),
-                        "title": title[:150],
-                        "artist": artist[:150] or "نامشخص",
-                        "source_url": source_url[:500],
-                        "license_url": str(track.get("license_ccurl") or "")[:300],
-                    }, ensure_ascii=False)
-        except Exception:
-            logger.exception("Jamendo track search failed")
-
-    if BRAVE_SEARCH_API_KEY:
-        try:
-            query = request_text[:250] + " official listening link"
-            return "🎵 نتیجه‌های جست‌وجوی آهنگ:\\n" + get_live_web_results(query)
-        except Exception:
-            logger.exception("Music web search failed")
-    return (
-        "در کاتالوگ‌های موسیقی نتیجه‌ای پیدا نشد. "
-        "اسم دقیق‌تر آهنگ یا خواننده را بفرست؛ برای سبک فانک هم می‌توانی «funk» را به عبارت اضافه کنی."
-    )
 
 
 def transcribe_soroush_voice(metadata):
@@ -2450,32 +2255,7 @@ def build_response_plan(chat_id, text):
             voice_meta = json.loads(text[len(VOICE_MEDIA_PREFIX):])
             transcript = transcribe_soroush_voice(voice_meta)
 
-            # A voice sent after tapping the music button is a music-search query
-            # even when the transcript contains only a song title or artist name.
-            music_state_key = f"music_search_pending_{chat_id}"
-            music_pending_until = db_get_state(music_state_key)
-            music_pending_active = False
-            if music_pending_until is not None:
-                try:
-                    music_pending_active = int(music_pending_until) > int(time.time())
-                except (TypeError, ValueError):
-                    music_pending_active = False
-
-            if music_pending_active:
-                db_delete_state(music_state_key)
-                db_set_state(
-                    f"music_last_query_{chat_id}",
-                    json.dumps({"query": transcript[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
-                )
-                response_text = search_music_links(transcript)
-            elif is_music_search_request(transcript):
-                db_set_state(
-                    f"music_last_query_{chat_id}",
-                    json.dumps({"query": transcript[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
-                )
-                response_text = search_music_links(transcript)
-            else:
-                response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
+            response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
         except UserVisibleError as exc:
             response_text = str(exc)
         except Exception:
@@ -2489,73 +2269,6 @@ def build_response_plan(chat_id, text):
     if not text:
         return {
             "responses": [], "history_user": None, "history_assistant": None,
-            "clear_history": False, "feedback_action": None,
-        }
-
-    music_state_key = f"music_search_pending_{chat_id}"
-    followup_search_phrases = {
-        "خب جستجو کن", "جستجو کن", "پس جستجو کن", "خب بگرد", "بگرد",
-        "ادامه بده", "پیداش کن", "همون رو جستجو کن", "همونو جستجو کن",
-    }
-    if normalize_text(text) in {normalize_text(item) for item in followup_search_phrases}:
-        last_query_raw = db_get_state(f"music_last_query_{chat_id}")
-        last_query = None
-        if last_query_raw:
-            try:
-                last_query_data = json.loads(last_query_raw)
-                if int(last_query_data.get("expires", 0)) > int(time.time()):
-                    last_query = str(last_query_data.get("query") or "").strip()
-            except (TypeError, ValueError, json.JSONDecodeError, AttributeError):
-                last_query = None
-        if last_query:
-            result = search_music_links(last_query)
-        else:
-            result = "برای جست‌وجو، لطفاً اسم آهنگ یا خواننده را بفرست یا دکمهٔ «🎵 جست‌وجوی موزیک» را بزن."
-        return {
-            "responses": [(chat_id, result)],
-            "history_user": None, "history_assistant": None,
-            "clear_history": False, "feedback_action": None,
-        }
-
-    if text == MUSIC_BUTTON_TEXT:
-        db_set_state(music_state_key, str(int(time.time()) + 300))
-        return {
-            "responses": [(chat_id, "ویسِ اسم آهنگ یا خواننده را بفرست؛ می‌تونی نام آهنگ را هم تایپ کنی یا سبک/بخشی از نامش را بنویسی.\\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعاله.")],
-            "history_user": None, "history_assistant": None,
-            "clear_history": False, "feedback_action": None,
-        }
-
-    music_pending_until = db_get_state(music_state_key)
-    if music_pending_until is not None:
-        try:
-            music_pending_active = int(music_pending_until) > int(time.time())
-        except (TypeError, ValueError):
-            music_pending_active = False
-        if music_pending_active and not text.startswith("/"):
-            db_delete_state(music_state_key)
-            db_set_state(
-                f"music_last_query_{chat_id}",
-                json.dumps({"query": text[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
-            )
-            result = search_music_links(text)
-            return {
-                "responses": [(chat_id, result)],
-                "history_user": None, "history_assistant": None,
-                "clear_history": False, "feedback_action": None,
-            }
-        if not music_pending_active or text.startswith("/"):
-            db_delete_state(music_state_key)
-
-    # Route explicit typed music requests to music search instead of the general AI.
-    if is_music_search_request(text):
-        db_set_state(
-            f"music_last_query_{chat_id}",
-            json.dumps({"query": text[:250], "expires": int(time.time()) + 900}, ensure_ascii=False),
-        )
-        result = search_music_links(text)
-        return {
-            "responses": [(chat_id, result)],
-            "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }
 
@@ -2705,7 +2418,7 @@ def build_response_plan(chat_id, text):
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
             "reply_markup": {
-                "keyboard": [[{"text": "🌦 هواشناسی"}, {"text": "💰 قیمت بازار"}], [{"text": MUSIC_BUTTON_TEXT}]],
+                "keyboard": [[{"text": "🌦 هواشناسی"}, {"text": "💰 قیمت بازار"}]],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
             } if command == "/start" else None,

@@ -2055,19 +2055,55 @@ def search_music_links(request_text):
         except Exception:
             logger.exception("Jamendo track search failed")
 
-    if not BRAVE_SEARCH_API_KEY:
-        return (
-            "برای جست‌وجوی گستردهٔ آهنگ‌ها، مدیر ربات باید کلید BRAVE_SEARCH_API_KEY را "
-            "در تنظیمات محیطی Render ثبت کند. بدون آن، فقط فایل‌های مجاز Jamendo قابل‌جست‌وجو هستند."
-        )
+    # Apple provides a public catalog search endpoint that does not require a paid API key.
+    # Return only catalog-backed results; never pretend this is a general web search.
     try:
-        query = request_text[:250] + " official song listen YouTube Spotify"
-        results = get_live_web_results(query)
+        response = get_http_session("music_session").get(
+            "https://itunes.apple.com/search",
+            params={
+                "term": request_text[:250],
+                "media": "music",
+                "entity": "song",
+                "limit": 5,
+                "country": "us",
+            },
+            timeout=LIVE_INFO_TIMEOUT,
+        )
+        with response:
+            response.raise_for_status()
+            payload = response.json()
+        rows = payload.get("results", []) if isinstance(payload, dict) else []
+        formatted = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("trackName") or "").strip()
+                artist = str(row.get("artistName") or "").strip()
+                url = str(row.get("trackViewUrl") or "").strip()
+                if title and artist and url.startswith("https://"):
+                    formatted.append(f"• {title} — {artist}\\n{url}")
+                if len(formatted) >= 5:
+                    break
+        if formatted:
+            return "🎵 نتیجه‌های کاتالوگ موسیقی اپل (جست‌وجوی رایگان):\\n" + "\\n\\n".join(formatted)
+        if BRAVE_SEARCH_API_KEY:
+            query = request_text[:250] + " official song listen YouTube Spotify"
+            results = get_live_web_results(query)
+            return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + results
+        return (
+            "در کاتالوگ موسیقی اپل نتیجه‌ای پیدا نشد و جست‌وجوی عمومی وب هم فعال نیست. "
+            "می‌تونی اسم دقیق‌تر آهنگ یا خواننده را بفرستی."
+        )
     except Exception:
-        logger.exception("Music link search failed")
-        return "جست‌وجوی آهنگ موقتاً ناموفق شد؛ لطفاً دوباره ویس بفرست."
-    return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + results
-
+        logger.exception("Free music catalog search failed")
+        if BRAVE_SEARCH_API_KEY:
+            try:
+                query = request_text[:250] + " official song listen YouTube Spotify"
+                return "🎵 نتیجه‌های جست‌وجوی آهنگ (لینک‌های رسمی/شنیداری):\\n" + get_live_web_results(query)
+            except Exception:
+                logger.exception("Music link search failed")
+        return "جست‌وجوی کاتالوگ موسیقی موقتاً ناموفق شد؛ لطفاً کمی بعد دوباره تلاش کن."
 def transcribe_soroush_voice(metadata):
     """Download a Soroush voice/audio attachment and transcribe it with Cloudflare Whisper."""
     file_id = metadata.get("file_id") if isinstance(metadata, dict) else None

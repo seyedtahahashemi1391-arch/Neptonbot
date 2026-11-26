@@ -1397,7 +1397,8 @@ def _needs_web_search(text):
     return any(marker in lowered for marker in _LIVE_MARKERS)
 
 
-def _weather_location(text):    """Extract a city from common Persian and English weather questions."""
+def _weather_location(text):
+    """Extract a city from common Persian and English weather questions."""
     cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")
     cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
     cleaned = re.sub(r"\s+", " ", cleaned)

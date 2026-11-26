@@ -195,5 +195,55 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIsNone(bot.db_get_state("weather_pending_123"))
 
 
+    def test_start_and_help_remain_available_while_feedback_is_pending(self):
+        with bot.db_connect() as db:
+            db.execute(
+                "INSERT INTO feedback_pending(chat_id) VALUES(?)",
+                ("feedback-user",),
+            )
+
+        start_result = bot.build_response_plan("feedback-user", "/start")
+        self.assertIn("NEPTON", start_result["responses"][0][1])
+        self.assertIsNotNone(start_result.get("reply_markup"))
+        self.assertTrue(bot.db_feedback_is_pending("feedback-user"))
+
+        help_result = bot.build_response_plan("feedback-user", "/help")
+        self.assertIn("راهنمای NeptonBot", help_result["responses"][0][1])
+        self.assertTrue(bot.db_feedback_is_pending("feedback-user"))
+
+    def test_queue_preserves_fifo_order_within_each_chat(self):
+        updates = [
+            (2001, "ordered-chat", "first"),
+            (2002, "ordered-chat", "second"),
+            (2003, "other-chat", "parallel"),
+        ]
+        self.assertTrue(bot.db_enqueue_updates(updates, 2004))
+
+        first = bot.db_claim_next_message("worker-one")
+        self.assertIsNotNone(first)
+        self.assertEqual(first["message_text"], "first")
+
+        # A later message from the same chat must not overtake the first.
+        second_worker_claim = bot.db_claim_next_message("worker-two")
+        self.assertIsNotNone(second_worker_claim)
+        self.assertEqual(second_worker_claim["chat_id"], "other-chat")
+        self.assertEqual(second_worker_claim["message_text"], "parallel")
+
+        self.assertTrue(bot.db_prepare_response_plan(
+            first["id"], "worker-one", []
+        ))
+        self.assertTrue(bot.db_finish_message(first["id"], "worker-one"))
+
+        next_same_chat = bot.db_claim_next_message("worker-three")
+        self.assertIsNotNone(next_same_chat)
+        self.assertEqual(next_same_chat["message_text"], "second")
+
+    def test_health_endpoint_reports_runtime_unavailable(self):
+        client = bot.app.test_client()
+        response = client.get("/health")
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(response.get_json()["status"], {"degraded", "unhealthy"})
+
+
 if __name__ == "__main__":
     unittest.main()

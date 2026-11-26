@@ -36,6 +36,23 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("متن تکراری", bot.SYSTEM_PROMPT)
         self.assertEqual(bot.MAX_COMPLETION_TOKENS, 1536)
 
+    def test_chamran_40_line_essay_uses_reviewed_historical_facts(self):
+        request = "یه انشا ۴۰ خطی درباره شهید چمران بنویس"
+        self.assertTrue(bot._is_chamran_40_line_essay_request(request))
+        result = bot.call_ai("test-chat", request)
+        lines = result.splitlines()
+        self.assertEqual(len(lines), 40)
+        self.assertIn("مصطفی چمران", result)
+        self.assertIn("دهم مهر سال ۱۳۱۱ در تهران", result)
+        self.assertIn("دانشگاه کالیفرنیا، برکلی", result)
+        self.assertIn("وزیر دفاع", result)
+        self.assertIn("سی‌ویکم خرداد سال ۱۳۶۰ در دهلاویه", result)
+        for false_claim in ("محمدعلی جعفری", "دانشگاه لیدز", "لشکر ۱۱ امام حسین", "کربلای ۴", "بیت‌المقدس"):
+            self.assertNotIn(false_claim, result)
+
+    def test_chamran_request_without_40_line_requirement_uses_normal_model_path(self):
+        self.assertFalse(bot._is_chamran_40_line_essay_request("درباره شهید چمران توضیح بده"))
+
     def test_private_message_extraction(self):
         update = {
             "update_id": 12,

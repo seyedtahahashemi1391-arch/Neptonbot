@@ -30,6 +30,12 @@ _CONFIG_SPEC.loader.exec_module(GUNICORN_CONFIG)
 
 
 class ParsingTests(unittest.TestCase):
+    def test_system_prompt_enforces_clean_school_essay_format(self):
+        self.assertIn("تعداد خط یا کلمه", bot.SYSTEM_PROMPT)
+        self.assertIn("ترتیب رویدادها", bot.SYSTEM_PROMPT)
+        self.assertIn("متن تکراری", bot.SYSTEM_PROMPT)
+        self.assertEqual(bot.MAX_COMPLETION_TOKENS, 1536)
+
     def test_private_message_extraction(self):
         update = {
             "update_id": 12,

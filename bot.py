@@ -1659,8 +1659,15 @@ def call_ai(chat_id, user_text):
             )
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.extend(get_history(chat_id))
+
+    stage_started = time.perf_counter()
+    history = get_history(chat_id)
+    logger.info("TIMING ai_history_ms=%.0f", (time.perf_counter() - stage_started) * 1000)
+    messages.extend(history)
+
+    stage_started = time.perf_counter()
     saved_memory = db_get_user_memory(chat_id)
+    logger.info("TIMING ai_memory_ms=%.0f", (time.perf_counter() - stage_started) * 1000)
     if saved_memory:
         messages.append({
             "role": "system",
@@ -1670,7 +1677,10 @@ def call_ai(chat_id, user_text):
                 + saved_memory
             ),
         })
+
+    stage_started = time.perf_counter()
     live_context = get_live_context(user_text)
+    logger.info("TIMING ai_live_context_ms=%.0f", (time.perf_counter() - stage_started) * 1000)
     if live_context:
         messages.append({
             "role": "system",

@@ -2431,6 +2431,8 @@ def build_response_plan(chat_id, text):
             "clear_history": True, "feedback_action": None,
         }
 
+    # Global navigation commands must remain usable while feedback is pending.
+
     feedback_result = process_feedback_message(chat_id, text)
     if feedback_result is not None:
         return {

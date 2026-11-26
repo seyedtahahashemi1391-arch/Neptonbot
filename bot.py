@@ -699,7 +699,8 @@ def _worker_id():
 
 def db_claim_next_message(worker_id):
     """Claim one eligible row atomically; later messages in a chat remain ordered."""
-    global _last_lease_sweep    now = time.time()
+    global _last_lease_sweep
+    now = time.time()
     monotonic_now = time.monotonic()
 
     if monotonic_now - _last_lease_sweep >= LEASE_SWEEP_INTERVAL:

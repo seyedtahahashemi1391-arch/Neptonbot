@@ -160,6 +160,10 @@ SYSTEM_PROMPT = (
     "اگر به اطلاعات زنده دسترسی نداری، این محدودیت را کوتاه و طبیعی بگو؛ "
     "از توصیهٔ کلی مثل مراجعه به سایت‌ها به‌جای پاسخ استفاده نکن و عدد حدسی نده. "
     "اگر دربارهٔ واقعیتی مطمئن نیستی، عدم‌قطعیت را صریح بیان کن. "
+    "هرگز برای کامل‌کردن پاسخ، نام اشخاص، مکان‌ها، محصولات، شرکت‌ها، داستان بازی‌ها، تاریخ‌ها یا جزئیات فنی را حدس نزن. "
+    "در پاسخ دربارهٔ بازی‌ها، سازنده، ناشر، شخصیت اصلی، سال انتشار و داستان را فقط وقتی بیان کن که از صحت آن مطمئنی؛ در غیر این صورت آن جزئیات را حذف کن یا عدم‌قطعیت را بگو. "
+    "عبارت‌های عامیانه، غلط‌های تایپی، شوخی و توهین را بدون قرینه به نام محصول، خوراکی، مکان یا موجودیت واقعی تبدیل نکن؛ اگر منظور روشن نیست، کوتاه سؤال روشن‌کننده بپرس. "
+    "اگر کاربر فقط نام یک شهر را در پاسخ به درخواست هواشناسی می‌فرستد، آن را فقط به‌عنوان نام شهر پردازش کن و در صورت شکست سرویس مکان‌یابی، شهر را ناموجود اعلام نکن؛ خطای سرویس یا نامشخص‌بودن نتیجه را شفاف بگو. "
     "درخواست‌هایی را که می‌توانند به آسیب واقعی، سوءاستفاده یا فعالیت غیرقانونی کمک کنند، "
     "با راهنمایی ایمن و غیرعملیاتی پاسخ بده."
 )
@@ -1531,8 +1535,25 @@ def get_live_weather(user_text):
         params={"name": place, "count": 1, "language": "fa", "format": "json", "countryCode": "IR"},
     )
     results = geo.get("results") if isinstance(geo, dict) else None
+
+    # A strict country-filtered Persian lookup can occasionally miss a valid
+    # Iranian city. Retry without the filter, then accept only an Iran result.
+    if not isinstance(results, list) or not results:
+        fallback = _get_json(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": place, "count": 10, "language": "en", "format": "json"},
+        )
+        fallback_rows = fallback.get("results") if isinstance(fallback, dict) else None
+        if isinstance(fallback_rows, list):
+            results = [
+                row for row in fallback_rows
+                if isinstance(row, dict)
+                and str(row.get("country_code") or "").upper() == "IR"
+            ]
+
     if not isinstance(results, list) or not results or not isinstance(results[0], dict):
-        return f"شهر «{place}» پیدا نشد؛ نام شهر را دقیق‌تر بفرست."
+        logger.info("Weather geocoding returned no Iran match for input=%r", place)
+        return f"برای نام «{place}» نتیجهٔ معتبر در سرویس مکان‌یابی پیدا نشد؛ ممکن است سرویس نام شهر را نشناخته باشد."
 
     loc = results[0]
     latitude = loc.get("latitude")

@@ -47,6 +47,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("دانشگاه کالیفرنیا، برکلی", result)
         self.assertIn("وزیر دفاع", result)
         self.assertIn("سی‌ویکم خرداد سال ۱۳۶۰ در دهلاویه", result)
+        self.assertIn("چهل‌وهشت سال داشت", result)
         for false_claim in ("محمدعلی جعفری", "دانشگاه لیدز", "لشکر ۱۱ امام حسین", "کربلای ۴", "بیت‌المقدس"):
             self.assertNotIn(false_claim, result)
 

@@ -2512,7 +2512,8 @@ def _process_claimed_item_impl(item, worker_id):
         if not saved:
             raise RuntimeError("Could not persist response plan or worker lease was lost")
         response_index = 0
-    else:        try:
+    else:
+        try:
             plan = json.loads(response_plan_raw)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("Stored response plan is invalid JSON") from exc

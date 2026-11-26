@@ -316,33 +316,84 @@ class PostgresConnection:
         self._connection.close()
 
 
+_postgres_pool = None
+_postgres_pool_lock = threading.Lock()
+
+
+def _get_postgres_pool():
+    """Return the process-local PostgreSQL pool, creating it lazily."""
+    global _postgres_pool
+    if _postgres_pool is not None:
+        return _postgres_pool
+
+    with _postgres_pool_lock:
+        if _postgres_pool is None:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+
+            pool = ConnectionPool(
+                conninfo=DATABASE_URL,
+                min_size=1,
+                max_size=max(4, MAX_PARALLEL_CHATS + 2),
+                timeout=10,
+                kwargs={
+                    "connect_timeout": 10,
+                    "application_name": "NeptonBot",
+                    "sslmode": "require",
+                    "autocommit": True,
+                    "row_factory": dict_row,
+                },
+                open=False,
+            )
+            pool.open(wait=False)
+            _postgres_pool = pool
+
+    return _postgres_pool
+
+
+def close_database_pool():
+    """Close pooled PostgreSQL connections during process shutdown."""
+    global _postgres_pool
+    with _postgres_pool_lock:
+        pool = _postgres_pool
+        _postgres_pool = None
+    if pool is not None:
+        try:
+            pool.close(timeout=5)
+        except Exception:
+            logger.warning("Could not close PostgreSQL connection pool cleanly", exc_info=True)
+
+
 @contextmanager
 def db_connect():
     if USE_POSTGRES:
-        import psycopg
-        from psycopg.rows import dict_row
+        pool = _get_postgres_pool()
+        # Returning the connection to the pool avoids a fresh TLS/authentication
+        # handshake for every small history, memory, queue, and state query.
+        with pool.connection(timeout=10) as raw_connection:
+            connection = PostgresConnection(raw_connection)
+            try:
+                yield connection
+            except BaseException:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                if connection.in_transaction:
+                    connection.rollback()
+        return
 
-        raw_connection = psycopg.connect(
-            DATABASE_URL,
-            connect_timeout=10,
-            application_name="NeptonBot",
-            sslmode="require",
-            autocommit=True,
-            row_factory=dict_row,
-        )
-        connection = PostgresConnection(raw_connection)
-    else:
-        connection = sqlite3.connect(
-            DB_PATH,
-            timeout=30,
-            isolation_level=None,
-            check_same_thread=True,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA synchronous = FULL")
-        connection.execute("PRAGMA temp_store = MEMORY")
+    connection = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        isolation_level=None,
+        check_same_thread=True,
+    )
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA synchronous = FULL")
+    connection.execute("PRAGMA temp_store = MEMORY")
     try:
         yield connection
     except BaseException:
@@ -2879,6 +2930,7 @@ def shutdown_runtime():
     logger.info("NeptonBot shutdown completed")
 
 
+atexit.register(close_database_pool)
 atexit.register(shutdown_runtime)
 
 

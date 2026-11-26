@@ -58,7 +58,7 @@ VOICE_MAX_BYTES = 8 * 1024 * 1024
 MUSIC_MAX_BYTES = 12 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.13"
+VERSION = "3.3.14"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -696,7 +696,6 @@ def db_enqueue_updates(prepared_updates, next_offset):
 
 def _worker_id():
     return f"{os.getpid()}:{threading.get_ident()}"
-
 
 def db_claim_next_message(worker_id):
     """Claim one eligible row atomically; later messages in a chat remain ordered."""
@@ -1397,8 +1396,7 @@ def _needs_web_search(text):
     return any(marker in lowered for marker in _LIVE_MARKERS)
 
 
-def _weather_location(text):
-    """Extract a city from common Persian and English weather questions."""
+def _weather_location(text):    """Extract a city from common Persian and English weather questions."""
     cleaned = str(text or "").strip().replace("\u200c", " ").replace("\u200f", " ")    cleaned = cleaned.replace("ك", "ک").replace("ي", "ی")
     cleaned = re.sub(r"\s+", " ", cleaned)
 
@@ -2097,8 +2095,7 @@ def transcribe_soroush_voice(metadata):
                 except ValueError:
                     pass
             audio = bytearray()
-            for chunk in response.iter_content(chunk_size=65536):
-                if chunk:                    audio.extend(chunk)
+            for chunk in response.iter_content(chunk_size=65536):                if chunk:                    audio.extend(chunk)
                     if len(audio) > VOICE_MAX_BYTES:
                         raise UserVisibleError("ویس بیش از حد مجاز است؛ لطفاً یک ویس کوتاه‌تر بفرست.")
     except UserVisibleError:
@@ -2457,6 +2454,15 @@ def build_response_plan(chat_id, text):
         if not music_pending_active or text.startswith("/"):
             db_delete_state(music_state_key)
 
+    # Route explicit typed music requests to music search instead of the general AI.
+    if is_music_search_request(text):
+        result = search_music_links(text)
+        return {
+            "responses": [(chat_id, result)],
+            "history_user": None, "history_assistant": None,
+            "clear_history": False, "feedback_action": None,
+        }
+
     command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
     weather_state_key = f"weather_pending_{chat_id}"
     weather_pending_until = db_get_state(weather_state_key)
@@ -2797,8 +2803,7 @@ def chat_worker():
     logger.info("Worker stopped id=%s", worker_id)
 
 
-def _start_or_replace_workers():
-    global _worker_threads
+def _start_or_replace_workers():    global _worker_threads
     with _service_lock:
         _worker_threads = [worker for worker in _worker_threads if worker.is_alive()]
         missing = max(0, MAX_PARALLEL_CHATS - len(_worker_threads))

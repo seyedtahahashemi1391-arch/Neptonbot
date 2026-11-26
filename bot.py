@@ -1588,7 +1588,8 @@ def _fa_number(value):
 
 def get_live_market_prices():
     """Fetch published Iranian market snapshots and show their actual update time."""
-    payload = _get_json(MARKET_DATA_URL)    rows = payload.get("data", []) if isinstance(payload, dict) else []
+    payload = _get_json(MARKET_DATA_URL)
+    rows = payload.get("data", []) if isinstance(payload, dict) else []
     if not isinstance(rows, list):
         rows = []
     by_symbol = {row.get("symbol"): row for row in rows if isinstance(row, dict)}

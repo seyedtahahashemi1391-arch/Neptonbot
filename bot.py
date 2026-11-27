@@ -1553,7 +1553,8 @@ def get_live_weather(user_text):
     current = forecast.get("current") if isinstance(forecast, dict) else None
     daily = forecast.get("daily") if isinstance(forecast, dict) else None
     if not isinstance(current, dict) or not isinstance(daily, dict):
-        logger.warning("Weather forecast response had an unexpected structure")        return "سرویس هواشناسی پاسخ کاملی نداد؛ کمی بعد دوباره تلاش کن."
+        logger.warning("Weather forecast response had an unexpected structure")
+        return "سرویس هواشناسی پاسخ کاملی نداد؛ کمی بعد دوباره تلاش کن."
 
     def _daily_value(key):
         values = daily.get(key)

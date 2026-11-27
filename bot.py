@@ -1849,6 +1849,26 @@ def call_ai(chat_id, user_text):
             ),
         })
 
+    talk_state_raw = db_get_state(f"talk_active_{chat_id}")
+    if talk_state_raw:
+        try:
+            talk_state = json.loads(talk_state_raw)
+            talk_topic = str(talk_state.get("topic", "")).strip()[:500]
+        except (TypeError, ValueError, AttributeError):
+            talk_topic = ""
+        messages.append({
+            "role": "system",
+            "content": (
+                "این گفتگو در حالت آزمایشی آشنایی با رضایت قبلی مخاطب است. "
+                "شفاف بگو که یک ربات هوش مصنوعی Nepton هستی و هرگز خودت را انسان جا نزن. "
+                "با لحن طبیعی و محترمانه، دربارهٔ موضوع پیشنهادی مدیر گفتگو کن و به پاسخ‌های مخاطب واکنش نشان بده. "
+                "فقط وقتی مخاطب پیام می‌دهد پاسخ بده؛ خودت پیام‌های پی‌درپی یا فشارآور شروع نکن. "
+                "از گرفتن اطلاعات حساس، خصوصی یا شناسایی‌کننده خودداری کن؛ اگر مخاطب بی‌علاقه بود یا خواست توقف کند، "
+                "احترام بگذار و راهنمایی‌اش کن که /talkstop بفرستد. موضوع پیشنهادی: "
+                + (talk_topic or "گفت‌وگوی دوستانهٔ عمومی")
+            ),
+        })
+
     stage_started = time.perf_counter()
     live_context = get_live_context(user_text)
     logger.info("TIMING ai_live_context_ms=%.0f", (time.perf_counter() - stage_started) * 1000)
@@ -2466,6 +2486,34 @@ def build_response_plan(chat_id, text):
             db_delete_state(weather_state_key)
             weather_pending_until = None
 
+    if command == "/talkoptin":
+        db_set_state(f"talk_optin_{chat_id}", "1")
+        message = (
+            "گفت‌وگوی آزمایشی فعال شد. مدیر می‌تواند برای شروع یک گفت‌وگوی دوستانه درخواست بدهد. "
+            "هر زمان خواستی با /talkstop آن را متوقف کن."
+        )
+        return {
+            "responses": [(chat_id, message)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+        }
+
+    if command == "/talkstop":
+        db_delete_state(f"talk_active_{chat_id}")
+        db_delete_state(f"talk_optin_{chat_id}")
+        tail = text.partition(" ")[2].strip()
+        admin_id = get_admin_chat_id()
+        if str(chat_id) == str(admin_id) and tail:
+            target_id = tail.split(maxsplit=1)[0]
+            db_delete_state(f"talk_active_{target_id}")
+            db_delete_state(f"talk_optin_{target_id}")
+            message = f"گفت‌وگوی آزمایشی برای شناسهٔ {target_id} متوقف شد."
+        else:
+            message = "گفت‌وگوی آزمایشی متوقف شد؛ دیگر در این حالت پاسخ‌گویی ادامه پیدا نمی‌کند."
+        return {
+            "responses": [(chat_id, message)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+        }
+
     if command == "/remember":
         memory_text = text.partition(" ")[2].strip()
         if not memory_text:
@@ -2491,6 +2539,43 @@ def build_response_plan(chat_id, text):
         message = "یادداشت شخصی حذف شد." if deleted else "یادداشت ذخیره‌شده‌ای وجود نداشت."
         return {
             "responses": [(chat_id, message)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+        }
+
+    if command == "/talk":
+        admin_id = get_admin_chat_id()
+        if admin_id is None or str(chat_id) != str(admin_id):
+            message = "این دستور فقط برای مدیر ربات فعال است."
+            responses = [(chat_id, message)]
+        else:
+            args = text.partition(" ")[2].strip()
+            target_id, _, topic = args.partition(" ")
+            target_id = target_id.strip()
+            topic = topic.strip()[:500]
+            if not target_id.isdigit() or not topic:
+                message = "فرمت: /talk شناسه_کاربر موضوع_گفتگو"
+                responses = [(chat_id, message)]
+            elif db_get_state(f"talk_optin_{target_id}") != "1":
+                message = (
+                    "این کاربر هنوز رضایت آزمایشی را فعال نکرده است. "
+                    "ابتدا باید خودش در گفت‌وگوی خصوصی /talkoptin را بفرستد."
+                )
+                responses = [(chat_id, message)]
+            else:
+                db_set_state(
+                    f"talk_active_{target_id}",
+                    json.dumps({"topic": topic}, ensure_ascii=False),
+                )
+                intro = (
+                    "سلام! من ربات هوش مصنوعی Nepton هستم. "
+                    "با رضایت آزمایشی‌ای که فعال کرده‌ای، می‌تونیم دربارهٔ "
+                    + topic
+                    + " گپ بزنیم. اگر تمایلی نداشتی، هر وقت خواستی /talkstop بفرست."
+                )
+                message = f"گفت‌وگوی آزمایشی برای {target_id} شروع شد؛ فقط پس از پیام مخاطب ادامه پیدا می‌کند."
+                responses = [(chat_id, message), (target_id, intro)]
+        return {
+            "responses": responses, "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
         }
 

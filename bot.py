@@ -754,7 +754,8 @@ def db_claim_next_message(worker_id):
         claim_sql = eligible_sql + (" FOR UPDATE OF q SKIP LOCKED" if USE_POSTGRES else "")
         row = db.execute(claim_sql, (now,)).fetchone()
 
-        if row is None:            db.commit()
+        if row is None:
+            db.commit()
             return None
 
         changed = db.execute("""

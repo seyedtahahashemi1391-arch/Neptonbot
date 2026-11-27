@@ -2489,6 +2489,90 @@ def build_response_plan(chat_id, text):
             db_delete_state(weather_state_key)
             weather_pending_until = None
 
+    admin_id = get_admin_chat_id()
+    admin_pending_key = f"admin_talk_pending_{chat_id}"
+    admin_pending_raw = db_get_state(admin_pending_key)
+
+    if str(chat_id) == str(admin_id):
+        if text.strip() == "💬 شروع گفت‌وگو":
+            db_set_state(admin_pending_key, json.dumps({
+                "action": "start", "expires_at": int(time.time()) + 300
+            }))
+            return {
+                "responses": [(chat_id, "شناسهٔ عددی کاربر را بفرست. فقط کاربری که قبلاً با /talkoptin رضایت داده باشد قابل انتخاب است. برای لغو /cancel را بفرست.")],
+                "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+        if text.strip() == "⛔ توقف گفت‌وگو":
+            db_set_state(admin_pending_key, json.dumps({
+                "action": "stop", "expires_at": int(time.time()) + 300
+            }))
+            return {
+                "responses": [(chat_id, "شناسهٔ عددی کاربری را بفرست که گفت‌وگوی فعالش متوقف شود. برای لغو /cancel را بفرست.")],
+                "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+
+        if admin_pending_raw is not None:
+            try:
+                pending = json.loads(admin_pending_raw)
+                pending_action = pending.get("action")
+                pending_expires = int(pending.get("expires_at", 0))
+            except (TypeError, ValueError, AttributeError):
+                pending_action, pending_expires = None, 0
+
+            if command == "/cancel":
+                db_delete_state(admin_pending_key)
+                return {
+                    "responses": [(chat_id, "عملیات گفت‌وگو لغو شد.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+
+            if pending_expires <= int(time.time()) or pending_action not in {"start", "stop"}:
+                db_delete_state(admin_pending_key)
+                return {
+                    "responses": [(chat_id, "درخواست منقضی شد؛ دوباره از پنل مدیریتی شروع کن.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+
+            target_id = text.strip()
+            if not target_id.isdigit():
+                return {
+                    "responses": [(chat_id, "شناسه باید فقط شامل رقم باشد. دوباره بفرست یا /cancel را بزن.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+
+            db_delete_state(admin_pending_key)
+            if pending_action == "stop":
+                db_delete_state(f"talk_active_{target_id}")
+                return {
+                    "responses": [(chat_id, f"گفت‌وگوی فعال برای شناسهٔ {target_id} متوقف شد.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+
+            if target_id == str(admin_id):
+                message = "شناسهٔ مدیر را نمی‌توان به‌عنوان مخاطب انتخاب کرد."
+                responses = [(chat_id, message)]
+            elif db_get_state(f"talk_optin_{target_id}") != "1":
+                message = ("این کاربر هنوز رضایت گفت‌وگوی آزمایشی را فعال نکرده است. "
+                           "ابتدا خودش باید در گفت‌وگوی خصوصی ربات /talkoptin را بفرستد.")
+                responses = [(chat_id, message)]
+            else:
+                topic = "گفت‌وگوی دوستانهٔ عمومی"
+                db_set_state(f"talk_active_{target_id}", json.dumps({"topic": topic}, ensure_ascii=False))
+                intro = ("سلام! من ربات هوش مصنوعی Nepton هستم. "
+                         "مدیر گفت‌وگویی را با رضایتی که قبلاً فعال کرده‌ای شروع کرده است. "
+                         "اگر تمایلی نداری، هر زمان خواستی /talkstop بفرست.")
+                responses = [(chat_id, f"گفت‌وگو برای شناسهٔ {target_id} شروع شد."), (target_id, intro)]
+            return {
+                "responses": responses, "history_user": None, "history_assistant": None,
+                "clear_history": False, "feedback_action": None,
+            }
+
     if command == "/talkoptin":
         db_set_state(f"talk_optin_{chat_id}", "1")
         message = (
@@ -2610,6 +2694,11 @@ def build_response_plan(chat_id, text):
         return {
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
+            "reply_markup": {
+                "keyboard": [[{"text": "💬 شروع گفت‌وگو"}, {"text": "⛔ توقف گفت‌وگو"}]],
+                "resize_keyboard": True,
+                "one_time_keyboard": False,
+            } if admin_id is not None and str(chat_id) == str(admin_id) else None,
         }
 
     if command == "/market":

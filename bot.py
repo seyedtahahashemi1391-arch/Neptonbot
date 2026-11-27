@@ -2499,7 +2499,7 @@ def build_response_plan(chat_id, text):
                 "action": "start", "expires_at": int(time.time()) + 300
             }))
             return {
-                "responses": [(chat_id, "شناسهٔ عددی کاربر را بفرست. فقط کاربری که قبلاً با /talkoptin رضایت داده باشد قابل انتخاب است. برای لغو /cancel را بفرست.")],
+                "responses": [(chat_id, "شناسهٔ عددی کاربر را بفرست تا ربات به او پیام بدهد. برای لغو /cancel را بفرست.")],
                 "history_user": None, "history_assistant": None,
                 "clear_history": False, "feedback_action": None,
             }
@@ -2557,16 +2557,13 @@ def build_response_plan(chat_id, text):
             if target_id == str(admin_id):
                 message = "شناسهٔ مدیر را نمی‌توان به‌عنوان مخاطب انتخاب کرد."
                 responses = [(chat_id, message)]
-            elif db_get_state(f"talk_optin_{target_id}") != "1":
-                message = ("این کاربر هنوز رضایت گفت‌وگوی آزمایشی را فعال نکرده است. "
-                           "ابتدا خودش باید در گفت‌وگوی خصوصی ربات /talkoptin را بفرستد.")
-                responses = [(chat_id, message)]
             else:
                 topic = "گفت‌وگوی دوستانهٔ عمومی"
                 db_set_state(f"talk_active_{target_id}", json.dumps({"topic": topic}, ensure_ascii=False))
                 intro = ("سلام! من ربات هوش مصنوعی Nepton هستم. "
-                         "مدیر گفت‌وگویی را با رضایتی که قبلاً فعال کرده‌ای شروع کرده است. "
-                         "اگر تمایلی نداری، هر زمان خواستی /talkstop بفرست.")
+                         "مدیر این گفت‌وگو را شروع کرده است. اگر دوست داری، می‌توانیم "
+                         "یک گفت‌وگوی دوستانه و طبیعی داشته باشیم. هر زمان نخواستی ادامه بدهی، "
+                         "فقط /talkstop را بفرست.")
                 responses = [(chat_id, f"گفت‌وگو برای شناسهٔ {target_id} شروع شد."), (target_id, intro)]
             return {
                 "responses": responses, "history_user": None, "history_assistant": None,

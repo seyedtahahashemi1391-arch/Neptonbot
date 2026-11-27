@@ -34,7 +34,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("تعداد خط یا کلمه", bot.SYSTEM_PROMPT)
         self.assertIn("ترتیب رویدادها", bot.SYSTEM_PROMPT)
         self.assertIn("متن تکراری", bot.SYSTEM_PROMPT)
-        self.assertEqual(bot.MAX_COMPLETION_TOKENS, 1536)
+        self.assertEqual(bot.MAX_COMPLETION_TOKENS, 768)
 
     def test_chamran_40_line_essay_uses_reviewed_historical_facts(self):
         request = "یه انشا ۴۰ خطی درباره شهید چمران بنویس"

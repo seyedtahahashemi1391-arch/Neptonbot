@@ -2405,7 +2405,6 @@ def build_response_plan(chat_id, text):
 
     admin_id = get_admin_chat_id()
     if command == "/admin":
-        admin_id = get_admin_chat_id()
         if admin_id is None or str(chat_id) != str(admin_id):
             message = "این دستور فقط برای مدیر ربات فعال است."
         else:

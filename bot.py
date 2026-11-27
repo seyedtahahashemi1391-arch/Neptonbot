@@ -2297,6 +2297,11 @@ def extract_message(update):
     else:
         is_private = sender_id is not None and str(sender_id) == str(chat_id)
 
+    if normalized_username and is_private:
+        # Soroush sendMessage requires chat_id; cache usernames after a private
+        # message so /talk can resolve them without guessing.
+        db_set_state(f"username_chat_{normalized_username}", str(chat_id))
+
     if normalized_username == ADMIN_USERNAME and is_private:
         set_admin_chat_id(chat_id)
     return str(chat_id), message_text
@@ -2619,25 +2624,38 @@ def build_response_plan(chat_id, text):
             responses = [(chat_id, message)]
         else:
             args = text.partition(" ")[2].strip()
-            target_id, _, topic = args.partition(" ")
-            target_id = target_id.strip()
+            target_input, _, topic = args.partition(" ")
+            target_input = target_input.strip()
             topic = topic.strip()[:500]
-            if not target_id.isdigit() or not topic:
-                message = "فرمت: /talk شناسه_کاربر موضوع_گفتگو"
+            target_key = target_input.lstrip("@").lower()
+            if not target_input or not topic:
+                message = "فرمت: /talk @username موضوع_گفتگو"
                 responses = [(chat_id, message)]
             else:
-                db_set_state(
-                    f"talk_active_{target_id}",
-                    json.dumps({"topic": topic}, ensure_ascii=False),
+                target_id = (
+                    target_key if target_key.isdigit()
+                    else db_get_state(f"username_chat_{target_key}")
                 )
-                intro = (
-                    "سلام! من ربات هوش مصنوعی Nepton هستم. "
-                    "مدیر این گفت‌وگو را شروع کرده است. اگر دوست داری، می‌تونیم دربارهٔ "
-                    + topic
-                    + " گپ بزنیم. هر وقت نخواستی ادامه بدهی، /talkstop را بفرست."
-                )
-                message = f"گفت‌وگوی آزمایشی برای {target_id} شروع شد؛ فقط پس از پیام مخاطب ادامه پیدا می‌کند."
-                responses = [(chat_id, message), (target_id, intro)]
+                if target_id is None:
+                    message = (
+                        f"یوزرنیم @{target_key} در ربات شناخته‌شده نیست. "
+                        "کاربر باید ابتدا یک‌بار در گفت‌وگوی خصوصی به ربات پیام بدهد."
+                    )
+                    responses = [(chat_id, message)]
+                else:
+                    target_id = str(target_id)
+                    db_set_state(
+                        f"talk_active_{target_id}",
+                        json.dumps({"topic": topic}, ensure_ascii=False),
+                    )
+                    intro = (
+                        "سلام! من ربات هوش مصنوعی Nepton هستم. "
+                        "مدیر این گفت‌وگو را شروع کرده است. اگر دوست داری، می‌تونیم دربارهٔ "
+                        + topic
+                        + " گپ بزنیم. هر وقت نخواستی ادامه بدهی، /talkstop را بفرست."
+                    )
+                    message = f"گفت‌وگوی آزمایشی برای @{target_key} شروع شد؛ فقط پس از پیام مخاطب ادامه پیدا می‌کند."
+                    responses = [(chat_id, message), (target_id, intro)]
         return {
             "responses": responses, "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,

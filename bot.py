@@ -397,8 +397,7 @@ def db_connect():
                     connection.rollback()
                 raise
             finally:
-                if connection.in_transaction:
-                    connection.rollback()
+                if connection.in_transaction:                    connection.rollback()
         return
 
     connection = sqlite3.connect(
@@ -797,8 +796,7 @@ def db_claim_next_message(worker_id):
         claim_sql = eligible_sql + (" FOR UPDATE OF q SKIP LOCKED" if USE_POSTGRES else "")
         row = db.execute(claim_sql, (now,)).fetchone()
 
-        if row is None:
-            db.commit()
+        if row is None:            db.commit()
             return None
 
         changed = db.execute("""
@@ -1197,8 +1195,7 @@ def _renew_runtime_lock():
             UPDATE nepton_runtime_leases
             SET
                 lease_until = EXTRACT(EPOCH FROM clock_timestamp()) + ?,
-                updated_at = EXTRACT(EPOCH FROM clock_timestamp())
-            WHERE lock_name = 'primary'
+                updated_at = EXTRACT(EPOCH FROM clock_timestamp())            WHERE lock_name = 'primary'
               AND owner_id = ?
               AND lease_until > EXTRACT(EPOCH FROM clock_timestamp())
         """, (
@@ -1597,8 +1594,7 @@ def get_live_weather(user_text):
     current = forecast.get("current") if isinstance(forecast, dict) else None
     daily = forecast.get("daily") if isinstance(forecast, dict) else None
     if not isinstance(current, dict) or not isinstance(daily, dict):
-        logger.warning("Weather forecast response had an unexpected structure")
-        return "سرویس هواشناسی پاسخ کاملی نداد؛ کمی بعد دوباره تلاش کن."
+        logger.warning("Weather forecast response had an unexpected structure")        return "سرویس هواشناسی پاسخ کاملی نداد؛ کمی بعد دوباره تلاش کن."
 
     def _daily_value(key):
         values = daily.get(key)
@@ -1997,8 +1993,7 @@ def soroush_request(method, payload=None):
             raise TransientAPIError(f"Soroush returned invalid JSON: {method}") from None
 
     if isinstance(data, dict):
-        if data.get("ok") is False or data.get("success") is False:
-            code = data.get("error_code") or data.get("code")
+        if data.get("ok") is False or data.get("success") is False:            code = data.get("error_code") or data.get("code")
             try:
                 code = int(code)
             except (TypeError, ValueError):
@@ -2397,7 +2392,6 @@ def process_feedback_message(chat_id, text):
             "responses": [(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")],
             "feedback_action": None,
         }
-
     if command == FEEDBACK_COMMAND or normalized == normalize_text(FEEDBACK_TRIGGER_TEXT):
         return {
             "responses": [(
@@ -2503,7 +2497,7 @@ def build_response_plan(chat_id, text):
                 "action": "start", "expires_at": int(time.time()) + 300
             }))
             return {
-                "responses": [(chat_id, "شناسهٔ عددی کاربر را بفرست تا ربات به او پیام بدهد. برای لغو /cancel را بفرست.")],
+                "responses": [(chat_id, "یوزرنیم کاربر را با @ بفرست؛ مثلاً @username. ربات به او پیام می‌دهد. برای لغو /cancel را بفرست.")],
                 "history_user": None, "history_assistant": None,
                 "clear_history": False, "feedback_action": None,
             }
@@ -2541,25 +2535,39 @@ def build_response_plan(chat_id, text):
                     "clear_history": False, "feedback_action": None,
                 }
 
-            target_id = text.strip()
-            if not target_id.isdigit():
+            target_input = text.strip()
+            if not target_input.startswith("@"):
                 return {
-                    "responses": [(chat_id, "شناسه باید فقط شامل رقم باشد. دوباره بفرست یا /cancel را بزن.")],
+                    "responses": [(chat_id, "یوزرنیم باید حتماً با @ شروع شود؛ مثلاً @username. دوباره بفرست یا /cancel را بزن.")],
                     "history_user": None, "history_assistant": None,
                     "clear_history": False, "feedback_action": None,
                 }
-
+            target_username = target_input[1:].strip().lower()
+            if not re.fullmatch(r"[a-z0-9_]{3,32}", target_username):
+                return {
+                    "responses": [(chat_id, "یوزرنیم معتبر نیست. آن را با @ و بدون فاصله بفرست؛ مثلاً @username.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+            target_id = db_get_state(f"username_chat_{target_username}")
+            if target_id is None:
+                return {
+                    "responses": [(chat_id, f"کاربر @{target_username} هنوز برای ربات شناخته‌شده نیست. او باید ابتدا به ربات پیام خصوصی بدهد.")],
+                    "history_user": None, "history_assistant": None,
+                    "clear_history": False, "feedback_action": None,
+                }
+            target_id = str(target_id)
             db_delete_state(admin_pending_key)
             if pending_action == "stop":
                 db_delete_state(f"talk_active_{target_id}")
                 return {
-                    "responses": [(chat_id, f"گفت‌وگوی فعال برای شناسهٔ {target_id} متوقف شد.")],
+                    "responses": [(chat_id, f"گفت‌وگوی فعال برای @{target_username} متوقف شد.")],
                     "history_user": None, "history_assistant": None,
                     "clear_history": False, "feedback_action": None,
                 }
 
             if target_id == str(admin_id):
-                message = "شناسهٔ مدیر را نمی‌توان به‌عنوان مخاطب انتخاب کرد."
+                message = "مدیر را نمی‌توان به‌عنوان مخاطب انتخاب کرد."
                 responses = [(chat_id, message)]
             else:
                 topic = "گفت‌وگوی دوستانهٔ عمومی"
@@ -2568,7 +2576,7 @@ def build_response_plan(chat_id, text):
                          "مدیر این گفت‌وگو را شروع کرده است. اگر دوست داری، می‌توانیم "
                          "یک گفت‌وگوی دوستانه و طبیعی داشته باشیم. هر زمان نخواستی ادامه بدهی، "
                          "فقط /talkstop را بفرست.")
-                responses = [(chat_id, f"گفت‌وگو برای شناسهٔ {target_id} شروع شد."), (target_id, intro)]
+                responses = [(chat_id, f"پیام آغازین برای @{target_username} ارسال شد."), (target_id, intro)]
             return {
                 "responses": responses, "history_user": None, "history_assistant": None,
                 "clear_history": False, "feedback_action": None,
@@ -2797,8 +2805,7 @@ def build_response_plan(chat_id, text):
 
     if is_creator_question(text):
         return {
-            "responses": [(chat_id, CREATOR_ANSWER)],
-            "history_user": text, "history_assistant": CREATOR_ANSWER,
+            "responses": [(chat_id, CREATOR_ANSWER)],            "history_user": text, "history_assistant": CREATOR_ANSWER,
             "clear_history": False, "feedback_action": None,
         }
 
@@ -3197,8 +3204,7 @@ def shutdown_runtime():
         worker_snapshot = list(_worker_threads)
     threads = [
         thread for thread in [
-            _polling_thread,
-            _supervisor_thread,
+            _polling_thread,            _supervisor_thread,
             _runtime_heartbeat_thread,
             *worker_snapshot,
         ]

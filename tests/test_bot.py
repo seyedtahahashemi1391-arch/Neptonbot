@@ -151,7 +151,6 @@ class DatabaseWorkflowTests(unittest.TestCase):
                 "dead_letters",
                 "conversation_history",
                 "feedback_pending",
-                "user_memory",
                 "bot_state",
             ):
                 db.execute(f"DELETE FROM {table}")

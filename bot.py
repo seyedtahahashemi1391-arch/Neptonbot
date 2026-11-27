@@ -2212,7 +2212,6 @@ def extract_message(update):
     else:
         is_private = sender_id is not None and str(sender_id) == str(chat_id)
 
-    if normalized_username and is_private:
     if normalized_username == ADMIN_USERNAME and is_private:
         set_admin_chat_id(chat_id)
     return str(chat_id), message_text

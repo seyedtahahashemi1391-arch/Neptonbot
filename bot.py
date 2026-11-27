@@ -1920,7 +1920,8 @@ def soroush_request(method, payload=None):
             raise TransientAPIError(f"Soroush returned invalid JSON: {method}") from None
 
     if isinstance(data, dict):
-        if data.get("ok") is False or data.get("success") is False:            code = data.get("error_code") or data.get("code")
+        if data.get("ok") is False or data.get("success") is False:
+            code = data.get("error_code") or data.get("code")
             try:
                 code = int(code)
             except (TypeError, ValueError):

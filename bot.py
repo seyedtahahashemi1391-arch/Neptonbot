@@ -2062,6 +2062,9 @@ def register_bot_commands():
         {"command": "weather", "description": "هواشناسی"},
         {"command": "market", "description": "قیمت‌های بازار ایران"},
         {"command": "admin", "description": "وضعیت مدیریتی ربات"},
+        {"command": "talkoptin", "description": "فعال‌سازی گفت‌وگوی آزمایشی"},
+        {"command": "talkstop", "description": "توقف گفت‌وگوی آزمایشی"},
+        {"command": "talk", "description": "شروع گفت‌وگوی آزمایشی (مدیر)"},
         {"command": "reset", "description": "پاک کردن حافظه گفتگو"},
     ]
     try:

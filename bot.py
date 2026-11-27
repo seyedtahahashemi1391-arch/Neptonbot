@@ -2062,7 +2062,6 @@ def register_bot_commands():
         {"command": "weather", "description": "هواشناسی"},
         {"command": "market", "description": "قیمت‌های بازار ایران"},
         {"command": "admin", "description": "وضعیت مدیریتی ربات"},
-        {"command": "talkoptin", "description": "فعال‌سازی گفت‌وگوی آزمایشی"},
         {"command": "talkstop", "description": "توقف گفت‌وگوی آزمایشی"},
         {"command": "talk", "description": "شروع گفت‌وگوی آزمایشی (مدیر)"},
         {"command": "reset", "description": "پاک کردن حافظه گفتگو"},
@@ -2570,26 +2569,13 @@ def build_response_plan(chat_id, text):
                 "clear_history": False, "feedback_action": None,
             }
 
-    if command == "/talkoptin":
-        db_set_state(f"talk_optin_{chat_id}", "1")
-        message = (
-            "گفت‌وگوی آزمایشی فعال شد. مدیر می‌تواند برای شروع یک گفت‌وگوی دوستانه درخواست بدهد. "
-            "هر زمان خواستی با /talkstop آن را متوقف کن."
-        )
-        return {
-            "responses": [(chat_id, message)], "history_user": None,
-            "history_assistant": None, "clear_history": False, "feedback_action": None,
-        }
-
     if command == "/talkstop":
         db_delete_state(f"talk_active_{chat_id}")
-        db_delete_state(f"talk_optin_{chat_id}")
         tail = text.partition(" ")[2].strip()
         admin_id = get_admin_chat_id()
         if str(chat_id) == str(admin_id) and tail:
             target_id = tail.split(maxsplit=1)[0]
             db_delete_state(f"talk_active_{target_id}")
-            db_delete_state(f"talk_optin_{target_id}")
             message = f"گفت‌وگوی آزمایشی برای شناسهٔ {target_id} متوقف شد."
         else:
             message = "گفت‌وگوی آزمایشی متوقف شد؛ دیگر در این حالت پاسخ‌گویی ادامه پیدا نمی‌کند."
@@ -2638,12 +2624,6 @@ def build_response_plan(chat_id, text):
             topic = topic.strip()[:500]
             if not target_id.isdigit() or not topic:
                 message = "فرمت: /talk شناسه_کاربر موضوع_گفتگو"
-                responses = [(chat_id, message)]
-            elif db_get_state(f"talk_optin_{target_id}") != "1":
-                message = (
-                    "این کاربر هنوز رضایت آزمایشی را فعال نکرده است. "
-                    "ابتدا باید خودش در گفت‌وگوی خصوصی /talkoptin را بفرستد."
-                )
                 responses = [(chat_id, message)]
             else:
                 db_set_state(

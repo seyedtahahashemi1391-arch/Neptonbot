@@ -2742,7 +2742,7 @@ def chat_worker():
 
         except Exception as exc:
             if isinstance(exc, (TransientAPIError, PermanentAPIError)):
-                logger.warning("Worker request failed type=%s", type(exc).__name__)
+                logger.warning("Worker request failed type=%s detail=%s", type(exc).__name__, str(exc)[:240])
             else:
                 logger.exception("Worker processing failed type=%s", type(exc).__name__)
 

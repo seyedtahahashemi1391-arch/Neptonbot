@@ -826,6 +826,14 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(next_same_chat)
         self.assertEqual(next_same_chat["message_text"], "second")
 
+    def test_root_endpoint_does_not_disclose_runtime_fingerprints(self):
+        response = bot.app.test_client().get("/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {"status": "online", "service": "Nepton"})
+        self.assertNotIn("version", response.get_json())
+        self.assertNotIn("model", response.get_json())
+        self.assertNotIn("provider", response.get_json())
+
     def test_health_endpoint_is_minimal_public_liveness_only(self):
         response = bot.app.test_client().get("/health")
         self.assertEqual(response.status_code, 200)

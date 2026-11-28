@@ -1539,8 +1539,24 @@ def get_live_weather(user_text):
     )
     results = geo.get("results") if isinstance(geo, dict) else None
 
-    # A strict country-filtered Persian lookup can occasionally miss a valid
-    # Iranian city. Retry without the filter, then accept only an Iran result.
+    # Open-Meteo's English-language fallback needs an English place name;
+    # resending the Persian name with language="en" can still return no match.
+    english_city_names = {
+        "تبریز": "Tabriz", "ارومیه": "Urmia", "اردبیل": "Ardabil",
+        "اصفهان": "Isfahan", "کرج": "Karaj", "ایلام": "Ilam",
+        "بوشهر": "Bushehr", "تهران": "Tehran", "شهرکرد": "Shahr-e Kord",
+        "بیرجند": "Birjand", "مشهد": "Mashhad", "بجنورد": "Bojnurd",
+        "اهواز": "Ahvaz", "زنجان": "Zanjan", "سمنان": "Semnan",
+        "زاهدان": "Zahedan", "شیراز": "Shiraz", "قزوین": "Qazvin",
+        "قم": "Qom", "سنندج": "Sanandaj", "کرمان": "Kerman",
+        "کرمانشاه": "Kermanshah", "یاسوج": "Yasuj", "گرگان": "Gorgan",
+        "رشت": "Rasht", "خرم آباد": "Khorramabad", "ساری": "Sari",
+        "اراک": "Arak", "بندرعباس": "Bandar Abbas", "همدان": "Hamadan",
+        "یزد": "Yazd",
+    }
+    english_place = english_city_names.get(normalize_text(place), place)
+
+    # Retry without the strict country filter, using the English alias when known.
     if not isinstance(results, list) or not any(
         isinstance(row, dict)
         and str(row.get("country_code") or "").upper() == "IR"
@@ -1548,7 +1564,7 @@ def get_live_weather(user_text):
     ):
         fallback = _get_json(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": place, "count": 100, "language": "en", "format": "json"},
+            params={"name": english_place, "count": 100, "language": "en", "format": "json"},
         )
         fallback_rows = fallback.get("results") if isinstance(fallback, dict) else None
         if isinstance(fallback_rows, list):

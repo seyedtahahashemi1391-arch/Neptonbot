@@ -279,6 +279,9 @@ elif DATABASE_URL and "://" not in DATABASE_URL:
     # Supabase's pooler URI may be copied without its URL scheme.
     DATABASE_URL = "postgresql://" + DATABASE_URL
 USE_POSTGRES = bool(DATABASE_URL)
+DB_SSLMODE = os.getenv("NEPTON_DB_SSLMODE", "require").strip().lower()
+if DB_SSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+    DB_SSLMODE = "require"
 
 _db_init_lock = threading.Lock()
 _queue_wakeup = threading.Event()
@@ -353,7 +356,7 @@ def _get_postgres_pool():
                 kwargs={
                     "connect_timeout": 10,
                     "application_name": "NeptonBot",
-                    "sslmode": "require",
+                    "sslmode": DB_SSLMODE,
                     "autocommit": True,
                     "row_factory": dict_row,
                 },
@@ -1157,6 +1160,14 @@ def db_requeue_dead_letter(dead_letter_id):
                 db.rollback()
                 return {"ok": False, "reason": "delivery_ambiguous"}
 
+            # The original message is already in dead-letter storage. If all
+            # its outbox parts are still pending, none was sent; remove those
+            # obsolete receipts before creating the replacement queue item.
+            db.execute("""
+                DELETE FROM delivery_outbox
+                WHERE queue_id = ? AND status = 'pending'
+            """, (row["original_queue_id"],))
+
         now = time.time()
         cursor = db.execute("""
             INSERT INTO message_queue(
@@ -1200,7 +1211,7 @@ def db_cleanup_old_records():
         delivery_cutoff = now - PROCESSED_UPDATE_RETENTION_DAYS * 86400
         db.execute(
             """DELETE FROM delivery_outbox
-               WHERE updated_at < ? AND status IN ('sent', 'uncertain')
+               WHERE updated_at < ? AND status IN ('pending', 'sent', 'uncertain')
                  AND NOT EXISTS (
                      SELECT 1 FROM message_queue
                      WHERE message_queue.id = delivery_outbox.queue_id

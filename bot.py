@@ -279,6 +279,9 @@ elif DATABASE_URL and "://" not in DATABASE_URL:
     # Supabase's pooler URI may be copied without its URL scheme.
     DATABASE_URL = "postgresql://" + DATABASE_URL
 USE_POSTGRES = bool(DATABASE_URL)
+DB_SSLMODE = os.getenv("NEPTON_DB_SSLMODE", "require").strip().lower()
+if DB_SSLMODE not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+    DB_SSLMODE = "require"
 
 _db_init_lock = threading.Lock()
 _queue_wakeup = threading.Event()
@@ -353,7 +356,7 @@ def _get_postgres_pool():
                 kwargs={
                     "connect_timeout": 10,
                     "application_name": "NeptonBot",
-                    "sslmode": "require",
+                    "sslmode": DB_SSLMODE,
                     "autocommit": True,
                     "row_factory": dict_row,
                 },

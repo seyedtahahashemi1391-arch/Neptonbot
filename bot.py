@@ -975,6 +975,19 @@ def db_mark_delivery_sent(message_id, response_index):
     return changed == 1
 
 
+def db_reset_delivery_pending(message_id, response_index, reason):
+    """Return a definitely rejected send to pending so the durable queue can retry it."""
+    now = time.time()
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE delivery_outbox
+            SET status = 'pending', updated_at = ?, last_error = ?
+            WHERE queue_id = ? AND response_index = ? AND status = 'sending'
+        """, (now, (reason or "delivery was rejected and is safe to retry")[:500],
+              message_id, response_index)).rowcount
+    return changed == 1
+
+
 def db_mark_delivery_uncertain(message_id, response_index, reason):
     now = time.time()
     with db_connect() as db:
@@ -2371,7 +2384,14 @@ def soroush_request(method, payload=None):
                 retry_after = float(response.headers.get("Retry-After", ""))
             except (TypeError, ValueError):
                 pass
-            raise TransientAPIError(
+            # A rate-limit rejection is an explicit refusal, so a sendMessage
+            # can be retried safely after its outbox receipt returns to pending.
+            error_type = (
+                RetryableDeliveryError
+                if method == "sendMessage" and status == 429
+                else TransientAPIError
+            )
+            raise error_type(
                 f"Soroush temporary HTTP failure: {method} ({status})",
                 retry_after=retry_after,
             )
@@ -2406,7 +2426,16 @@ def soroush_request(method, payload=None):
                 )
             )
             if code == 429 or (code is not None and code >= 500) or transient_text:
-                raise TransientAPIError(
+                rate_limited = code == 429 or any(
+                    marker in description
+                    for marker in ("too many requests", "rate limit", "flood")
+                )
+                error_type = (
+                    RetryableDeliveryError
+                    if method == "sendMessage" and rate_limited
+                    else TransientAPIError
+                )
+                raise error_type(
                     f"Soroush API temporary rejection: {method}",
                     retry_after=retry_after,
                 )
@@ -3117,6 +3146,14 @@ def _process_claimed_item_impl(item, worker_id):
                 send_one_message(
                     part["chat_id"], part["text"], reply_markup=part.get("reply_markup")
                 )
+            except RetryableDeliveryError as exc:
+                if not db_reset_delivery_pending(
+                    message_id, response_index, f"{type(exc).__name__}: {exc}"
+                ):
+                    raise UncertainDeliveryError(
+                        "Could not persist the safe retry state; delivery is quarantined"
+                    ) from exc
+                raise
             except Exception as exc:
                 db_mark_delivery_uncertain(
                     message_id, response_index,
@@ -3208,7 +3245,11 @@ def chat_worker():
 
             if item is not None:
                 try:
-                    attempts_done = int(item.get("attempts", 0)) + 1
+                    # Explicit rate-limit rejections are not processing failures;
+                    # honor Retry-After without consuming the message retry budget.
+                    attempts_done = int(item.get("attempts", 0)) + (
+                        0 if isinstance(exc, RetryableDeliveryError) else 1
+                    )
                     permanent = isinstance(exc, PermanentAPIError)
                     if permanent or attempts_done > MAX_WORKER_RETRIES:
                         failed = db_dead_letter(item["id"], worker_id, str(exc))

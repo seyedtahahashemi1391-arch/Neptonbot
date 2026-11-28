@@ -397,6 +397,18 @@ class SoroushTransportContractTests(unittest.TestCase):
         session.post.assert_called_once()
         self.assertEqual(session.post.call_args.kwargs["allow_redirects"], False)
 
+    def test_http_429_send_message_is_a_safe_retry_rejection(self):
+        response = self.Response(
+            status_code=429,
+            payload={"ok": False},
+            headers={"Retry-After": "6"},
+        )
+        with patch.object(bot, "get_http_session", return_value=self._request(response)):
+            with self.assertRaises(bot.TransientAPIError) as raised:
+                bot.soroush_request("sendMessage", {"chat_id": "test", "text": "hello"})
+        self.assertIsInstance(raised.exception, bot.RetryableDeliveryError)
+        self.assertEqual(raised.exception.retry_after, 6.0)
+
     def test_http_5xx_is_transient(self):
         response = self.Response(status_code=503, payload={"error": "maintenance"})
         with patch.object(bot, "get_http_session", return_value=self._request(response)):
@@ -441,6 +453,7 @@ class SoroushTransportContractTests(unittest.TestCase):
         with patch.object(bot, "get_http_session", return_value=self._request(response)):
             with self.assertRaises(bot.TransientAPIError) as raised:
                 bot.soroush_request("sendMessage", {"chat_id": "test", "text": "hello"})
+        self.assertIsInstance(raised.exception, bot.RetryableDeliveryError)
         self.assertEqual(raised.exception.retry_after, 4.0)
 
 
@@ -553,6 +566,68 @@ class DatabaseWorkflowTests(unittest.TestCase):
             self.assertEqual(send.call_count, 1)
         receipt = bot.db_get_delivery_state(item["id"], 0)
         self.assertEqual(receipt["status"], "uncertain")
+
+    def test_worker_rate_limit_does_not_consume_processing_retry_budget(self):
+        event = bot._polling_stop
+        event.clear()
+        item = {
+            "id": 987654,
+            "attempts": 3,
+            "chat_id": "chat-rate-limit-worker",
+            "message_text": "hello",
+        }
+
+        def stop_after_retry(delay):
+            event.set()
+            return True
+
+        try:
+            with patch.object(bot, "_worker_id", return_value="rate-limit-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ), patch.object(
+                bot, "_process_claimed_item",
+                side_effect=bot.RetryableDeliveryError("rate limited", retry_after=9),
+            ), patch.object(
+                bot, "db_retry_message", return_value=True
+            ) as retry, patch.object(
+                event, "wait", side_effect=stop_after_retry
+            ):
+                bot.chat_worker()
+
+            self.assertEqual(retry.call_count, 1)
+            self.assertEqual(retry.call_args.args[2], 3)
+            self.assertEqual(retry.call_args.kwargs["retry_after"], 9)
+        finally:
+            event.clear()
+
+    def test_chaos_rate_limited_send_returns_outbox_to_pending_for_retry(self):
+        self.assertTrue(bot.db_enqueue_updates([(3202, "chat-rate-limit", "hello")], 3203))
+        item = bot.db_claim_next_message("rate-limit-worker")
+        self.assertIsNotNone(item)
+        with patch.object(bot, "build_response_plan", return_value={
+            "responses": [("chat-rate-limit", "response")],
+            "reply_markup": None,
+        }), patch.object(
+            bot, "send_one_message",
+            side_effect=bot.RetryableDeliveryError("rate limited", retry_after=5),
+        ) as send:
+            with self.assertRaises(bot.RetryableDeliveryError):
+                bot._process_claimed_item_impl(item, "rate-limit-worker")
+
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "pending")
+        self.assertEqual(send.call_count, 1)
+        retry_started = time.time()
+        self.assertTrue(bot.db_retry_message(
+            item["id"], "rate-limit-worker", 1, "rate limited", retry_after=5
+        ))
+        with bot.db_connect() as db:
+            row = db.execute(
+                "SELECT status, attempts, retry_at FROM message_queue WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 1)
+        self.assertGreaterEqual(row["retry_at"], retry_started + 4.5)
 
     def test_chaos_sent_receipt_survives_cursor_write_failure(self):
         self.assertTrue(bot.db_enqueue_updates([(3203, "chat-chaos", "hello")], 3204))

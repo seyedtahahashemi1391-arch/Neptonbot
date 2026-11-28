@@ -433,11 +433,10 @@ class DatabaseWorkflowTests(unittest.TestCase):
         with patch.object(bot, "build_response_plan", return_value={
             "responses": [("chat-chaos", "response")],
             "reply_markup": None,
-        }), patch.object(bot, "send_one_message") as send, patch.object(
-            bot, "db_advance_response", return_value=False
-        ):
-            with self.assertRaises(RuntimeError):
-                bot._process_claimed_item_impl(item, "chaos-worker")
+        }), patch.object(bot, "send_one_message") as send:
+            with patch.object(bot, "db_advance_response", return_value=False):
+                with self.assertRaises(RuntimeError):
+                    bot._process_claimed_item_impl(item, "chaos-worker")
             item["response_plan"] = bot.json.dumps(plan)
             item["response_index"] = 0
             bot._process_claimed_item_impl(item, "chaos-worker")

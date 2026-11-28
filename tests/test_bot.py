@@ -376,9 +376,10 @@ class SoroushTransportContractTests(unittest.TestCase):
 
     def _request(self, response=None, side_effect=None):
         from types import SimpleNamespace
+        from unittest.mock import Mock
 
         session = SimpleNamespace(
-            post=unittest.mock.Mock(return_value=response, side_effect=side_effect)
+            post=Mock(return_value=response, side_effect=side_effect)
         )
         return session
 

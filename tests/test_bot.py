@@ -370,7 +370,7 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(first["status"], "pending")
         self.assertEqual(first["message_text"], "first")
         self.assertEqual(second["status"], "pending")
-        self.assertEqual(json.loads(second["reply_markup"]), {"inline_keyboard": []})
+        self.assertEqual(bot.json.loads(second["reply_markup"]), {"inline_keyboard": []})
 
     def test_legacy_response_plan_migration_quarantines_ambiguous_cursor(self):
         self.assertTrue(bot.db_enqueue_updates([(2002, "chat-legacy", "hello")], 2003))

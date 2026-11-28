@@ -927,7 +927,7 @@ def db_mark_delivery_uncertain(message_id, response_index, reason):
             UPDATE delivery_outbox
             SET status = 'uncertain', updated_at = ?, last_error = ?
             WHERE queue_id = ? AND response_index = ? AND status = 'sending'
-        """, ((reason or "delivery outcome uncertain")[:500], now, message_id, response_index)).rowcount
+        """, (now, (reason or "delivery outcome uncertain")[:500], message_id, response_index)).rowcount
     return changed == 1
 
 
@@ -1166,6 +1166,11 @@ class PermanentAPIError(Exception):
 
 
 class RetryableDeliveryError(TransientAPIError):
+    pass
+
+
+class UncertainDeliveryError(PermanentAPIError):
+    """External send may have succeeded; do not retry automatically."""
     pass
 
 
@@ -2944,7 +2949,7 @@ def _process_claimed_item_impl(item, worker_id):
         if delivery is None:
             raise RuntimeError("Durable outbox record is missing")
         if delivery["status"] == "uncertain":
-            raise PermanentAPIError(
+            raise UncertainDeliveryError(
                 "Delivery outcome is uncertain; automatic resend is disabled to avoid duplicates"
             )
         if delivery["status"] == "sending":
@@ -2952,7 +2957,7 @@ def _process_claimed_item_impl(item, worker_id):
                 message_id, response_index,
                 "worker recovered while delivery was in progress",
             )
-            raise PermanentAPIError(
+            raise UncertainDeliveryError(
                 "Delivery outcome is uncertain after interruption; automatic resend is disabled"
             )
         if delivery["status"] != "sent":
@@ -2967,7 +2972,7 @@ def _process_claimed_item_impl(item, worker_id):
                     message_id, response_index,
                     f"{type(exc).__name__}: {exc}",
                 )
-                raise PermanentAPIError(
+                raise UncertainDeliveryError(
                     "Delivery outcome is uncertain; automatic resend is disabled to avoid duplicates"
                 ) from exc
             if not db_mark_delivery_sent(message_id, response_index):
@@ -3057,7 +3062,7 @@ def chat_worker():
                     permanent = isinstance(exc, PermanentAPIError)
                     if permanent or attempts_done > MAX_WORKER_RETRIES:
                         failed = db_dead_letter(item["id"], worker_id, str(exc))
-                        if failed is not None:
+                        if failed is not None and not isinstance(exc, UncertainDeliveryError):
                             try:
                                 send_one_message(
                                     failed["chat_id"],
@@ -3066,6 +3071,12 @@ def chat_worker():
                                 )
                             except Exception:
                                 logger.warning("Could not send final failure notice")
+                        elif failed is not None:
+                            logger.error(
+                                "Queue item quarantined because delivery outcome is uncertain; "
+                                "no automatic resend or failure notice was sent id=%s",
+                                failed["id"],
+                            )
                     else:
                         db_retry_message(
                             item["id"], worker_id, attempts_done, str(exc),

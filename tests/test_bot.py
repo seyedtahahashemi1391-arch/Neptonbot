@@ -66,6 +66,16 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot.extract_message(update), ("123", "سلام"))
         self.assertEqual(bot.get_update_id(update), 12)
 
+    def test_audio_messages_are_ignored(self):
+        update = {
+            "message": {
+                "chat": {"id": 123, "type": "private"},
+                "from": {"id": 123},
+                "voice": {"file_id": "audio-file-id"},
+            }
+        }
+        self.assertIsNone(bot.extract_message(update))
+
     def test_reply_context_is_preserved_for_ai(self):
         update = {
             "message": {

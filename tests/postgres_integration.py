@@ -80,6 +80,41 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         self.assertEqual([entry["role"] for entry in history], ["user", "assistant"])
         self.assertEqual(bot.db_get_offset(), update_id + 1)
 
+
+    def test_postgres_workers_claim_distinct_messages_concurrently(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        updates = []
+        expected_chats = set()
+        for index in range(8):
+            chat_id = self._chat_id(f"parallel-{index}")
+            expected_chats.add(chat_id)
+            updates.append((self._update_id(), chat_id, f"parallel message {index}"))
+
+        self.assertTrue(bot.db_enqueue_updates(updates, max(row[0] for row in updates) + 1))
+        claimed = []
+        try:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [
+                    executor.submit(bot.db_claim_next_message, f"postgres-parallel-{index}")
+                    for index in range(8)
+                ]
+                claimed = [future.result(timeout=20) for future in futures]
+
+            self.assertTrue(all(item is not None for item in claimed))
+            self.assertEqual(len({item["id"] for item in claimed}), 8)
+            self.assertEqual({item["chat_id"] for item in claimed}, expected_chats)
+            self.assertTrue(all(item["status"] == "pending" for item in claimed))
+        finally:
+            ids = [item["id"] for item in claimed if item is not None]
+            if ids:
+                with bot.db_connect() as db:
+                    db.execute(
+                        "DELETE FROM message_queue WHERE id IN (" +
+                        ",".join("?" for _ in ids) + ")",
+                        tuple(ids),
+                    )
+
     def test_dead_letter_can_be_requeued_without_losing_record(self):
         chat_id = self._chat_id("deadletter")
         update_id = self._update_id()

@@ -126,6 +126,15 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         )
         item = bot.db_claim_next_message("postgres-ci-dead-worker")
         self.assertIsNotNone(item)
+        self.assertTrue(
+            bot.db_prepare_response_plan(
+                item["id"],
+                "postgres-ci-dead-worker",
+                [{"chat_id": chat_id, "text": "unsent pending outbox reply"}],
+                history_user="dead-letter integration message",
+                history_assistant="unsent pending outbox reply",
+            )
+        )
         bot.db_dead_letter(item["id"], "postgres-ci-dead-worker", "integration test")
 
         matches = [
@@ -137,6 +146,12 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
 
         result = bot.db_requeue_dead_letter(dead_letter_id)
         self.assertTrue(result["ok"], result)
+        with bot.db_connect() as db:
+            orphaned_outbox = db.execute(
+                "SELECT COUNT(*) AS n FROM delivery_outbox WHERE queue_id = ?",
+                (item["id"],),
+            ).fetchone()["n"]
+        self.assertEqual(orphaned_outbox, 0)
         self.assertEqual(
             bot.db_requeue_dead_letter(dead_letter_id)["reason"],
             "not_found",

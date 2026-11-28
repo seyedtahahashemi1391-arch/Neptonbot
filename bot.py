@@ -59,8 +59,8 @@ if AI_MODE not in {"auto", "cloudflare", "rules"}:
     AI_MODE = "auto"
 AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
 AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
-VERSION = "3.3.22"
-ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
+VERSION = "3.3.23"
+ADMIN_CHAT_ID = os.getenv("NEPTON_ADMIN_CHAT_ID", "").strip()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
 CLOUDFLARE_URL = (
@@ -1236,6 +1236,16 @@ def db_cleanup_old_records():
 # Runtime state and Flask app
 # =========================================================
 app = Flask(__name__)
+# This bot uses polling; cap any accidental inbound request bodies and keep
+# health responses out of shared caches.
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    return response
 
 admin_lock = threading.Lock()
 admin_chat_id = None
@@ -1314,8 +1324,11 @@ class UncertainDeliveryError(PermanentAPIError):
 def load_persistent_runtime_state():
     global admin_chat_id
     saved_admin = db_get_admin_chat_id()
+    # Explicit environment configuration takes precedence over the persisted
+    # value; otherwise retain the existing, previously registered admin.
+    configured_admin = ADMIN_CHAT_ID or saved_admin
     with admin_lock:
-        admin_chat_id = saved_admin
+        admin_chat_id = configured_admin
 
 
 def set_admin_chat_id(chat_id):
@@ -1527,78 +1540,8 @@ def home():
 
 @app.get("/health")
 def health():
-    try:
-        try:
-            stats = db_queue_stats()
-            database_connected = True
-        except Exception as exc:
-            stats = {}
-            database_connected = False
-            logger.warning("Health check database unavailable type=%s", type(exc).__name__)
-
-        polling_running = _polling_thread is not None and _polling_thread.is_alive()
-        with _service_lock:
-            worker_snapshot = list(_worker_threads)
-        live_workers = sum(worker.is_alive() for worker in worker_snapshot)
-        with _poll_health_lock:
-            last_success = _last_poll_success_at
-            last_error_at = _last_poll_error_at
-            last_error_type = _last_poll_error_type
-        poll_age = (time.time() - last_success) if last_success is not None else None
-        poll_fresh = poll_age is not None and poll_age <= max(60, SOROUSH_TIMEOUT[1] * 2)
-        runtime_healthy = _runtime_active and polling_running and live_workers >= 1
-        fully_healthy = runtime_healthy and poll_fresh and database_connected
-
-        queue_depth = int(stats.get("queued_messages", 0))
-        queue_capacity = MAX_QUEUED_MESSAGES
-        queue_utilization = round((queue_depth / queue_capacity) * 100, 1)
-        ai_circuit = _cloudflare_circuit_status()
-        alerts = []
-        if not database_connected:
-            alerts.append("database_unavailable")
-        if not runtime_healthy:
-            alerts.append("runtime_not_healthy")
-        if not poll_fresh:
-            alerts.append("polling_stale")
-        if queue_utilization >= 80:
-            alerts.append("queue_capacity_high")
-        if int(stats.get("dead_letters", 0)) > 0:
-            alerts.append("dead_letters_open")
-        if int(stats.get("outbox_uncertain", 0)) > 0:
-            alerts.append("outbox_delivery_uncertain")
-        if "موقتاً قطع" in ai_circuit:
-            alerts.append("ai_provider_circuit_open")
-
-        payload = {
-            "status": "healthy" if fully_healthy else "degraded",
-            "database_connected": database_connected,
-            "polling_fresh": poll_fresh,
-            "runtime_owner": _runtime_active,
-            "runtime_lock_acquired": _runtime_lock_acquired,
-            "polling": "running" if polling_running else "stopped",
-            "workers_alive": live_workers,
-            "workers_expected": MAX_PARALLEL_CHATS,
-            "last_poll_success_seconds_ago": round(poll_age, 1) if poll_age is not None else None,
-            "last_poll_error_type": last_error_type,
-            "last_poll_error_seconds_ago": (
-                round(time.time() - last_error_at, 1) if last_error_at is not None else None
-            ),
-            "ai_mode": AI_MODE,
-            "ai_circuit": ai_circuit,
-            "sentry_enabled": SENTRY_ENABLED,
-            "queue_capacity": queue_capacity,
-            "queue_utilization_percent": queue_utilization,
-            "alerts": alerts,
-            "version": VERSION,
-            "model": MODEL,
-        }
-        payload.update(stats)
-        # Liveness is distinct from readiness: keep the HTTP process available
-        # while the runtime retries a temporarily unavailable database.
-        return jsonify(payload), 200
-    except Exception:
-        logger.exception("Health check failed")
-        return jsonify({"status": "unhealthy", "version": VERSION}), 503
+    """Minimal public liveness probe; operational diagnostics stay in /admin."""
+    return jsonify({"status": "online"}), 200
 
 
 # =========================================================
@@ -2655,21 +2598,6 @@ def extract_message(update):
     if isinstance(chat_id, (dict, list)) or chat_id is None:
         return None
 
-    username = sender.get("username") if isinstance(sender, dict) else None
-    normalized_username = (
-        username.strip().lstrip("@").lower() if isinstance(username, str) else None
-    )
-    chat_type = chat.get("type") if isinstance(chat, dict) else None
-    if chat_type is None:
-        chat_type = message.get("chat_type")
-    sender_id = sender.get("id") if isinstance(sender, dict) else None
-    if chat_type is not None:
-        is_private = str(chat_type).strip().lower() in {"private", "personal", "user"}
-    else:
-        is_private = sender_id is not None and str(sender_id) == str(chat_id)
-
-    if normalized_username == ADMIN_USERNAME and is_private:
-        set_admin_chat_id(chat_id)
     return str(chat_id), message_text
 
 
@@ -2859,7 +2787,7 @@ def build_response_plan(chat_id, text):
 
     admin_id = get_admin_chat_id()
     if command == "/admin":
-        if admin_id is None or str(chat_id) != str(admin_id):
+        if not admin_id or str(chat_id) != str(admin_id):
             message = "این دستور فقط برای مدیر ربات فعال است."
         else:
             try:
@@ -2910,7 +2838,7 @@ def build_response_plan(chat_id, text):
         }
 
     if command in {"/deadletters", "/deadletter_retry"}:
-        if admin_id is None or str(chat_id) != str(admin_id):
+        if not admin_id or str(chat_id) != str(admin_id):
             message = "این دستور فقط برای مدیر ربات فعال است."
         elif command == "/deadletters":
             try:

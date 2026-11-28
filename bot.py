@@ -59,7 +59,7 @@ if AI_MODE not in {"auto", "cloudflare", "rules"}:
     AI_MODE = "auto"
 AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
 AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
-VERSION = "3.3.21"
+VERSION = "3.3.22"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -721,35 +721,36 @@ def db_recover_interrupted_jobs():
         _queue_wakeup.set()
 
 def db_queue_stats():
+    """Read queue, outbox, and dead-letter counters in one database round trip."""
     now = time.time()
     with db_connect() as db:
-        rows = db.execute(
-            "SELECT status, COUNT(*) AS n FROM message_queue GROUP BY status"
-        ).fetchall()
-        oldest = db.execute(
-            "SELECT MIN(queued_at) AS oldest FROM message_queue"
-        ).fetchone()["oldest"]
-        dead_count = db.execute(
-            "SELECT COUNT(*) AS n FROM dead_letters WHERE status = 'open'"
-        ).fetchone()["n"]
-        outbox_rows = db.execute(
-            "SELECT status, COUNT(*) AS n FROM delivery_outbox GROUP BY status"
-        ).fetchall()
-        next_retry = db.execute(
-            "SELECT MIN(retry_at) AS retry_at FROM message_queue WHERE status = 'pending'"
-        ).fetchone()["retry_at"]
-    by_status = {row["status"]: int(row["n"]) for row in rows}
+        row = db.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM message_queue) AS queued_messages,
+                (SELECT COUNT(*) FROM message_queue WHERE status = 'pending') AS pending_messages,
+                (SELECT COUNT(*) FROM message_queue WHERE status = 'processing') AS processing_messages,
+                (SELECT MIN(queued_at) FROM message_queue) AS oldest_queued_at,
+                (SELECT MIN(retry_at) FROM message_queue WHERE status = 'pending') AS next_retry_at,
+                (SELECT COUNT(*) FROM dead_letters WHERE status = 'open') AS dead_letters,
+                (SELECT COUNT(*) FROM delivery_outbox WHERE status = 'pending') AS outbox_pending,
+                (SELECT COUNT(*) FROM delivery_outbox WHERE status = 'sent') AS outbox_sent,
+                (SELECT COUNT(*) FROM delivery_outbox WHERE status = 'uncertain') AS outbox_uncertain,
+                (SELECT COUNT(*) FROM delivery_outbox WHERE status = 'sending') AS outbox_sending
+        """).fetchone()
+
+    oldest = row["oldest_queued_at"]
+    next_retry = row["next_retry_at"]
     return {
-        "queued_messages": sum(by_status.values()),
-        "pending_messages": by_status.get("pending", 0),
-        "processing_messages": by_status.get("processing", 0),
+        "queued_messages": int(row["queued_messages"] or 0),
+        "pending_messages": int(row["pending_messages"] or 0),
+        "processing_messages": int(row["processing_messages"] or 0),
         "oldest_queue_age_seconds": round(max(0, now - oldest), 1) if oldest else 0,
         "next_retry_in_seconds": round(max(0, next_retry - now), 1) if next_retry else None,
-        "dead_letters": int(dead_count),
-        "outbox_pending": sum(int(row["n"]) for row in outbox_rows if row["status"] == "pending"),
-        "outbox_sent": sum(int(row["n"]) for row in outbox_rows if row["status"] == "sent"),
-        "outbox_uncertain": sum(int(row["n"]) for row in outbox_rows if row["status"] == "uncertain"),
-        "outbox_sending": sum(int(row["n"]) for row in outbox_rows if row["status"] == "sending"),
+        "dead_letters": int(row["dead_letters"] or 0),
+        "outbox_pending": int(row["outbox_pending"] or 0),
+        "outbox_sent": int(row["outbox_sent"] or 0),
+        "outbox_uncertain": int(row["outbox_uncertain"] or 0),
+        "outbox_sending": int(row["outbox_sending"] or 0),
     }
 
 

@@ -1,7 +1,9 @@
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import os
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -477,6 +479,119 @@ class DatabaseWorkflowTests(unittest.TestCase):
         result = bot.db_requeue_dead_letter(bot.db_list_dead_letters()[0]["id"])
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "delivery_ambiguous")
+
+    def test_load_queue_capacity_rejects_overflow_atomically(self):
+        batch = [
+            (50000 + index, f"load-chat-{index}", f"message-{index}")
+            for index in range(600)
+        ]
+        started = time.monotonic()
+        self.assertTrue(bot.db_enqueue_updates(batch, 50600))
+        elapsed = time.monotonic() - started
+        self.assertEqual(bot.db_queue_stats()["queued_messages"], 600)
+        self.assertLess(elapsed, 20.0)
+
+        overflow = [
+            (60000 + index, f"overflow-chat-{index}", f"message-{index}")
+            for index in range(401)
+        ]
+        self.assertFalse(bot.db_enqueue_updates(overflow, 60401))
+        self.assertEqual(bot.db_queue_stats()["queued_messages"], 600)
+        self.assertNotEqual(bot.db_get_offset(), 60401)
+
+    def test_load_concurrent_workers_claim_each_message_once(self):
+        total_messages = 64
+        worker_count = 8
+        batch = [
+            (70000 + index, f"parallel-chat-{index}", f"payload-{index}")
+            for index in range(total_messages)
+        ]
+        self.assertTrue(bot.db_enqueue_updates(batch, 70064))
+
+        barrier = threading.Barrier(worker_count)
+        claimed_ids = []
+        claimed_lock = threading.Lock()
+        previous_sweep = bot._last_lease_sweep
+        bot._last_lease_sweep = time.monotonic()
+
+        def claim_until_empty(worker_number):
+            worker_id = f"load-worker-{worker_number}"
+            local_ids = []
+            barrier.wait(timeout=10)
+            while True:
+                item = bot.db_claim_next_message(worker_id)
+                if item is None:
+                    break
+                local_ids.append(item["id"])
+            with claimed_lock:
+                claimed_ids.extend(local_ids)
+            return len(local_ids)
+
+        started = time.monotonic()
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(claim_until_empty, range(worker_count)))
+        finally:
+            bot._last_lease_sweep = previous_sweep
+
+        elapsed = time.monotonic() - started
+        self.assertEqual(sum(results), total_messages)
+        self.assertEqual(len(claimed_ids), total_messages)
+        self.assertEqual(len(set(claimed_ids)), total_messages)
+        self.assertEqual(bot.db_queue_stats()["processing_messages"], total_messages)
+        self.assertLess(elapsed, 30.0)
+
+    def test_database_diagnostics_are_aggregated_and_history_index_is_used(self):
+        self.assertTrue(bot.db_enqueue_updates([
+            (81001, "stats-chat-a", "first"),
+            (81002, "stats-chat-b", "second"),
+        ], 81003))
+        claimed = bot.db_claim_next_message("stats-worker")
+        self.assertIsNotNone(claimed)
+        self.assertTrue(bot.db_prepare_response_plan(
+            claimed["id"],
+            "stats-worker",
+            [
+                {"chat_id": "stats-chat-a", "text": "pending"},
+                {"chat_id": "stats-chat-a", "text": "sent"},
+                {"chat_id": "stats-chat-a", "text": "uncertain"},
+                {"chat_id": "stats-chat-a", "text": "sending"},
+            ],
+        ))
+        with bot.db_connect() as db:
+            db.execute("""
+                UPDATE delivery_outbox
+                SET status = CASE response_index
+                    WHEN 1 THEN 'sent'
+                    WHEN 2 THEN 'uncertain'
+                    WHEN 3 THEN 'sending'
+                    ELSE 'pending'
+                END
+                WHERE queue_id = ?
+            """, (claimed["id"],))
+            db.execute("""
+                INSERT INTO dead_letters(
+                    original_queue_id, update_id, chat_id, message_text,
+                    attempts, last_error, failed_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (claimed["id"], 81001, "stats-chat-a", "failed", 1, "test", time.time(), "open"))
+
+            plan = db.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT role, content FROM conversation_history
+                WHERE chat_id = ? ORDER BY id DESC LIMIT ?
+            """, ("stats-chat-a", bot.MAX_HISTORY_MESSAGES)).fetchall()
+
+        stats = bot.db_queue_stats()
+        self.assertEqual(stats["queued_messages"], 2)
+        self.assertEqual(stats["pending_messages"], 1)
+        self.assertEqual(stats["processing_messages"], 1)
+        self.assertEqual(stats["dead_letters"], 1)
+        self.assertEqual(stats["outbox_pending"], 1)
+        self.assertEqual(stats["outbox_sent"], 1)
+        self.assertEqual(stats["outbox_uncertain"], 1)
+        self.assertEqual(stats["outbox_sending"], 1)
+        self.assertTrue(any("idx_history_chat_id" in row["detail"] for row in plan))
 
     def test_queue_deduplication_and_durable_completion(self):
         update = (1001, "chat-1", "سلام")

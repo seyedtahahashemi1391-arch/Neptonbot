@@ -231,5 +231,66 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             db.execute("DELETE FROM message_queue WHERE id = ?", (item["id"],))
 
 
+    def test_runtime_lease_blocks_active_owner_and_recovers_expired_owner(self):
+        previous_owner = bot._runtime_owner_id
+        previous_acquired = bot._runtime_lock_acquired
+        test_owner = f"postgres-lease-test-{self.suffix}"
+        bot._runtime_owner_id = test_owner
+        bot._runtime_lock_acquired = False
+        try:
+            now = time.time()
+            with bot.db_connect() as db:
+                db.execute("""
+                    INSERT INTO nepton_runtime_leases(
+                        lock_name, owner_id, lease_until, updated_at
+                    ) VALUES('primary', ?, ?, ?)
+                    ON CONFLICT(lock_name) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        lease_until = excluded.lease_until,
+                        updated_at = excluded.updated_at
+                """, ("another-active-owner", now + 300, now))
+
+            self.assertFalse(bot.acquire_runtime_lock())
+            self.assertFalse(bot._runtime_lock_acquired)
+
+            with bot.db_connect() as db:
+                db.execute("""
+                    UPDATE nepton_runtime_leases
+                    SET lease_until = ?, updated_at = ?
+                    WHERE lock_name = 'primary'
+                """, (time.time() - 10, time.time()))
+
+            self.assertTrue(bot.acquire_runtime_lock())
+            self.assertTrue(bot._runtime_lock_acquired)
+            self.assertTrue(bot._renew_runtime_lock())
+
+            # A stale process must not delete a lease now owned by another node.
+            with bot.db_connect() as db:
+                db.execute("""
+                    UPDATE nepton_runtime_leases
+                    SET owner_id = ?, lease_until = ?
+                    WHERE lock_name = 'primary'
+                """, ("replacement-owner", time.time() + 300))
+
+            bot._release_runtime_lock()
+            with bot.db_connect() as db:
+                row = db.execute("""
+                    SELECT owner_id FROM nepton_runtime_leases
+                    WHERE lock_name = 'primary'
+                """).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["owner_id"], "replacement-owner")
+        finally:
+            bot._release_runtime_lock()
+            with bot.db_connect() as db:
+                db.execute(
+                    "DELETE FROM nepton_runtime_leases WHERE lock_name = 'primary' "
+                    "AND owner_id IN (?, ?)",
+                    (test_owner, "replacement-owner"),
+                )
+            bot._runtime_owner_id = previous_owner
+            bot._runtime_lock_acquired = previous_acquired
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -100,6 +100,15 @@ class ParsingTests(unittest.TestCase):
                 bot._ai_circuit_open_until = 0.0
                 bot._ai_circuit_probe_in_progress = False
 
+    def test_call_ai_falls_back_when_cloudflare_network_fails(self):
+        with patch.object(bot, "get_history", return_value=[]), patch.object(
+            bot, "get_live_context", return_value=""
+        ), patch.object(
+            bot, "cloudflare_post_with_retry", side_effect=bot.TransientAPIError("offline")
+        ):
+            answer = bot.call_ai("offline-chat", "یک سؤال ناشناخته")
+        self.assertIn("اتصال سرویس هوش مصنوعی", answer)
+
     def test_call_ai_uses_rules_when_cloudflare_credentials_are_missing(self):
         with patch.object(bot, "CLOUDFLARE_ACCOUNT_ID", ""), patch.object(
             bot, "CLOUDFLARE_API_TOKEN", ""

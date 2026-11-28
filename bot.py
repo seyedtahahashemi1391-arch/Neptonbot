@@ -964,8 +964,10 @@ def db_cleanup_old_records():
                 GROUP BY chat_id ORDER BY MAX(created_at) DESC LIMIT ?
             )
         """, (MAX_CONVERSATIONS,))
+        # Avoid a literal percent sign in SQL: psycopg treats it as a
+        # placeholder marker even inside a quoted LIKE pattern.
         weather_states = db.execute(
-            "SELECT key, value FROM bot_state WHERE key LIKE 'weather_pending_%'"
+            "SELECT key, value FROM bot_state WHERE substr(key, 1, 16) = 'weather_pending_'"
         ).fetchall()
         for state in weather_states:
             try:

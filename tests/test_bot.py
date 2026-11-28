@@ -372,6 +372,25 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(second["status"], "pending")
         self.assertEqual(json.loads(second["reply_markup"]), {"inline_keyboard": []})
 
+    def test_legacy_response_plan_migration_quarantines_ambiguous_cursor(self):
+        self.assertTrue(bot.db_enqueue_updates([(2002, "chat-legacy", "hello")], 2003))
+        item = bot.db_claim_next_message("legacy-worker")
+        legacy_plan = [
+            {"chat_id": "chat-legacy", "text": "already sent"},
+            {"chat_id": "chat-legacy", "text": "possibly sent"},
+            {"chat_id": "chat-legacy", "text": "not yet sent"},
+        ]
+        with bot.db_connect() as db:
+            db.execute(
+                "UPDATE message_queue SET response_plan = ?, response_index = 1 WHERE id = ?",
+                (json.dumps(legacy_plan), item["id"]),
+            )
+            db.execute("DELETE FROM delivery_outbox WHERE queue_id = ?", (item["id"],))
+        bot.init_database()
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "sent")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 1)["status"], "uncertain")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 2)["status"], "pending")
+
     def test_outbox_sent_receipt_prevents_duplicate_send_after_cursor_gap(self):
         self.assertTrue(bot.db_enqueue_updates([(2003, "chat-outbox", "hello")], 2004))
         item = bot.db_claim_next_message("outbox-worker")

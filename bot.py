@@ -1504,7 +1504,34 @@ def get_live_weather(user_text):
     """Return a concise weather summary; malformed provider data never poisons the queue."""
     place = _weather_location(user_text)
     if not place:
-        return "نام شهر را بفرست تا وضعیت هوا را بگویم."
+        return "نام شهر یا استان را بفرست تا وضعیت هوا را بگویم."
+
+    # Province names are accepted and resolved to their provincial capitals.
+    # This keeps the forecast provider's geocoding focused on a real city.
+    def _province_key(value):
+        value = normalize_text(value)
+        value = re.sub(r"^استان\\s+", "", value)
+        return re.sub(r"\\s+", "", value)
+
+    province_capitals = {
+        "آذربایجان شرقی": "تبریز", "آذربایجان غربی": "ارومیه",
+        "اردبیل": "اردبیل", "اصفهان": "اصفهان", "البرز": "کرج",
+        "ایلام": "ایلام", "بوشهر": "بوشهر", "تهران": "تهران",
+        "چهارمحال و بختیاری": "شهرکرد", "خراسان جنوبی": "بیرجند",
+        "خراسان رضوی": "مشهد", "خراسان شمالی": "بجنورد",
+        "خوزستان": "اهواز", "زنجان": "زنجان", "سمنان": "سمنان",
+        "سیستان و بلوچستان": "زاهدان", "فارس": "شیراز", "قزوین": "قزوین",
+        "قم": "قم", "کردستان": "سنندج", "کرمان": "کرمان",
+        "کرمانشاه": "کرمانشاه", "کهگیلویه و بویراحمد": "یاسوج",
+        "گلستان": "گرگان", "گیلان": "رشت", "لرستان": "خرم‌آباد",
+        "مازندران": "ساری", "مرکزی": "اراک", "هرمزگان": "بندرعباس",
+        "همدان": "همدان", "یزد": "یزد",
+    }
+    province_lookup = {_province_key(name): capital for name, capital in province_capitals.items()}
+    requested_place = place
+    capital = province_lookup.get(_province_key(place))
+    if capital:
+        place = capital
 
     geo = _get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
@@ -2496,7 +2523,7 @@ def build_response_plan(chat_id, text):
         expires_at = int(time.time()) + 300
         db_set_state(weather_state_key, str(expires_at))
         return {
-            "responses": [(chat_id, "نام شهری که در ایران وجود دارد را بنویسید")],
+            "responses": [(chat_id, "نام شهر یا استان ایران را بنویسید")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }
@@ -2715,7 +2742,7 @@ def chat_worker():
 
         except Exception as exc:
             if isinstance(exc, (TransientAPIError, PermanentAPIError)):
-                logger.warning("Worker request failed type=%s", type(exc).__name__)
+                logger.warning("Worker request failed type=%s detail=%s", type(exc).__name__, str(exc)[:240])
             else:
                 logger.exception("Worker processing failed type=%s", type(exc).__name__)
 

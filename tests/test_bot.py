@@ -334,6 +334,40 @@ class DatabaseWorkflowTests(unittest.TestCase):
             ):
                 db.execute(f"DELETE FROM {table}")
 
+    def test_dead_letter_can_be_listed_and_safely_requeued(self):
+        self.assertTrue(bot.db_enqueue_updates([(3101, "chat-dead", "retry me")], 3102))
+        item = bot.db_claim_next_message("dead-worker")
+        bot.db_dead_letter(item["id"], "dead-worker", "temporary processing failure")
+        listed = bot.db_list_dead_letters()
+        self.assertEqual(len(listed), 1)
+        dead_id = listed[0]["id"]
+        result = bot.db_requeue_dead_letter(dead_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(bot.db_list_dead_letters(), [])
+        with bot.db_connect() as db:
+            queued = db.execute(
+                "SELECT chat_id, message_text, status, update_id FROM message_queue WHERE id = ?",
+                (result["queue_id"],),
+            ).fetchone()
+        self.assertEqual(queued["chat_id"], "chat-dead")
+        self.assertEqual(queued["message_text"], "retry me")
+        self.assertEqual(queued["status"], "pending")
+        self.assertIsNone(queued["update_id"])
+        self.assertEqual(bot.db_requeue_dead_letter(dead_id)["reason"], "not_found")
+
+    def test_dead_letter_requeue_refuses_partial_or_uncertain_delivery(self):
+        self.assertTrue(bot.db_enqueue_updates([(3103, "chat-dead", "retry me")], 3104))
+        item = bot.db_claim_next_message("dead-worker")
+        bot.db_prepare_response_plan(
+            item["id"], "dead-worker", [{"chat_id": "chat-dead", "text": "maybe sent"}]
+        )
+        bot.db_mark_delivery_sending(item["id"], 0)
+        bot.db_mark_delivery_uncertain(item["id"], 0, "connection reset")
+        bot.db_dead_letter(item["id"], "dead-worker", "uncertain delivery")
+        result = bot.db_requeue_dead_letter(bot.db_list_dead_letters()[0]["id"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "delivery_ambiguous")
+
     def test_queue_deduplication_and_durable_completion(self):
         update = (1001, "chat-1", "سلام")
         self.assertTrue(bot.db_enqueue_updates([update], 1002))

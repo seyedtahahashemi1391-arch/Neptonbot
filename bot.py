@@ -59,7 +59,7 @@ if AI_MODE not in {"auto", "cloudflare", "rules"}:
     AI_MODE = "auto"
 AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
 AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
-VERSION = "3.3.19"
+VERSION = "3.3.20"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -609,8 +609,18 @@ def init_database():
                     response_index INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL,
                     last_error TEXT,
-                    failed_at REAL NOT NULL
+                    failed_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    requeued_at REAL,
+                    requeued_queue_id INTEGER
                 )
+            """)
+            _add_column_if_missing(db, "dead_letters", "status", "TEXT NOT NULL DEFAULT 'open'")
+            _add_column_if_missing(db, "dead_letters", "requeued_at", "REAL")
+            _add_column_if_missing(db, "dead_letters", "requeued_queue_id", "INTEGER")
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dead_letters_status_failed
+                ON dead_letters(status, failed_at DESC)
             """)
             if not USE_POSTGRES:
                 db.execute("PRAGMA user_version = 6")
@@ -720,7 +730,7 @@ def db_queue_stats():
             "SELECT MIN(queued_at) AS oldest FROM message_queue"
         ).fetchone()["oldest"]
         dead_count = db.execute(
-            "SELECT COUNT(*) AS n FROM dead_letters"
+            "SELECT COUNT(*) AS n FROM dead_letters WHERE status = 'open'"
         ).fetchone()["n"]
         outbox_rows = db.execute(
             "SELECT status, COUNT(*) AS n FROM delivery_outbox GROUP BY status"
@@ -739,6 +749,7 @@ def db_queue_stats():
         "outbox_pending": sum(int(row["n"]) for row in outbox_rows if row["status"] == "pending"),
         "outbox_sent": sum(int(row["n"]) for row in outbox_rows if row["status"] == "sent"),
         "outbox_uncertain": sum(int(row["n"]) for row in outbox_rows if row["status"] == "uncertain"),
+        "outbox_sending": sum(int(row["n"]) for row in outbox_rows if row["status"] == "sending"),
     }
 
 
@@ -1099,6 +1110,76 @@ def db_dead_letter(message_id, worker_id, reason):
         db.commit()
         logger.error("Queue item moved to dead-letter storage id=%s", message_id)
         return dict(row)
+
+
+def db_list_dead_letters(limit=5):
+    limit = min(max(int(limit), 1), 20)
+    with db_connect() as db:
+        rows = db.execute("""
+            SELECT id, chat_id, message_text, attempts, last_error, failed_at,
+                   response_index, response_plan
+            FROM dead_letters
+            WHERE status = 'open'
+            ORDER BY failed_at DESC, id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def db_requeue_dead_letter(dead_letter_id):
+    """Requeue only when no earlier or ambiguous outbound delivery can be duplicated."""
+    with db_connect() as db:
+        db.execute("BEGIN" if USE_POSTGRES else "BEGIN IMMEDIATE")
+        row = db.execute("""
+            SELECT * FROM dead_letters
+            WHERE id = ? AND status = 'open'
+        """ + (" FOR UPDATE" if USE_POSTGRES else ""), (int(dead_letter_id),)).fetchone()
+        if row is None:
+            db.rollback()
+            return {"ok": False, "reason": "not_found"}
+
+        try:
+            json.loads(row["response_plan"] or "[]")
+        except (TypeError, ValueError):
+            db.rollback()
+            return {"ok": False, "reason": "invalid_plan"}
+        if int(row["response_index"] or 0) > 0:
+            db.rollback()
+            return {"ok": False, "reason": "partial_delivery"}
+
+        if row["original_queue_id"] is not None:
+            delivery = db.execute("""
+                SELECT COUNT(*) AS n FROM delivery_outbox
+                WHERE queue_id = ? AND status IN ('sent', 'sending', 'uncertain')
+            """, (row["original_queue_id"],)).fetchone()
+            if int(delivery["n"] or 0) > 0:
+                db.rollback()
+                return {"ok": False, "reason": "delivery_ambiguous"}
+
+        now = time.time()
+        cursor = db.execute("""
+            INSERT INTO message_queue(
+                update_id, chat_id, message_text, queued_at, attempts,
+                status, retry_at, response_plan, response_index,
+                lease_until, locked_by, history_user, history_assistant,
+                clear_history, feedback_action
+            ) VALUES (NULL, ?, ?, ?, 0, 'pending', 0, NULL, 0, 0, NULL, NULL, NULL, 0, NULL)
+            RETURNING id
+        """, (row["chat_id"], row["message_text"], now))
+        new_queue_id = cursor.fetchone()["id"]
+        changed = db.execute("""
+            UPDATE dead_letters
+            SET status = 'requeued', requeued_at = ?, requeued_queue_id = ?
+            WHERE id = ? AND status = 'open'
+        """, (now, new_queue_id, int(dead_letter_id))).rowcount
+        if changed != 1:
+            db.rollback()
+            return {"ok": False, "reason": "race"}
+        db.commit()
+
+    _queue_wakeup.set()
+    logger.warning("Dead-letter item requeued dead_id=%s queue_id=%s", dead_letter_id, new_queue_id)
+    return {"ok": True, "queue_id": new_queue_id}
 
 
 def retry_delay(attempts):
@@ -2778,9 +2859,61 @@ def build_response_plan(chat_id, text):
                     f"وضعیت دیتابیس: در دسترس\n"
                     f"پیام‌های صف: {stats['queued_messages']} (در انتظار: {stats['pending_messages']})\n"
                     f"در حال پردازش: {stats['processing_messages']}\n"
-                    f"Dead-letter: {stats['dead_letters']}\n"
-                    f"قدیمی‌ترین پیام صف: {stats['oldest_queue_age_seconds']} ثانیه"
+                    f"Dead-letter باز: {stats['dead_letters']}\n"
+                    f"Outbox: انتظار {stats['outbox_pending']} | ارسال {stats['outbox_sending']} | نامشخص {stats['outbox_uncertain']}\n"
+                    f"Outbox تأییدشده: {stats['outbox_sent']}\n"
+                    f"قدیمی‌ترین پیام صف: {stats['oldest_queue_age_seconds']} ثانیه\n"
+                    "دستورات: /deadletters و /deadletter_retry ID"
                 )
+        return {
+            "responses": [(chat_id, message)], "history_user": None,
+            "history_assistant": None, "clear_history": False, "feedback_action": None,
+            "reply_markup": None,
+        }
+
+    if command in {"/deadletters", "/deadletter_retry"}:
+        if admin_id is None or str(chat_id) != str(admin_id):
+            message = "این دستور فقط برای مدیر ربات فعال است."
+        elif command == "/deadletters":
+            try:
+                items = db_list_dead_letters(10)
+                if not items:
+                    message = "📭 پیام ناموفقی برای بررسی وجود ندارد."
+                else:
+                    lines = ["📥 پیام‌های Dead Letter (حداکثر ۱۰ مورد):"]
+                    for item in items:
+                        preview = " ".join((item["message_text"] or "").split())[:90]
+                        error = (item["last_error"] or "بدون جزئیات")[:100]
+                        lines.append(
+                            f"\n#{item['id']} | تلاش: {item['attempts']}\n"
+                            f"پیام: {preview}\nخطا: {error}"
+                        )
+                    lines.append("\nبرای تلاش مجدد: /deadletter_retry ID")
+                    message = "\n".join(lines)
+            except Exception as exc:
+                logger.warning("Dead-letter listing failed type=%s", type(exc).__name__)
+                message = "خواندن فهرست پیام‌های ناموفق فعلاً ممکن نیست."
+        else:
+            raw_id = text.partition(" ")[2].strip()
+            if not raw_id.isdigit():
+                message = "شناسه را مشخص کن؛ مثال: /deadletter_retry 12"
+            else:
+                try:
+                    result = db_requeue_dead_letter(int(raw_id))
+                    messages = {
+                        "not_found": "این پیام پیدا نشد یا قبلاً تعیین تکلیف شده است.",
+                        "invalid_plan": "برنامهٔ پاسخ ذخیره‌شده معتبر نیست؛ ارسال مجدد متوقف شد.",
+                        "partial_delivery": "بخشی از پاسخ قبلاً ارسال شده؛ برای جلوگیری از تکرار، ارسال مجدد مجاز نیست.",
+                        "delivery_ambiguous": "وضعیت ارسال قبلی نامشخص یا در حال ارسال است؛ ارسال مجدد خودکار مجاز نیست.",
+                        "race": "وضعیت پیام هم‌زمان تغییر کرد؛ دوباره فهرست را بررسی کن.",
+                    }
+                    message = (
+                        f"✅ پیام با شناسهٔ صف {result['queue_id']} دوباره در صف قرار گرفت."
+                        if result["ok"] else messages.get(result["reason"], "امکان بازیابی پیام وجود ندارد.")
+                    )
+                except Exception as exc:
+                    logger.warning("Dead-letter requeue failed type=%s", type(exc).__name__)
+                    message = "بازیابی پیام به دلیل خطای دیتابیس انجام نشد."
         return {
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,

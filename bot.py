@@ -2413,7 +2413,8 @@ def build_response_plan(chat_id, text):
         (command.startswith("/") and command not in {"/weather", "/cancel"})
         or text.strip() == "💰 قیمت بازار"
         or normalize_text(text) in {
-            normalize_text(FEEDBACK_TRIGGER_TEXT), normalize_text("💡 ارسال نظر")
+            normalize_text(FEEDBACK_TRIGGER_TEXT), normalize_text("💡 ارسال نظر"),
+            normalize_text("❔ راهنما"),
         }
     ):
         if weather_pending_until is not None:

@@ -77,7 +77,11 @@ class ParsingTests(unittest.TestCase):
         }
         chat_id, encoded = bot.extract_message(update)
         self.assertEqual(chat_id, "123")
-        result = bot.build_response_plan(chat_id, encoded)
+        with patch.object(bot, "call_ai", return_value="پاسخ آزمایشی") as ai:
+            result = bot.build_response_plan(chat_id, encoded)
+        ai.assert_called_once_with(
+            "123", "منظورت چیه؟", reply_context="این پیام اصلی ربات است"
+        )
         self.assertEqual(result["history_user"], "منظورت چیه؟")
         self.assertEqual(result["responses"][0][0], "123")
 

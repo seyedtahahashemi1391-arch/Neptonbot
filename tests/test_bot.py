@@ -616,16 +616,18 @@ class DatabaseWorkflowTests(unittest.TestCase):
 
         self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "pending")
         self.assertEqual(send.call_count, 1)
+        retry_started = time.time()
         self.assertTrue(bot.db_retry_message(
             item["id"], "rate-limit-worker", 1, "rate limited", retry_after=5
         ))
         with bot.db_connect() as db:
             row = db.execute(
-                "SELECT status, attempts FROM message_queue WHERE id = ?",
+                "SELECT status, attempts, retry_at FROM message_queue WHERE id = ?",
                 (item["id"],),
             ).fetchone()
         self.assertEqual(row["status"], "pending")
         self.assertEqual(row["attempts"], 1)
+        self.assertGreaterEqual(row["retry_at"], retry_started + 4.5)
 
     def test_chaos_sent_receipt_survives_cursor_write_failure(self):
         self.assertTrue(bot.db_enqueue_updates([(3203, "chat-chaos", "hello")], 3204))

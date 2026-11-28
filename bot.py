@@ -94,6 +94,8 @@ POLL_EMPTY_WAIT = _env_float("NEPTON_POLL_INTERVAL", 0.35, 0.20, 1.0)
 POLL_EMPTY_WAIT_MAX = _env_float("NEPTON_POLL_MAX_INTERVAL", 1.25, POLL_EMPTY_WAIT, 5.0)
 POLL_ERROR_BACKOFF_START = 2
 POLL_ERROR_BACKOFF_MAX = 30
+DB_RETRY_BACKOFF_START = 1
+DB_RETRY_BACKOFF_MAX = 30
 
 MAX_WORKER_RETRIES = 5
 RETRY_BACKOFF_START = 2
@@ -556,6 +558,21 @@ def init_database():
         logger.info("PostgreSQL database initialized")
     else:
         logger.info("SQLite initialized at %s", str(Path(DB_PATH).expanduser().resolve()))
+
+
+def _is_database_error(exc):
+    """Recognize transient database/connection-pool failures without hiding app bugs."""
+    module = type(exc).__module__
+    return isinstance(exc, sqlite3.Error) or module.startswith(("psycopg", "psycopg_pool"))
+
+
+def _database_retry_delay(failures):
+    exponent = min(max(0, int(failures) - 1), 10)
+    base = min(DB_RETRY_BACKOFF_START * (2 ** exponent), DB_RETRY_BACKOFF_MAX)
+    return min(
+        base + random.uniform(0, min(base * 0.15, 1.0)),
+        DB_RETRY_BACKOFF_MAX,
+    )
 
 
 def db_get_state(key, default=None):
@@ -2564,7 +2581,11 @@ def build_response_plan(chat_id, text):
         if admin_id is None or str(chat_id) != str(admin_id):
             message = "این دستور فقط برای مدیر ربات فعال است."
         else:
-            stats = db_queue_stats()
+            try:
+                stats = db_queue_stats()
+            except Exception as exc:
+                logger.warning("Admin queue diagnostics unavailable type=%s", type(exc).__name__)
+                stats = None
             with _service_lock:
                 alive_workers = sum(worker.is_alive() for worker in _worker_threads)
             with _poll_health_lock:
@@ -2572,19 +2593,32 @@ def build_response_plan(chat_id, text):
                 poll_error = _last_poll_error_type
             age = round(time.time() - last_ok, 1) if last_ok is not None else "نامشخص"
             runtime_label = "فعال" if _runtime_active else "غیرفعال"
-            message = (
-                "🛠 پنل مدیریتی Nepton\n"
-                f"نسخه: {VERSION}\n"
-                f"وضعیت Runtime: {runtime_label}\n"
-                f"Worker فعال: {alive_workers}/{MAX_PARALLEL_CHATS}\n"
-                f"آخرین Poll موفق: {age} ثانیه قبل\n"
-                f"خطای آخر Poll: {poll_error or 'ندارد'}\n"
-                f"حالت AI: {AI_MODE} | وضعیت Cloudflare: {_cloudflare_circuit_status()}\n"
-                f"پیام‌های صف: {stats['queued_messages']} (در انتظار: {stats['pending_messages']})\n"
-                f"در حال پردازش: {stats['processing_messages']}\n"
-                f"Dead-letter: {stats['dead_letters']}\n"
-                f"قدیمی‌ترین پیام صف: {stats['oldest_queue_age_seconds']} ثانیه"
-            )
+            if stats is None:
+                message = (
+                    "🛠 پنل مدیریتی Nepton\n"
+                    f"نسخه: {VERSION}\n"
+                    f"وضعیت Runtime: {runtime_label}\n"
+                    f"Worker فعال: {alive_workers}/{MAX_PARALLEL_CHATS}\n"
+                    f"آخرین Poll موفق: {age} ثانیه قبل\n"
+                    f"خطای آخر Poll: {poll_error or 'ندارد'}\n"
+                    f"حالت AI: {AI_MODE} | وضعیت Cloudflare: {_cloudflare_circuit_status()}\n"
+                    "وضعیت دیتابیس: موقتاً غیرقابل دسترس؛ آمار صف فعلاً قابل خواندن نیست."
+                )
+            else:
+                message = (
+                    "🛠 پنل مدیریتی Nepton\n"
+                    f"نسخه: {VERSION}\n"
+                    f"وضعیت Runtime: {runtime_label}\n"
+                    f"Worker فعال: {alive_workers}/{MAX_PARALLEL_CHATS}\n"
+                    f"آخرین Poll موفق: {age} ثانیه قبل\n"
+                    f"خطای آخر Poll: {poll_error or 'ندارد'}\n"
+                    f"حالت AI: {AI_MODE} | وضعیت Cloudflare: {_cloudflare_circuit_status()}\n"
+                    f"وضعیت دیتابیس: در دسترس\n"
+                    f"پیام‌های صف: {stats['queued_messages']} (در انتظار: {stats['pending_messages']})\n"
+                    f"در حال پردازش: {stats['processing_messages']}\n"
+                    f"Dead-letter: {stats['dead_letters']}\n"
+                    f"قدیمی‌ترین پیام صف: {stats['oldest_queue_age_seconds']} ثانیه"
+                )
         return {
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
@@ -2828,12 +2862,14 @@ def _process_claimed_item(item, worker_id):
 
 def chat_worker():
     worker_id = _worker_id()
+    database_failures = 0
     logger.info("Worker started id=%s", worker_id)
 
     while not _polling_stop.is_set() and not _runtime_lease_lost.is_set():
         item = None
         try:
             item = db_claim_next_message(worker_id)
+            database_failures = 0
             if item is None:
                 _queue_wakeup.wait(WORKER_IDLE_WAIT)
                 _queue_wakeup.clear()
@@ -2841,6 +2877,18 @@ def chat_worker():
             _process_claimed_item(item, worker_id)
 
         except Exception as exc:
+            if _is_database_error(exc):
+                database_failures += 1
+                wait = _database_retry_delay(database_failures)
+                logger.warning(
+                    "Queue worker database unavailable type=%s retry_in=%.1fs; "
+                    "claimed work is left leased for safe recovery",
+                    type(exc).__name__, wait,
+                )
+                _queue_wakeup.wait(wait)
+                _queue_wakeup.clear()
+                continue
+
             if isinstance(exc, (TransientAPIError, PermanentAPIError)):
                 logger.warning("Worker request failed type=%s detail=%s", type(exc).__name__, str(exc)[:240])
             else:
@@ -2914,14 +2962,20 @@ def prepare_update_batch(updates):
 
 
 def polling_loop():
-    offset = db_get_offset()
+    offset = None
+    offset_loaded = False
     backoff = POLL_ERROR_BACKOFF_START
     idle_wait = POLL_EMPTY_WAIT
     last_cleanup = time.monotonic()
-    logger.info("Soroush polling started offset_present=%s", offset is not None)
+    logger.info("Soroush polling started; durable offset will be loaded before polling")
 
     while not _polling_stop.is_set() and not _runtime_lease_lost.is_set():
         try:
+            if not offset_loaded:
+                offset = db_get_offset()
+                offset_loaded = True
+                logger.info("Persistent polling offset loaded present=%s", offset is not None)
+
             if time.monotonic() - last_cleanup >= DB_CLEANUP_INTERVAL:
                 try:
                     db_cleanup_old_records()
@@ -3134,7 +3188,16 @@ atexit.register(shutdown_runtime)
 # Startup
 # =========================================================
 if os.getenv("NEPTON_DISABLE_AUTOSTART", "0").strip().lower() not in {"1", "true", "yes"}:
-    if not start_runtime_services():
+    try:
+        if not start_runtime_services():
+            _start_runtime_acquirer()
+    except Exception as exc:
+        # Keep the HTTP process alive so Render can still serve health/status
+        # while the runtime acquisition loop retries database initialization.
+        logger.exception(
+            "Runtime startup deferred because a required dependency is unavailable type=%s",
+            type(exc).__name__,
+        )
         _start_runtime_acquirer()
 else:
     logger.info("NEPTON_DISABLE_AUTOSTART is enabled; runtime will start in the post-worker hook")

@@ -2303,10 +2303,14 @@ def call_ai(chat_id, user_text, reply_context=None):
         "model": MODEL,
         "messages": messages,
         "temperature": 0.25,
-        "max_completion_tokens": completion_token_budget(user_text),
-        "chat_template_kwargs": {"enable_thinking": False},
         "stream": False,
     }
+    if AI_PROVIDER == "cloudflare":
+        payload["max_completion_tokens"] = completion_token_budget(user_text)
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    else:
+        # Keep the local OpenAI-compatible path portable across Ollama and vLLM.
+        payload["max_tokens"] = completion_token_budget(user_text)
 
     started = time.perf_counter()
     try:

@@ -155,6 +155,37 @@ class ParsingTests(unittest.TestCase):
         ), patch.object(bot, "get_history", side_effect=AssertionError("history should not be read")):
             self.assertIn("اتصال سرویس هوش مصنوعی", bot.call_ai("offline-chat", "یک سؤال ناشناخته"))
 
+    def test_openai_compatible_provider_uses_configured_internal_endpoint(self):
+        session = SimpleNamespace(post=lambda *args, **kwargs: (args, kwargs))
+        with patch.object(bot, "AI_PROVIDER", "openai-compatible"), patch.object(
+            bot, "AI_PROVIDER_URL", "http://ai.internal:11434/v1/chat/completions"
+        ), patch.object(bot, "AI_PROVIDER_KEY", ""):
+            args, kwargs = bot.cloudflare_post_with_retry(session, {"model": "qwen"})
+        self.assertEqual(args[0], "http://ai.internal:11434/v1/chat/completions")
+        self.assertNotIn("Authorization", kwargs["headers"])
+        self.assertEqual(kwargs["json"], {"model": "qwen"})
+        self.assertFalse(kwargs["allow_redirects"])
+
+    def test_internal_ai_provider_needs_endpoint_but_not_api_key(self):
+        with patch.object(bot, "AI_PROVIDER", "openai-compatible"), patch.object(
+            bot, "AI_PROVIDER_URL", "http://ai.internal/v1/chat/completions"
+        ), patch.object(bot, "AI_PROVIDER_BASE_URL", "http://ai.internal/v1/chat/completions"):
+            self.assertTrue(bot._cloudflare_is_configured())
+        with patch.object(bot, "AI_PROVIDER", "openai-compatible"), patch.object(
+            bot, "AI_PROVIDER_URL", ""
+        ), patch.object(bot, "AI_PROVIDER_BASE_URL", ""):
+            self.assertFalse(bot._cloudflare_is_configured())
+
+    def test_live_data_off_mode_never_calls_external_providers(self):
+        with patch.object(bot, "LIVE_DATA_MODE", "off"), patch.object(
+            bot, "_get_json", side_effect=AssertionError("external request must not run")
+        ) as external:
+            self.assertIn("غیرفعال", bot.get_live_market_prices())
+            self.assertIn("غیرفعال", bot.get_live_weather("هواشناسی کاشمر"))
+            self.assertIn("غیرفعال", bot.get_live_web_results("خبر امروز"))
+            self.assertEqual(bot.get_live_context("خبر امروز"), "")
+        external.assert_not_called()
+
     def test_database_error_detection_and_backoff(self):
         self.assertTrue(bot._is_database_error(bot.sqlite3.OperationalError("database is locked")))
         self.assertFalse(bot._is_database_error(bot.TransientAPIError("network down")))

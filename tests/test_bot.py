@@ -383,7 +383,7 @@ class DatabaseWorkflowTests(unittest.TestCase):
         with bot.db_connect() as db:
             db.execute(
                 "UPDATE message_queue SET response_plan = ?, response_index = 1 WHERE id = ?",
-                (json.dumps(legacy_plan), item["id"]),
+                (bot.json.dumps(legacy_plan), item["id"]),
             )
             db.execute("DELETE FROM delivery_outbox WHERE queue_id = ?", (item["id"],))
         bot.init_database()

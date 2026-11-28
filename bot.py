@@ -1283,7 +1283,14 @@ def home():
 @app.get("/health")
 def health():
     try:
-        stats = db_queue_stats()
+        try:
+            stats = db_queue_stats()
+            database_connected = True
+        except Exception as exc:
+            stats = {}
+            database_connected = False
+            logger.warning("Health check database unavailable type=%s", type(exc).__name__)
+
         polling_running = _polling_thread is not None and _polling_thread.is_alive()
         with _service_lock:
             worker_snapshot = list(_worker_threads)
@@ -1295,8 +1302,10 @@ def health():
         poll_age = (time.time() - last_success) if last_success is not None else None
         poll_fresh = poll_age is not None and poll_age <= max(60, SOROUSH_TIMEOUT[1] * 2)
         runtime_healthy = _runtime_active and polling_running and live_workers >= 1
+        fully_healthy = runtime_healthy and poll_fresh and database_connected
         payload = {
-            "status": "healthy" if runtime_healthy and poll_fresh else "degraded",
+            "status": "healthy" if fully_healthy else "degraded",
+            "database_connected": database_connected,
             "polling_fresh": poll_fresh,
             "runtime_owner": _runtime_active,
             "runtime_lock_acquired": _runtime_lock_acquired,
@@ -1312,9 +1321,9 @@ def health():
             "model": MODEL,
         }
         payload.update(stats)
-        # Keep Render's liveness check stable during a temporary upstream outage;
-        # `status` and `polling_fresh` expose provider degradation without restart loops.
-        return jsonify(payload), 200 if runtime_healthy else 503
+        # Liveness is distinct from readiness: keep the HTTP process available
+        # while the runtime retries a temporarily unavailable database.
+        return jsonify(payload), 200
     except Exception:
         logger.exception("Health check failed")
         return jsonify({"status": "unhealthy", "version": VERSION}), 503

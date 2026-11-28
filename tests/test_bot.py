@@ -355,6 +355,94 @@ class GunicornLifecycleTests(unittest.TestCase):
         self.assertEqual(GUNICORN_CONFIG.graceful_timeout, 35)
 
 
+class SoroushTransportContractTests(unittest.TestCase):
+    class Response:
+        def __init__(self, status_code=200, payload=None, headers=None, json_error=None):
+            self.status_code = status_code
+            self.payload = payload
+            self.headers = headers or {}
+            self.json_error = json_error
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def json(self):
+            if self.json_error:
+                raise self.json_error
+            return self.payload
+
+    def _request(self, response=None, side_effect=None):
+        from types import SimpleNamespace
+
+        session = SimpleNamespace(
+            post=unittest.mock.Mock(return_value=response, side_effect=side_effect)
+        )
+        return session
+
+    def test_http_429_preserves_retry_after(self):
+        response = self.Response(
+            status_code=429,
+            payload={"ok": True},
+            headers={"Retry-After": "7"},
+        )
+        session = self._request(response)
+        with patch.object(bot, "get_http_session", return_value=session):
+            with self.assertRaises(bot.TransientAPIError) as raised:
+                bot.soroush_request("getUpdates", {"offset": 12})
+        self.assertEqual(raised.exception.retry_after, 7.0)
+        session.post.assert_called_once()
+        self.assertEqual(session.post.call_args.kwargs["allow_redirects"], False)
+
+    def test_http_5xx_is_transient(self):
+        response = self.Response(status_code=503, payload={"error": "maintenance"})
+        with patch.object(bot, "get_http_session", return_value=self._request(response)):
+            with self.assertRaises(bot.TransientAPIError):
+                bot.soroush_request("getUpdates")
+
+    def test_http_4xx_client_rejection_is_permanent(self):
+        response = self.Response(status_code=400, payload={"error": "bad request"})
+        with patch.object(bot, "get_http_session", return_value=self._request(response)):
+            with self.assertRaises(bot.PermanentAPIError):
+                bot.soroush_request("sendMessage", {"chat_id": "test", "text": "hello"})
+
+    def test_transport_timeout_is_transient(self):
+        import requests
+
+        session = self._request(
+            side_effect=requests.exceptions.Timeout("simulated timeout")
+        )
+        with patch.object(bot, "get_http_session", return_value=session):
+            with self.assertRaises(bot.TransientAPIError):
+                bot.soroush_request("getUpdates")
+
+    def test_invalid_json_is_transient(self):
+        response = self.Response(
+            status_code=200,
+            json_error=ValueError("invalid json"),
+        )
+        with patch.object(bot, "get_http_session", return_value=self._request(response)):
+            with self.assertRaises(bot.TransientAPIError):
+                bot.soroush_request("getUpdates")
+
+    def test_api_level_rate_limit_is_transient_and_keeps_retry_after(self):
+        response = self.Response(
+            status_code=200,
+            payload={
+                "ok": False,
+                "error_code": 429,
+                "description": "Too Many Requests",
+                "parameters": {"retry_after": 4},
+            },
+        )
+        with patch.object(bot, "get_http_session", return_value=self._request(response)):
+            with self.assertRaises(bot.TransientAPIError) as raised:
+                bot.soroush_request("sendMessage", {"chat_id": "test", "text": "hello"})
+        self.assertEqual(raised.exception.retry_after, 4.0)
+
+
 class DatabaseWorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

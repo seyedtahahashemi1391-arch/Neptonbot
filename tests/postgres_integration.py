@@ -274,6 +274,9 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
                     WHERE lock_name = 'primary'
                 """, ("replacement-owner", time.time() + 300))
 
+            # Once another owner takes over, this stale process must not renew.
+            self.assertFalse(bot._renew_runtime_lock())
+
             bot._release_runtime_lock()
             with bot.db_connect() as db:
                 row = db.execute("""

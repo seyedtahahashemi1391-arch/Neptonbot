@@ -68,6 +68,25 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot.extract_message(update), ("123", "سلام"))
         self.assertEqual(bot.get_update_id(update), 12)
 
+    def test_public_username_cannot_claim_admin_privileges(self):
+        update = {
+            "message": {
+                "chat": {"id": 987654, "type": "private"},
+                "from": {"id": 987654, "username": "t91m62"},
+                "text": "/admin",
+            }
+        }
+        with patch.object(bot, "set_admin_chat_id") as register_admin:
+            self.assertEqual(bot.extract_message(update), ("987654", "/admin"))
+        register_admin.assert_not_called()
+
+    def test_admin_commands_deny_unregistered_chat(self):
+        with patch.object(bot, "get_admin_chat_id", return_value="trusted-chat"):
+            for command in ("/admin", "/deadletters", "/deadletter_retry 12"):
+                with self.subTest(command=command):
+                    plan = bot.build_response_plan("untrusted-chat", command)
+                    self.assertIn("فقط برای مدیر", plan["responses"][0][1])
+
     def test_ai_offline_fallback_keeps_fixed_replies_available(self):
         self.assertEqual(bot._offline_fallback_answer("سلام"), bot.get_fixed_conversation_answer("سلام"))
         self.assertEqual(bot._offline_fallback_answer("سازنده‌ات کیه؟"), bot.CREATOR_ANSWER)
@@ -808,36 +827,23 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(next_same_chat)
         self.assertEqual(next_same_chat["message_text"], "second")
 
-    def test_health_endpoint_reports_degraded_runtime_without_failing_liveness(self):
-        client = bot.app.test_client()
-        response = client.get("/health")
+    def test_health_endpoint_is_minimal_public_liveness_only(self):
+        response = bot.app.test_client().get("/health")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["status"], "degraded")
-
-    def test_health_endpoint_exposes_operational_alerts_and_capacity(self):
-        stats = {
-            "queued_messages": 850,
-            "pending_messages": 840,
-            "processing_messages": 10,
-            "oldest_queue_age_seconds": 125,
-            "dead_letters": 2,
-            "outbox_pending": 3,
-            "outbox_sent": 20,
-            "outbox_uncertain": 1,
-            "outbox_sending": 0,
-        }
-        with patch.object(bot, "db_queue_stats", return_value=stats), patch.object(
-            bot, "_cloudflare_circuit_status", return_value="موقتاً قطع"
+        self.assertEqual(response.get_json(), {"status": "online"})
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        for sensitive_field in (
+            "database_connected", "runtime_owner", "workers_alive",
+            "last_poll_error_type", "ai_circuit", "queue_capacity",
+            "dead_letters", "outbox_uncertain", "model",
         ):
-            payload = bot.app.test_client().get("/health").get_json()
-        self.assertEqual(payload["queue_capacity"], bot.MAX_QUEUED_MESSAGES)
-        self.assertEqual(payload["queue_utilization_percent"], 85.0)
-        self.assertIn("queue_capacity_high", payload["alerts"])
-        self.assertIn("dead_letters_open", payload["alerts"])
-        self.assertIn("outbox_delivery_uncertain", payload["alerts"])
-        self.assertIn("ai_provider_circuit_open", payload["alerts"])
-        self.assertIn("ai_mode", payload)
-        self.assertIn("sentry_enabled", payload)
+            self.assertNotIn(sensitive_field, response.get_json())
+
+    def test_health_endpoint_does_not_query_internal_diagnostics(self):
+        with patch.object(bot, "db_queue_stats", side_effect=AssertionError("must not query")):
+            response = bot.app.test_client().get("/health")
+        self.assertEqual(response.status_code, 200)
 
     def test_poll_health_records_sentry_metrics_without_affecting_polling(self):
         with patch.object(bot, "SENTRY_ENABLED", True), patch.object(

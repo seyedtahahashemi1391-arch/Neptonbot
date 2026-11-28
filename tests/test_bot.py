@@ -453,6 +453,44 @@ class ParsingTests(unittest.TestCase):
             bot._queue_wakeup.clear()
 
 
+class RuntimeShutdownRecoveryTests(unittest.TestCase):
+    def test_shutdown_keeps_runtime_lease_when_a_worker_is_still_alive(self):
+        stuck_worker = SimpleNamespace(
+            name="stuck-worker",
+            is_alive=lambda: True,
+            join=lambda timeout: None,
+        )
+        with patch.object(bot, "_polling_thread", None), patch.object(
+            bot, "_supervisor_thread", None
+        ), patch.object(bot, "_runtime_heartbeat_thread", None), patch.object(
+            bot, "_worker_threads", [stuck_worker]
+        ), patch.object(bot, "_release_runtime_lock") as release:
+            bot.shutdown_runtime()
+
+        release.assert_not_called()
+        self.assertTrue(bot._polling_stop.is_set())
+        self.assertTrue(bot._queue_wakeup.is_set())
+        bot._polling_stop.clear()
+        bot._queue_wakeup.clear()
+
+    def test_shutdown_releases_runtime_lease_after_all_threads_stop(self):
+        stopped_worker = SimpleNamespace(
+            name="stopped-worker",
+            is_alive=lambda: False,
+            join=lambda timeout: None,
+        )
+        with patch.object(bot, "_polling_thread", None), patch.object(
+            bot, "_supervisor_thread", None
+        ), patch.object(bot, "_runtime_heartbeat_thread", None), patch.object(
+            bot, "_worker_threads", [stopped_worker]
+        ), patch.object(bot, "_release_runtime_lock") as release:
+            bot.shutdown_runtime()
+
+        release.assert_called_once_with()
+        bot._polling_stop.clear()
+        bot._queue_wakeup.clear()
+
+
 class GunicornLifecycleTests(unittest.TestCase):
     def test_runtime_starts_only_after_worker_initialization(self):
         worker = SimpleNamespace(pid=123)

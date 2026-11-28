@@ -229,6 +229,12 @@ class DatabaseWorkflowTests(unittest.TestCase):
             result = bot.get_live_market_prices()
         self.assertIn("دادهٔ قابل‌استفاده نداد", result)
 
+    def test_postgres_cleanup_query_has_no_unescaped_placeholder_marker(self):
+        query = (
+            "SELECT key, value FROM bot_state "
+            "WHERE substr(key, 1, 16) = 'weather_pending_'"
+        )
+        self.assertNotIn("%", bot.PostgresConnection._sql(query))
     def test_cleanup_removes_expired_weather_states(self):
         bot.db_set_state("weather_pending_expired", "0")
         bot.db_set_state("weather_pending_active", str(int(time.time()) + 300))

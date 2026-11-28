@@ -66,6 +66,46 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot.extract_message(update), ("123", "سلام"))
         self.assertEqual(bot.get_update_id(update), 12)
 
+    def test_ai_offline_fallback_keeps_fixed_replies_available(self):
+        self.assertEqual(bot._offline_fallback_answer("سلام"), bot.get_fixed_conversation_answer("سلام"))
+        self.assertEqual(bot._offline_fallback_answer("سازنده‌ات کیه؟"), bot.CREATOR_ANSWER)
+        self.assertIn("اتصال سرویس هوش مصنوعی", bot._offline_fallback_answer("یک سؤال پیچیده و ناشناخته"))
+
+    def test_cloudflare_circuit_breaker_opens_and_recovers(self):
+        original_threshold = bot.AI_CIRCUIT_FAILURE_THRESHOLD
+        original_cooldown = bot.AI_CIRCUIT_COOLDOWN
+        try:
+            bot.AI_CIRCUIT_FAILURE_THRESHOLD = 2
+            bot.AI_CIRCUIT_COOLDOWN = 15
+            with bot._ai_circuit_lock:
+                bot._ai_circuit_failures = 0
+                bot._ai_circuit_open_until = 0.0
+                bot._ai_circuit_probe_in_progress = False
+            self.assertTrue(bot._cloudflare_circuit_allows_request())
+            bot._cloudflare_circuit_record_failure()
+            self.assertTrue(bot._cloudflare_circuit_allows_request())
+            bot._cloudflare_circuit_record_failure()
+            self.assertFalse(bot._cloudflare_circuit_allows_request())
+            with bot._ai_circuit_lock:
+                bot._ai_circuit_open_until = 0.0
+            self.assertTrue(bot._cloudflare_circuit_allows_request())
+            self.assertFalse(bot._cloudflare_circuit_allows_request())
+            bot._cloudflare_circuit_record_success()
+            self.assertTrue(bot._cloudflare_circuit_allows_request())
+        finally:
+            bot.AI_CIRCUIT_FAILURE_THRESHOLD = original_threshold
+            bot.AI_CIRCUIT_COOLDOWN = original_cooldown
+            with bot._ai_circuit_lock:
+                bot._ai_circuit_failures = 0
+                bot._ai_circuit_open_until = 0.0
+                bot._ai_circuit_probe_in_progress = False
+
+    def test_call_ai_uses_rules_when_cloudflare_credentials_are_missing(self):
+        with patch.object(bot, "CLOUDFLARE_ACCOUNT_ID", ""), patch.object(
+            bot, "CLOUDFLARE_API_TOKEN", ""
+        ), patch.object(bot, "get_history", side_effect=AssertionError("history should not be read")):
+            self.assertIn("اتصال سرویس هوش مصنوعی", bot.call_ai("offline-chat", "یک سؤال ناشناخته"))
+
     def test_audio_messages_are_ignored(self):
         update = {
             "message": {

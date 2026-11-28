@@ -173,6 +173,14 @@ class ParsingTests(unittest.TestCase):
         finally:
             event.clear()
 
+    def test_health_endpoint_stays_live_when_database_is_unavailable(self):
+        with patch.object(bot, "db_queue_stats", side_effect=bot.sqlite3.OperationalError("db offline")):
+            response = bot.app.test_client().get("/health")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["status"], "degraded")
+        self.assertFalse(payload["database_connected"])
+
     def test_audio_messages_are_ignored(self):
         update = {
             "message": {

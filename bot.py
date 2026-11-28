@@ -1500,6 +1500,34 @@ def _get_json(url, *, params=None, headers=None):
         raise TransientAPIError("Live information provider returned invalid JSON") from None
 
 
+def _get_wttr_fallback_weather(place):
+    """Independent weather-provider fallback used when Open-Meteo is unavailable."""
+    aliases = {"بوشهر":"Bushehr","تبریز":"Tabriz","ارومیه":"Urmia","اردبیل":"Ardabil","اصفهان":"Isfahan","کرج":"Karaj","ایلام":"Ilam","تهران":"Tehran","شهرکرد":"Shahr-e Kord","بیرجند":"Birjand","مشهد":"Mashhad","بجنورد":"Bojnurd","اهواز":"Ahvaz","زنجان":"Zanjan","سمنان":"Semnan","زاهدان":"Zahedan","شیراز":"Shiraz","قزوین":"Qazvin","قم":"Qom","سنندج":"Sanandaj","کرمان":"Kerman","کرمانشاه":"Kermanshah","یاسوج":"Yasuj","گرگان":"Gorgan","رشت":"Rasht","خرم‌آباد":"Khorramabad","ساری":"Sari","اراک":"Arak","بندرعباس":"Bandar Abbas","همدان":"Hamadan","یزد":"Yazd"}
+    query = aliases.get(normalize_text(place), place)
+    data = _get_json(f"https://wttr.in/{query}", params={"format": "j1"})
+    current_rows = data.get("current_condition") if isinstance(data, dict) else None
+    forecast_rows = data.get("weather") if isinstance(data, dict) else None
+    if not isinstance(current_rows, list) or not current_rows or not isinstance(forecast_rows, list) or not forecast_rows:
+        raise TransientAPIError("Fallback weather provider returned an invalid response")
+    current, today = current_rows[0], forecast_rows[0]
+    nearest = data.get("nearest_area") if isinstance(data, dict) else None
+    area = nearest[0] if isinstance(nearest, list) and nearest else {}
+    area_names = area.get("areaName") or [{}]
+    city = area_names[0].get("value") or place
+    rain_values = []
+    for hour in today.get("hourly", []):
+        try:
+            rain_values.append(int(hour.get("chanceofrain", 0)))
+        except (TypeError, ValueError):
+            pass
+    rain = max(rain_values) if rain_values else "—"
+    return (f"🌦 هواشناسی {city}\n"
+            f"اکنون: {current.get('temp_C', '—')}°C (احساسی: {current.get('FeelsLikeC', '—')}°C)\n"
+            f"امروز: {today.get('mintempC', '—')}° تا {today.get('maxtempC', '—')}°C\n"
+            f"احتمال بارش: {rain}٪؛ باد: {current.get('windspeedKmph', '—')} km/h؛ رطوبت: {current.get('humidity', '—')}٪\n"
+            "منبع: سرویس جایگزین هواشناسی")
+
+
 def get_live_weather(user_text):
     """Return a concise weather summary; malformed provider data never poisons the queue."""
     place = _weather_location(user_text)
@@ -1533,10 +1561,14 @@ def get_live_weather(user_text):
     if capital:
         place = capital
 
-    geo = _get_json(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": place, "count": 100, "language": "fa", "format": "json", "countryCode": "IR"},
-    )
+    try:
+        geo = _get_json(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": place, "count": 100, "language": "fa", "format": "json", "countryCode": "IR"},
+        )
+    except TransientAPIError:
+        logger.warning("Open-Meteo geocoding unavailable; switching to fallback provider")
+        return _get_wttr_fallback_weather(place)
     results = geo.get("results") if isinstance(geo, dict) else None
 
     # Open-Meteo's English-language fallback needs an English place name;
@@ -1611,18 +1643,22 @@ def get_live_weather(user_text):
         logger.warning("Weather geocoding response omitted valid coordinates")
         return "سرویس مکان‌یابی پاسخ معتبری نداد؛ کمی بعد دوباره تلاش کن."
 
-    forecast = _get_json(
-        "https://api.open-meteo.com/v1/forecast",
-        params={
-            "latitude": latitude, "longitude": longitude,
-            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
-            "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
-            "temperature_unit": "celsius",
-            "wind_speed_unit": "kmh",
-            "precipitation_unit": "mm",
-            "forecast_days": 2, "timezone": "auto",
-        },
-    )
+    try:
+        forecast = _get_json(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": latitude, "longitude": longitude,
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+                "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                "temperature_unit": "celsius",
+                "wind_speed_unit": "kmh",
+                "precipitation_unit": "mm",
+                "forecast_days": 2, "timezone": "auto",
+            },
+        )
+    except TransientAPIError:
+        logger.warning("Open-Meteo forecast unavailable; switching to fallback provider")
+        return _get_wttr_fallback_weather(place)
     current = forecast.get("current") if isinstance(forecast, dict) else None
     daily = forecast.get("daily") if isinstance(forecast, dict) else None
     if not isinstance(current, dict) or not isinstance(daily, dict):

@@ -485,11 +485,11 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIsNotNone(next_same_chat)
         self.assertEqual(next_same_chat["message_text"], "second")
 
-    def test_health_endpoint_reports_runtime_unavailable(self):
+    def test_health_endpoint_reports_degraded_runtime_without_failing_liveness(self):
         client = bot.app.test_client()
         response = client.get("/health")
-        self.assertEqual(response.status_code, 503)
-        self.assertIn(response.get_json()["status"], {"degraded", "unhealthy"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "degraded")
 
 
 if __name__ == "__main__":

@@ -745,12 +745,18 @@ def db_claim_next_message(worker_id):
           )
         ORDER BY q.id LIMIT 1
     """
-    with db_connect() as probe_db:
-        candidate = probe_db.execute(eligible_sql, (now,)).fetchone()
-    if candidate is None:
-        return None
+    # PostgreSQL can lock and claim in one round trip. The previous probe
+    # opened a second pooled connection and repeated the same eligibility query
+    # for every non-empty claim. Keep the lightweight probe for SQLite, where
+    # BEGIN IMMEDIATE serializes writers and is useful to avoid idle lock churn.
+    if not USE_POSTGRES:
+        with db_connect() as probe_db:
+            candidate = probe_db.execute(eligible_sql, (now,)).fetchone()
+        if candidate is None:
+            return None
+
     with db_connect() as db:
-        db.execute("BEGIN IMMEDIATE")
+        db.execute("BEGIN" if USE_POSTGRES else "BEGIN IMMEDIATE")
         claim_sql = eligible_sql + (" FOR UPDATE OF q SKIP LOCKED" if USE_POSTGRES else "")
         row = db.execute(claim_sql, (now,)).fetchone()
 

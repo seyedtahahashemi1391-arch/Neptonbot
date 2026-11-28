@@ -325,6 +325,7 @@ class DatabaseWorkflowTests(unittest.TestCase):
         with bot.db_connect() as db:
             for table in (
                 "message_queue",
+                "delivery_outbox",
                 "processed_updates",
                 "dead_letters",
                 "conversation_history",
@@ -355,6 +356,45 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(bot.db_queue_stats()["queued_messages"], 0)
         history = bot.get_history("chat-1")
         self.assertEqual([entry["role"] for entry in history], ["user", "assistant"])
+
+    def test_response_plan_is_atomically_written_to_outbox(self):
+        self.assertTrue(bot.db_enqueue_updates([(2001, "chat-outbox", "hello")], 2002))
+        item = bot.db_claim_next_message("outbox-worker")
+        plan = [
+            {"chat_id": "chat-outbox", "text": "first"},
+            {"chat_id": "chat-outbox", "text": "second", "reply_markup": {"inline_keyboard": []}},
+        ]
+        self.assertTrue(bot.db_prepare_response_plan(item["id"], "outbox-worker", plan))
+        first = bot.db_get_delivery_state(item["id"], 0)
+        second = bot.db_get_delivery_state(item["id"], 1)
+        self.assertEqual(first["status"], "pending")
+        self.assertEqual(first["message_text"], "first")
+        self.assertEqual(second["status"], "pending")
+        self.assertEqual(json.loads(second["reply_markup"]), {"inline_keyboard": []})
+
+    def test_outbox_sent_receipt_prevents_duplicate_send_after_cursor_gap(self):
+        self.assertTrue(bot.db_enqueue_updates([(2003, "chat-outbox", "hello")], 2004))
+        item = bot.db_claim_next_message("outbox-worker")
+        self.assertTrue(bot.db_prepare_response_plan(
+            item["id"], "outbox-worker", [{"chat_id": "chat-outbox", "text": "once"}]
+        ))
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 0))
+        self.assertTrue(bot.db_mark_delivery_sent(item["id"], 0))
+        receipt = bot.db_get_delivery_state(item["id"], 0)
+        self.assertEqual(receipt["status"], "sent")
+        self.assertFalse(bot.db_mark_delivery_sending(item["id"], 0))
+
+    def test_outbox_interrupted_delivery_is_quarantined_not_resent(self):
+        self.assertTrue(bot.db_enqueue_updates([(2005, "chat-outbox", "hello")], 2006))
+        item = bot.db_claim_next_message("outbox-worker")
+        self.assertTrue(bot.db_prepare_response_plan(
+            item["id"], "outbox-worker", [{"chat_id": "chat-outbox", "text": "maybe delivered"}]
+        ))
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 0))
+        bot.db_recover_interrupted_jobs()
+        receipt = bot.db_get_delivery_state(item["id"], 0)
+        self.assertEqual(receipt["status"], "uncertain")
+        self.assertIn("interrupted", receipt["last_error"])
 
     def test_weather_cancel_does_not_break_feedback_cancel(self):
         bot.db_set_state("weather_pending_123", str(int(time.time()) + 300))

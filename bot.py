@@ -59,7 +59,7 @@ if AI_MODE not in {"auto", "cloudflare", "rules"}:
     AI_MODE = "auto"
 AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
 AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
-VERSION = "3.3.18"
+VERSION = "3.3.19"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -504,6 +504,67 @@ def init_database():
             """)
 
             db.execute("""
+                CREATE TABLE IF NOT EXISTS delivery_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    queue_id INTEGER NOT NULL,
+                    response_index INTEGER NOT NULL,
+                    chat_id TEXT NOT NULL,
+                    message_text TEXT NOT NULL,
+                    reply_markup TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    last_error TEXT,
+                    UNIQUE(queue_id, response_index)
+                )
+            """)
+            db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_delivery_outbox_status
+                ON delivery_outbox(status, updated_at)
+            """)
+
+            # Backfill response plans persisted by versions before the durable
+            # outbox existed. Earlier cursor positions are confirmed sent;
+            # the current position is ambiguous and must not be blindly resent.
+            legacy_rows = db.execute("""
+                SELECT id, response_plan, response_index
+                FROM message_queue
+                WHERE response_plan IS NOT NULL AND response_plan != ''
+            """).fetchall()
+            migration_now = time.time()
+            for legacy in legacy_rows:
+                try:
+                    legacy_plan = json.loads(legacy["response_plan"])
+                except (TypeError, ValueError):
+                    logger.error("Skipping invalid legacy response plan during outbox migration id=%s", legacy["id"])
+                    continue
+                if not isinstance(legacy_plan, list):
+                    continue
+                cursor_index = max(0, int(legacy["response_index"] or 0))
+                for index, part in enumerate(legacy_plan):
+                    if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
+                        continue
+                    status = "sent" if index < cursor_index else (
+                        "uncertain" if index == cursor_index else "pending"
+                    )
+                    db.execute("""
+                        INSERT INTO delivery_outbox(
+                            queue_id, response_index, chat_id, message_text,
+                            reply_markup, status, attempts, created_at, updated_at,
+                            last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                        ON CONFLICT(queue_id, response_index) DO NOTHING
+                    """, (
+                        legacy["id"], index, str(part["chat_id"]), part["text"],
+                        json.dumps(part.get("reply_markup"), ensure_ascii=False)
+                        if part.get("reply_markup") is not None else None,
+                        status, migration_now, migration_now,
+                        "legacy delivery state ambiguous during outbox migration"
+                        if status == "uncertain" else None,
+                    ))
+
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS processed_updates (
                     update_id INTEGER PRIMARY KEY,
                     processed_at REAL NOT NULL
@@ -629,14 +690,22 @@ def db_feedback_is_pending(chat_id):
 
 
 def db_recover_interrupted_jobs():
-    """Recover claims only after this process owns the singleton runtime lock."""
+    """Recover claims without blindly resending deliveries interrupted mid-flight."""
     with db_connect() as db:
+        db.execute("BEGIN" if USE_POSTGRES else "BEGIN IMMEDIATE")
+        db.execute("""
+            UPDATE delivery_outbox
+            SET status = 'uncertain', updated_at = ?,
+                last_error = 'worker interrupted during external delivery'
+            WHERE status = 'sending'
+        """, (time.time(),))
         cursor = db.execute("""
             UPDATE message_queue
             SET status = 'pending', retry_at = 0,
                 lease_until = 0, locked_by = NULL
             WHERE status = 'processing'
         """)
+        db.commit()
     if cursor.rowcount:
         logger.warning("Recovered %s interrupted queue item(s)", cursor.rowcount)
         _queue_wakeup.set()
@@ -653,6 +722,9 @@ def db_queue_stats():
         dead_count = db.execute(
             "SELECT COUNT(*) AS n FROM dead_letters"
         ).fetchone()["n"]
+        outbox_rows = db.execute(
+            "SELECT status, COUNT(*) AS n FROM delivery_outbox GROUP BY status"
+        ).fetchall()
         next_retry = db.execute(
             "SELECT MIN(retry_at) AS retry_at FROM message_queue WHERE status = 'pending'"
         ).fetchone()["retry_at"]
@@ -664,6 +736,9 @@ def db_queue_stats():
         "oldest_queue_age_seconds": round(max(0, now - oldest), 1) if oldest else 0,
         "next_retry_in_seconds": round(max(0, next_retry - now), 1) if next_retry else None,
         "dead_letters": int(dead_count),
+        "outbox_pending": sum(int(row["n"]) for row in outbox_rows if row["status"] == "pending"),
+        "outbox_sent": sum(int(row["n"]) for row in outbox_rows if row["status"] == "sent"),
+        "outbox_uncertain": sum(int(row["n"]) for row in outbox_rows if row["status"] == "uncertain"),
     }
 
 
@@ -810,6 +885,7 @@ def db_prepare_response_plan(
 ):
     serialized = json.dumps(response_plan, ensure_ascii=False, separators=(",", ":"))
     with db_connect() as db:
+        db.execute("BEGIN" if USE_POSTGRES else "BEGIN IMMEDIATE")
         changed = db.execute("""
             UPDATE message_queue
             SET response_plan = ?,
@@ -830,6 +906,68 @@ def db_prepare_response_plan(
             message_id,
             worker_id,
         )).rowcount
+        if changed == 1:
+            now = time.time()
+            for index, part in enumerate(response_plan):
+                if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
+                    db.rollback()
+                    raise ValueError("Invalid response plan item for durable outbox")
+                markup = part.get("reply_markup")
+                db.execute("""
+                    INSERT INTO delivery_outbox(
+                        queue_id, response_index, chat_id, message_text,
+                        reply_markup, status, attempts, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                    ON CONFLICT(queue_id, response_index) DO NOTHING
+                """, (
+                    message_id, index, str(part["chat_id"]), part["text"],
+                    json.dumps(markup, ensure_ascii=False) if markup is not None else None,
+                    now, now,
+                ))
+        db.commit()
+    return changed == 1
+
+
+def db_get_delivery_state(message_id, response_index):
+    with db_connect() as db:
+        row = db.execute(
+            "SELECT * FROM delivery_outbox WHERE queue_id = ? AND response_index = ?",
+            (message_id, response_index),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def db_mark_delivery_sending(message_id, response_index):
+    now = time.time()
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE delivery_outbox
+            SET status = 'sending', attempts = attempts + 1,
+                updated_at = ?, last_error = NULL
+            WHERE queue_id = ? AND response_index = ? AND status = 'pending'
+        """, (now, message_id, response_index)).rowcount
+    return changed == 1
+
+
+def db_mark_delivery_sent(message_id, response_index):
+    now = time.time()
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE delivery_outbox
+            SET status = 'sent', updated_at = ?, last_error = NULL
+            WHERE queue_id = ? AND response_index = ? AND status = 'sending'
+        """, (now, message_id, response_index)).rowcount
+    return changed == 1
+
+
+def db_mark_delivery_uncertain(message_id, response_index, reason):
+    now = time.time()
+    with db_connect() as db:
+        changed = db.execute("""
+            UPDATE delivery_outbox
+            SET status = 'uncertain', updated_at = ?, last_error = ?
+            WHERE queue_id = ? AND response_index = ? AND status = 'sending'
+        """, (now, (reason or "delivery outcome uncertain")[:500], message_id, response_index)).rowcount
     return changed == 1
 
 
@@ -977,6 +1115,16 @@ def db_cleanup_old_records():
 
     with db_connect() as db:
         db.execute("DELETE FROM processed_updates WHERE processed_at < ?", (processed_cutoff,))
+        delivery_cutoff = now - PROCESSED_UPDATE_RETENTION_DAYS * 86400
+        db.execute(
+            """DELETE FROM delivery_outbox
+               WHERE updated_at < ? AND status IN ('sent', 'uncertain')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM message_queue
+                     WHERE message_queue.id = delivery_outbox.queue_id
+                 )""",
+            (delivery_cutoff,),
+        )
         db.execute("DELETE FROM dead_letters WHERE failed_at < ?", (dead_cutoff,))
         db.execute("DELETE FROM conversation_history WHERE created_at < ?", (history_cutoff,))
         db.execute("""
@@ -1063,6 +1211,11 @@ class PermanentAPIError(Exception):
 
 
 class RetryableDeliveryError(TransientAPIError):
+    pass
+
+
+class UncertainDeliveryError(PermanentAPIError):
+    """External send may have succeeded; do not retry automatically."""
     pass
 
 
@@ -2837,9 +2990,38 @@ def _process_claimed_item_impl(item, worker_id):
         ):
             raise RuntimeError("Stored response plan contains an invalid item")
 
-        send_one_message(
-            part["chat_id"], part["text"], reply_markup=part.get("reply_markup")
-        )
+        delivery = db_get_delivery_state(message_id, response_index)
+        if delivery is None:
+            raise RuntimeError("Durable outbox record is missing")
+        if delivery["status"] == "uncertain":
+            raise UncertainDeliveryError(
+                "Delivery outcome is uncertain; automatic resend is disabled to avoid duplicates"
+            )
+        if delivery["status"] == "sending":
+            db_mark_delivery_uncertain(
+                message_id, response_index,
+                "worker recovered while delivery was in progress",
+            )
+            raise UncertainDeliveryError(
+                "Delivery outcome is uncertain after interruption; automatic resend is disabled"
+            )
+        if delivery["status"] != "sent":
+            if not db_mark_delivery_sending(message_id, response_index):
+                raise RuntimeError("Could not claim durable outbox delivery")
+            try:
+                send_one_message(
+                    part["chat_id"], part["text"], reply_markup=part.get("reply_markup")
+                )
+            except Exception as exc:
+                db_mark_delivery_uncertain(
+                    message_id, response_index,
+                    f"{type(exc).__name__}: {exc}",
+                )
+                raise UncertainDeliveryError(
+                    "Delivery outcome is uncertain; automatic resend is disabled to avoid duplicates"
+                ) from exc
+            if not db_mark_delivery_sent(message_id, response_index):
+                raise RuntimeError("Could not persist successful delivery receipt")
         if not db_advance_response(message_id, worker_id, response_index):
             raise RuntimeError("Could not advance durable response cursor")
         response_index += 1
@@ -2925,7 +3107,7 @@ def chat_worker():
                     permanent = isinstance(exc, PermanentAPIError)
                     if permanent or attempts_done > MAX_WORKER_RETRIES:
                         failed = db_dead_letter(item["id"], worker_id, str(exc))
-                        if failed is not None:
+                        if failed is not None and not isinstance(exc, UncertainDeliveryError):
                             try:
                                 send_one_message(
                                     failed["chat_id"],
@@ -2934,6 +3116,12 @@ def chat_worker():
                                 )
                             except Exception:
                                 logger.warning("Could not send final failure notice")
+                        elif failed is not None:
+                            logger.error(
+                                "Queue item quarantined because delivery outcome is uncertain; "
+                                "no automatic resend or failure notice was sent id=%s",
+                                failed["id"],
+                            )
                     else:
                         db_retry_message(
                             item["id"], worker_id, attempts_done, str(exc),

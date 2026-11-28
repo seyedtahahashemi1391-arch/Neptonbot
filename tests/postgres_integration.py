@@ -174,5 +174,62 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             db.execute("DELETE FROM message_queue WHERE id = ?", (result["queue_id"],))
 
 
+    def test_restart_recovery_quarantines_only_in_flight_delivery(self):
+        chat_id = self._chat_id("restart-recovery")
+        update_id = self._update_id()
+        self.assertTrue(
+            bot.db_enqueue_updates(
+                [(update_id, chat_id, "restart recovery message")],
+                update_id + 1,
+            )
+        )
+        item = bot.db_claim_next_message("postgres-restart-worker")
+        self.assertIsNotNone(item)
+        plan = [
+            {"chat_id": chat_id, "text": "already sent"},
+            {"chat_id": chat_id, "text": "interrupted send"},
+            {"chat_id": chat_id, "text": "not yet attempted"},
+        ]
+        self.assertTrue(
+            bot.db_prepare_response_plan(
+                item["id"],
+                "postgres-restart-worker",
+                plan,
+                history_user="restart recovery message",
+                history_assistant="restart recovery reply",
+            )
+        )
+
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 0))
+        self.assertTrue(bot.db_mark_delivery_sent(item["id"], 0))
+        self.assertTrue(
+            bot.db_advance_response(item["id"], "postgres-restart-worker", 0)
+        )
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 1))
+
+        # Simulate process restart after an external send began but before its
+        # outcome was durably recorded. Recovery must not blindly resend it.
+        bot.db_recover_interrupted_jobs()
+
+        with bot.db_connect() as db:
+            queue_row = db.execute(
+                "SELECT status, response_index, locked_by, lease_until "
+                "FROM message_queue WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+        self.assertEqual(queue_row["status"], "pending")
+        self.assertEqual(queue_row["response_index"], 1)
+        self.assertIsNone(queue_row["locked_by"])
+        self.assertEqual(queue_row["lease_until"], 0)
+
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "sent")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 1)["status"], "uncertain")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 2)["status"], "pending")
+
+        with bot.db_connect() as db:
+            db.execute("DELETE FROM delivery_outbox WHERE queue_id = ?", (item["id"],))
+            db.execute("DELETE FROM message_queue WHERE id = ?", (item["id"],))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -2523,7 +2523,7 @@ def build_response_plan(chat_id, text):
         expires_at = int(time.time()) + 300
         db_set_state(weather_state_key, str(expires_at))
         return {
-            "responses": [(chat_id, "نام شهری که در ایران وجود دارد را بنویسید")],
+            "responses": [(chat_id, "نام شهر یا استان ایران را بنویسید")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }

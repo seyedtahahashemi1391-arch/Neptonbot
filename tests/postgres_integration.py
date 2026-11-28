@@ -40,7 +40,7 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         bot.load_persistent_runtime_state()
         self.assertEqual(bot.get_admin_chat_id(), admin_chat)
 
-    def test_queue_outbox_and_completion_lifecycle(self):
+    def test_a_queue_outbox_and_completion_lifecycle(self):
         chat_id = self._chat_id("outbox")
         update_id = self._update_id()
         self.assertTrue(

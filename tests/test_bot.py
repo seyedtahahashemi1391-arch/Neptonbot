@@ -187,6 +187,30 @@ class ParsingTests(unittest.TestCase):
         finally:
             event.clear()
 
+    def test_worker_stops_claiming_after_runtime_lease_loss(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+        item = {"id": 987654, "attempts": 0}
+        try:
+            def lose_runtime_lease(_item, _worker_id):
+                lease_lost.set()
+
+            with patch.object(bot, "_worker_id", return_value="lease-loss-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ) as claim, patch.object(
+                bot, "_process_claimed_item", side_effect=lose_runtime_lease
+            ) as process:
+                bot.chat_worker()
+
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(process.call_count, 1)
+            self.assertTrue(lease_lost.is_set())
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+
     def test_polling_retries_loading_offset_after_database_failure(self):
         event = bot._polling_stop
         event.clear()

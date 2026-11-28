@@ -3082,6 +3082,12 @@ def flatten_response_plan(responses, reply_markup=None):
 # Queue workers
 # =========================================================
 def _process_claimed_item_impl(item, worker_id):
+    # A process that lost the global runtime lease must not begin or continue
+    # outbound work. The current durable claim is left for lease recovery.
+    if _runtime_lease_lost.is_set():
+        logger.warning("Skipping queue item after runtime lease loss id=%s", item.get("id"))
+        return
+
     message_id = item["id"]
     queue_age_ms = max(0.0, (time.time() - float(item.get("queued_at") or time.time())) * 1000)
     logger.info("TIMING queue_wait_ms=%.0f", queue_age_ms)
@@ -3113,6 +3119,14 @@ def _process_claimed_item_impl(item, worker_id):
         raise RuntimeError("Stored response plan or response cursor is invalid")
 
     while response_index < len(plan):
+        # The lease can be lost while an external send is in flight. Record
+        # that send's outcome, then stop before starting the next response.
+        if _runtime_lease_lost.is_set():
+            logger.warning(
+                "Stopping remaining response parts after runtime lease loss id=%s index=%s",
+                message_id, response_index,
+            )
+            return
         if not db_renew_lease(message_id, worker_id):
             raise RuntimeError("Worker lease was lost before message delivery")
         part = plan[response_index]

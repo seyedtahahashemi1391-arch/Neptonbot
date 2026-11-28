@@ -174,5 +174,128 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
             db.execute("DELETE FROM message_queue WHERE id = ?", (result["queue_id"],))
 
 
+    def test_restart_recovery_quarantines_only_in_flight_delivery(self):
+        chat_id = self._chat_id("restart-recovery")
+        update_id = self._update_id()
+        self.assertTrue(
+            bot.db_enqueue_updates(
+                [(update_id, chat_id, "restart recovery message")],
+                update_id + 1,
+            )
+        )
+        item = bot.db_claim_next_message("postgres-restart-worker")
+        self.assertIsNotNone(item)
+        plan = [
+            {"chat_id": chat_id, "text": "already sent"},
+            {"chat_id": chat_id, "text": "interrupted send"},
+            {"chat_id": chat_id, "text": "not yet attempted"},
+        ]
+        self.assertTrue(
+            bot.db_prepare_response_plan(
+                item["id"],
+                "postgres-restart-worker",
+                plan,
+                history_user="restart recovery message",
+                history_assistant="restart recovery reply",
+            )
+        )
+
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 0))
+        self.assertTrue(bot.db_mark_delivery_sent(item["id"], 0))
+        self.assertTrue(
+            bot.db_advance_response(item["id"], "postgres-restart-worker", 0)
+        )
+        self.assertTrue(bot.db_mark_delivery_sending(item["id"], 1))
+
+        # Simulate process restart after an external send began but before its
+        # outcome was durably recorded. Recovery must not blindly resend it.
+        bot.db_recover_interrupted_jobs()
+
+        with bot.db_connect() as db:
+            queue_row = db.execute(
+                "SELECT status, response_index, locked_by, lease_until "
+                "FROM message_queue WHERE id = ?",
+                (item["id"],),
+            ).fetchone()
+        self.assertEqual(queue_row["status"], "pending")
+        self.assertEqual(queue_row["response_index"], 1)
+        self.assertIsNone(queue_row["locked_by"])
+        self.assertEqual(queue_row["lease_until"], 0)
+
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "sent")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 1)["status"], "uncertain")
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 2)["status"], "pending")
+
+        with bot.db_connect() as db:
+            db.execute("DELETE FROM delivery_outbox WHERE queue_id = ?", (item["id"],))
+            db.execute("DELETE FROM message_queue WHERE id = ?", (item["id"],))
+
+
+    def test_runtime_lease_blocks_active_owner_and_recovers_expired_owner(self):
+        previous_owner = bot._runtime_owner_id
+        previous_acquired = bot._runtime_lock_acquired
+        test_owner = f"postgres-lease-test-{self.suffix}"
+        bot._runtime_owner_id = test_owner
+        bot._runtime_lock_acquired = False
+        try:
+            # The production acquisition path owns creation of this table.
+            self.assertTrue(bot.acquire_runtime_lock())
+            now = time.time()
+            with bot.db_connect() as db:
+                db.execute("""
+                    INSERT INTO nepton_runtime_leases(
+                        lock_name, owner_id, lease_until, updated_at
+                    ) VALUES('primary', ?, ?, ?)
+                    ON CONFLICT(lock_name) DO UPDATE SET
+                        owner_id = excluded.owner_id,
+                        lease_until = excluded.lease_until,
+                        updated_at = excluded.updated_at
+                """, ("another-active-owner", now + 300, now))
+
+            self.assertFalse(bot.acquire_runtime_lock())
+            self.assertFalse(bot._runtime_lock_acquired)
+
+            with bot.db_connect() as db:
+                db.execute("""
+                    UPDATE nepton_runtime_leases
+                    SET lease_until = ?, updated_at = ?
+                    WHERE lock_name = 'primary'
+                """, (time.time() - 10, time.time()))
+
+            self.assertTrue(bot.acquire_runtime_lock())
+            self.assertTrue(bot._runtime_lock_acquired)
+            self.assertTrue(bot._renew_runtime_lock())
+
+            # A stale process must not delete a lease now owned by another node.
+            with bot.db_connect() as db:
+                db.execute("""
+                    UPDATE nepton_runtime_leases
+                    SET owner_id = ?, lease_until = ?
+                    WHERE lock_name = 'primary'
+                """, ("replacement-owner", time.time() + 300))
+
+            # Once another owner takes over, this stale process must not renew.
+            self.assertFalse(bot._renew_runtime_lock())
+
+            bot._release_runtime_lock()
+            with bot.db_connect() as db:
+                row = db.execute("""
+                    SELECT owner_id FROM nepton_runtime_leases
+                    WHERE lock_name = 'primary'
+                """).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row["owner_id"], "replacement-owner")
+        finally:
+            bot._release_runtime_lock()
+            with bot.db_connect() as db:
+                db.execute(
+                    "DELETE FROM nepton_runtime_leases WHERE lock_name = 'primary' "
+                    "AND owner_id IN (?, ?)",
+                    (test_owner, "replacement-owner"),
+                )
+            bot._runtime_owner_id = previous_owner
+            bot._runtime_lock_acquired = previous_acquired
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

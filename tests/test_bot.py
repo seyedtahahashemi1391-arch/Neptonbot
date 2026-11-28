@@ -187,6 +187,117 @@ class ParsingTests(unittest.TestCase):
         finally:
             event.clear()
 
+    def test_message_processing_stops_remaining_sends_after_runtime_lease_loss(self):
+        lease_lost = bot._runtime_lease_lost
+        lease_lost.clear()
+        item = {
+            "id": 987653,
+            "queued_at": time.time(),
+            "response_plan": '[{"chat_id":"lease-chat","text":"first"},'
+                             '{"chat_id":"lease-chat","text":"second"}]',
+            "response_index": 0,
+        }
+
+        def lose_lease_during_send(*_args, **_kwargs):
+            lease_lost.set()
+
+        try:
+            with patch.object(bot, "db_renew_lease", return_value=True), patch.object(
+                bot, "db_get_delivery_state", return_value={"status": "pending"}
+            ), patch.object(
+                bot, "db_mark_delivery_sending", return_value=True
+            ), patch.object(
+                bot, "send_one_message", side_effect=lose_lease_during_send
+            ) as send, patch.object(
+                bot, "db_mark_delivery_sent", return_value=True
+            ) as mark_sent, patch.object(
+                bot, "db_advance_response", return_value=True
+            ) as advance, patch.object(
+                bot, "db_finish_message"
+            ) as finish:
+                bot._process_claimed_item_impl(item, "lease-loss-worker")
+
+            send.assert_called_once_with("lease-chat", "first", reply_markup=None)
+            mark_sent.assert_called_once_with(item["id"], 0)
+            advance.assert_called_once_with(item["id"], "lease-loss-worker", 0)
+            finish.assert_not_called()
+        finally:
+            lease_lost.clear()
+
+    def test_message_processing_does_not_start_after_runtime_lease_loss(self):
+        lease_lost = bot._runtime_lease_lost
+        lease_lost.set()
+        try:
+            item = {"id": 987652, "response_plan": "[]", "response_index": 0}
+            with patch.object(bot, "db_renew_lease") as renew, patch.object(
+                bot, "send_one_message"
+            ) as send:
+                bot._process_claimed_item_impl(item, "stale-worker")
+            renew.assert_not_called()
+            send.assert_not_called()
+        finally:
+            lease_lost.clear()
+
+    def test_worker_stops_claiming_after_runtime_lease_loss(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+        item = {"id": 987654, "attempts": 0}
+        try:
+            def lose_runtime_lease(_item, _worker_id):
+                lease_lost.set()
+
+            with patch.object(bot, "_worker_id", return_value="lease-loss-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ) as claim, patch.object(
+                bot, "_process_claimed_item", side_effect=lose_runtime_lease
+            ) as process:
+                bot.chat_worker()
+
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(process.call_count, 1)
+            self.assertTrue(lease_lost.is_set())
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+
+    def test_worker_releases_claim_after_database_loss_without_spending_retry(self):
+        polling_stop = bot._polling_stop
+        polling_stop.clear()
+        item = {"id": 987655, "attempts": 2}
+        wait_calls = {"count": 0}
+
+        def stop_after_database_recovery(_delay):
+            wait_calls["count"] += 1
+            polling_stop.set()
+            return True
+
+        try:
+            with patch.object(bot, "_worker_id", return_value="db-loss-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ) as claim, patch.object(
+                bot, "_process_claimed_item",
+                side_effect=bot.sqlite3.OperationalError("database connection lost")
+            ) as process, patch.object(
+                bot, "_database_retry_delay", return_value=0.01
+            ), patch.object(
+                bot._queue_wakeup, "wait", side_effect=stop_after_database_recovery
+            ), patch.object(
+                bot, "db_retry_message", return_value=True
+            ) as release:
+                bot.chat_worker()
+
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(process.call_count, 1)
+            release.assert_called_once_with(
+                item["id"], "db-loss-worker", item["attempts"],
+                "database temporarily unavailable", retry_after=0.01
+            )
+            self.assertEqual(wait_calls["count"], 1)
+        finally:
+            polling_stop.clear()
+
     def test_polling_retries_loading_offset_after_database_failure(self):
         event = bot._polling_stop
         event.clear()
@@ -331,6 +442,104 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(bot.has_update_container({"ok": False, "result": []}))
         self.assertFalse(bot.has_update_container({"unexpected": "shape"}))
 
+
+
+    def test_polling_discards_response_if_runtime_lease_is_lost_during_request(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+
+        def lose_lease_during_request(*_args, **_kwargs):
+            lease_lost.set()
+            return {"ok": True, "result": [{"update_id": 123, "message": {}}]}
+
+        try:
+            with patch.object(bot, "db_get_offset", return_value=None), patch.object(
+                bot, "soroush_request", side_effect=lose_lease_during_request
+            ) as request, patch.object(
+                bot, "db_enqueue_updates"
+            ) as enqueue:
+                bot.polling_loop()
+
+            request.assert_called_once()
+            enqueue.assert_not_called()
+            self.assertTrue(lease_lost.is_set())
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+
+
+    def test_runtime_heartbeat_stops_after_three_consecutive_renewal_failures(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+        bot._queue_wakeup.clear()
+        wait_results = [False, False, False, False, False, True]
+        renew_results = [
+            RuntimeError("temporary database outage"),
+            True,
+            RuntimeError("temporary database outage"),
+            RuntimeError("temporary database outage"),
+            RuntimeError("temporary database outage"),
+        ]
+        try:
+            with patch.object(
+                polling_stop, "wait", side_effect=wait_results
+            ), patch.object(
+                bot, "_renew_runtime_lock", side_effect=renew_results
+            ) as renew, patch.object(
+                bot._queue_wakeup, "set"
+            ) as wake:
+                bot.runtime_lease_heartbeat()
+
+            self.assertEqual(renew.call_count, 5)
+            self.assertTrue(lease_lost.is_set())
+            self.assertTrue(polling_stop.is_set())
+            wake.assert_called_once_with()
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+            bot._queue_wakeup.clear()
+
+
+class RuntimeShutdownRecoveryTests(unittest.TestCase):
+    def test_shutdown_keeps_runtime_lease_when_a_worker_is_still_alive(self):
+        stuck_worker = SimpleNamespace(
+            name="stuck-worker",
+            is_alive=lambda: True,
+            join=lambda timeout: None,
+        )
+        with patch.object(bot, "_polling_thread", None), patch.object(
+            bot, "_supervisor_thread", None
+        ), patch.object(bot, "_runtime_heartbeat_thread", None), patch.object(
+            bot, "_worker_threads", [stuck_worker]
+        ), patch.object(bot, "_release_runtime_lock") as release:
+            bot.shutdown_runtime()
+
+        release.assert_not_called()
+        self.assertTrue(bot._polling_stop.is_set())
+        self.assertTrue(bot._queue_wakeup.is_set())
+        bot._polling_stop.clear()
+        bot._queue_wakeup.clear()
+
+    def test_shutdown_releases_runtime_lease_after_all_threads_stop(self):
+        stopped_worker = SimpleNamespace(
+            name="stopped-worker",
+            is_alive=lambda: False,
+            join=lambda timeout: None,
+        )
+        with patch.object(bot, "_polling_thread", None), patch.object(
+            bot, "_supervisor_thread", None
+        ), patch.object(bot, "_runtime_heartbeat_thread", None), patch.object(
+            bot, "_worker_threads", [stopped_worker]
+        ), patch.object(bot, "_release_runtime_lock") as release:
+            bot.shutdown_runtime()
+
+        release.assert_called_once_with()
+        bot._polling_stop.clear()
+        bot._queue_wakeup.clear()
 
 
 class GunicornLifecycleTests(unittest.TestCase):

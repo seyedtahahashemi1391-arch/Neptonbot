@@ -54,7 +54,12 @@ LIVE_INFO_MAX_RESULTS = 5
 REPLY_CONTEXT_PREFIX = "__NEPTON_REPLY_CONTEXT__:"
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
-VERSION = "3.3.16"
+AI_MODE = os.getenv("NEPTON_AI_MODE", "auto").strip().lower()
+if AI_MODE not in {"auto", "cloudflare", "rules"}:
+    AI_MODE = "auto"
+AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
+AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
+VERSION = "3.3.17"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -172,8 +177,6 @@ _missing = [
     name
     for name, value in (
         ("BOT_TOKEN", BOT_TOKEN),
-        ("CLOUDFLARE_ACCOUNT_ID", CLOUDFLARE_ACCOUNT_ID),
-        ("CLOUDFLARE_API_TOKEN", CLOUDFLARE_API_TOKEN),
     )
     if not value
 ]
@@ -195,6 +198,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s pid=%(process)d %(threadName)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("NeptonBot")
+
+_ai_circuit_lock = threading.Lock()
+_ai_circuit_failures = 0
+_ai_circuit_open_until = 0.0
+_ai_circuit_probe_in_progress = False
 
 SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
 SENTRY_ENABLED = bool(SENTRY_DSN)
@@ -1869,6 +1877,66 @@ def completion_token_budget(user_text):
     return LONG_COMPLETION_TOKENS if long_request else MAX_COMPLETION_TOKENS
 
 
+def _cloudflare_is_configured():
+    return bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN and MODEL)
+
+
+def _cloudflare_circuit_allows_request():
+    global _ai_circuit_probe_in_progress
+    now = time.monotonic()
+    with _ai_circuit_lock:
+        if _ai_circuit_failures < AI_CIRCUIT_FAILURE_THRESHOLD:
+            return True
+        if now < _ai_circuit_open_until or _ai_circuit_probe_in_progress:
+            return False
+        _ai_circuit_probe_in_progress = True
+        return True
+
+
+def _cloudflare_circuit_record_failure():
+    global _ai_circuit_failures, _ai_circuit_open_until, _ai_circuit_probe_in_progress
+    with _ai_circuit_lock:
+        _ai_circuit_failures += 1
+        _ai_circuit_probe_in_progress = False
+        if _ai_circuit_failures >= AI_CIRCUIT_FAILURE_THRESHOLD:
+            _ai_circuit_open_until = time.monotonic() + AI_CIRCUIT_COOLDOWN
+            logger.warning("AI circuit opened failures=%s cooldown_seconds=%s",
+                           _ai_circuit_failures, AI_CIRCUIT_COOLDOWN)
+
+
+def _cloudflare_circuit_record_success():
+    global _ai_circuit_failures, _ai_circuit_open_until, _ai_circuit_probe_in_progress
+    with _ai_circuit_lock:
+        was_open = _ai_circuit_failures >= AI_CIRCUIT_FAILURE_THRESHOLD
+        _ai_circuit_failures = 0
+        _ai_circuit_open_until = 0.0
+        _ai_circuit_probe_in_progress = False
+    if was_open:
+        logger.info("AI circuit closed after successful probe")
+
+
+def _cloudflare_circuit_status():
+    with _ai_circuit_lock:
+        if _ai_circuit_failures < AI_CIRCUIT_FAILURE_THRESHOLD:
+            return "آماده"
+        if time.monotonic() < _ai_circuit_open_until:
+            return "موقتاً قطع"
+        return "در حال آزمایش مجدد"
+
+
+def _offline_fallback_answer(user_text):
+    fixed = get_fixed_conversation_answer(user_text)
+    if fixed:
+        return fixed
+    if is_creator_question(user_text):
+        return CREATOR_ANSWER
+    return (
+        "در حال حاضر اتصال سرویس هوش مصنوعی برقرار نیست.\n"
+        "قابلیت‌های پایهٔ نپتون فعال‌اند، اما برای پاسخ دقیق به این درخواست "
+        "به مدل هوش مصنوعی نیاز دارم. لطفاً کمی بعد دوباره پیام بده."
+    )
+
+
 def call_ai(chat_id, user_text, reply_context=None):
     if _is_chamran_40_line_essay_request(user_text):
         logger.info("Using reviewed deterministic 40-line essay for Shahid Chamran request")
@@ -1877,7 +1945,7 @@ def call_ai(chat_id, user_text, reply_context=None):
         try:
             return get_live_market_prices()
         except (TransientAPIError, UserVisibleError):
-            raise
+            return "منبع قیمت بازار فعلاً در دسترس نیست؛ قیمت قدیمی یا حدسی نمایش داده نمی‌شود."
         except Exception:
             logger.warning("Live market price request failed", exc_info=True)
             return "منبع قیمت بازار فعلاً در دسترس نیست؛ عددی حدس نمی‌زنم."
@@ -1887,11 +1955,22 @@ def call_ai(chat_id, user_text, reply_context=None):
         started = time.perf_counter()
         try:
             return get_live_weather(user_text)
+        except (TransientAPIError, UserVisibleError):
+            return "سرویس هواشناسی فعلاً در دسترس نیست؛ برای جلوگیری از نمایش اطلاعات نادرست، پیش‌بینی ارائه نمی‌کنم."
         finally:
             logger.info(
                 "TIMING live_weather_request_ms=%.0f",
                 (time.perf_counter() - started) * 1000,
             )
+
+    if AI_MODE == "rules":
+        return _offline_fallback_answer(user_text)
+    if not _cloudflare_is_configured():
+        logger.warning("Cloudflare AI is not configured; using deterministic fallback")
+        return _offline_fallback_answer(user_text)
+    if not _cloudflare_circuit_allows_request():
+        logger.warning("Cloudflare AI circuit is open; using deterministic fallback")
+        return _offline_fallback_answer(user_text)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
@@ -1910,7 +1989,11 @@ def call_ai(chat_id, user_text, reply_context=None):
         })
 
     stage_started = time.perf_counter()
-    live_context = get_live_context(user_text)
+    try:
+        live_context = get_live_context(user_text)
+    except TransientAPIError:
+        logger.warning("Live context provider unavailable; continuing without live context")
+        live_context = "اطلاعات زنده فعلاً در دسترس نیست؛ از ارائهٔ عدد یا خبر فعلیِ تأییدنشده خودداری کن."
     logger.info("TIMING ai_live_context_ms=%.0f", (time.perf_counter() - stage_started) * 1000)
     if live_context:
         messages.append({
@@ -1963,12 +2046,18 @@ def call_ai(chat_id, user_text, reply_context=None):
             except ValueError as exc:
                 raise TransientAPIError("Cloudflare returned invalid JSON") from exc
 
-    except UserVisibleError:
-        raise
-    except TransientAPIError:
-        raise
-    except requests.exceptions.RequestException:
-        raise TransientAPIError("Cloudflare network failure") from None
+    except (UserVisibleError, TransientAPIError) as exc:
+        _cloudflare_circuit_record_failure()
+        if AI_MODE == "cloudflare":
+            raise
+        logger.warning("Cloudflare AI failed; switching to deterministic fallback type=%s", type(exc).__name__)
+        return _offline_fallback_answer(user_text)
+    except requests.exceptions.RequestException as exc:
+        _cloudflare_circuit_record_failure()
+        if AI_MODE == "cloudflare":
+            raise TransientAPIError("Cloudflare network failure") from None
+        logger.warning("Cloudflare network failed; switching to deterministic fallback type=%s", type(exc).__name__)
+        return _offline_fallback_answer(user_text)
     finally:
         logger.info(
             "TIMING cloudflare_request_ms=%.0f",
@@ -1982,13 +2071,23 @@ def call_ai(chat_id, user_text, reply_context=None):
             "overload", "rate limit", "timeout", "temporarily", "unavailable"
         )
         if any(token in model_error for token in transient_markers):
-            raise TransientAPIError("Cloudflare model temporarily unavailable")
-        raise UserVisibleError(
-            "سرویس هوش مصنوعی نتوانست این درخواست را پردازش کند. لطفاً دوباره تلاش کن."
-        )
+            _cloudflare_circuit_record_failure()
+            if AI_MODE == "cloudflare":
+                raise TransientAPIError("Cloudflare model temporarily unavailable")
+            return _offline_fallback_answer(user_text)
+        _cloudflare_circuit_record_failure()
+        if AI_MODE == "cloudflare":
+            raise UserVisibleError(
+                "سرویس هوش مصنوعی نتوانست این درخواست را پردازش کند. لطفاً دوباره تلاش کن."
+            )
+        return _offline_fallback_answer(user_text)
     answer = _extract_ai_text(data)
     if not answer:
-        raise UserVisibleError("مدل این بار پاسخ متنی تولید نکرد. لطفاً دوباره تلاش کن.")
+        _cloudflare_circuit_record_failure()
+        if AI_MODE == "cloudflare":
+            raise UserVisibleError("مدل این بار پاسخ متنی تولید نکرد. لطفاً دوباره تلاش کن.")
+        return _offline_fallback_answer(user_text)
+    _cloudflare_circuit_record_success()
     return answer
 
 
@@ -2480,6 +2579,7 @@ def build_response_plan(chat_id, text):
                 f"Worker فعال: {alive_workers}/{MAX_PARALLEL_CHATS}\n"
                 f"آخرین Poll موفق: {age} ثانیه قبل\n"
                 f"خطای آخر Poll: {poll_error or 'ندارد'}\n"
+                f"حالت AI: {AI_MODE} | وضعیت Cloudflare: {_cloudflare_circuit_status()}\n"
                 f"پیام‌های صف: {stats['queued_messages']} (در انتظار: {stats['pending_messages']})\n"
                 f"در حال پردازش: {stats['processing_messages']}\n"
                 f"Dead-letter: {stats['dead_letters']}\n"
@@ -2492,7 +2592,10 @@ def build_response_plan(chat_id, text):
         }
 
     if command == "/market":
-        result = get_live_market_prices()
+        try:
+            result = get_live_market_prices()
+        except (TransientAPIError, UserVisibleError):
+            result = "منبع قیمت بازار فعلاً در دسترس نیست؛ قیمت قدیمی یا حدسی نمایش داده نمی‌شود."
         return {
             "responses": [(chat_id, result)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
@@ -2506,7 +2609,10 @@ def build_response_plan(chat_id, text):
                 "history_user": None, "history_assistant": None,
                 "clear_history": False, "feedback_action": None,
             }
-        result = get_live_web_results(query)
+        try:
+            result = get_live_web_results(query)
+        except (TransientAPIError, UserVisibleError):
+            result = "جست‌وجوی وب فعلاً در دسترس نیست. قابلیت‌های پایهٔ ربات همچنان فعال‌اند."
         return {
             "responses": [(chat_id, result)], "history_user": query,
             "history_assistant": result, "clear_history": False, "feedback_action": None,
@@ -2547,8 +2653,9 @@ def build_response_plan(chat_id, text):
         if pending_active:
             try:
                 weather_result = get_live_weather("هواشناسی " + text.strip())
-            except UserVisibleError as exc:
-                weather_result = str(exc)
+            except (UserVisibleError, TransientAPIError):
+                weather_result = "سرویس هواشناسی فعلاً در دسترس نیست؛ پیش‌بینی حدسی ارائه نمی‌شود."
+                db_delete_state(weather_state_key)
             else:
                 # Keep the pending state on transient errors so the durable queue
                 # can retry the same update without losing the requested city flow.

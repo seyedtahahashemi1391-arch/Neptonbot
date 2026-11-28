@@ -2887,6 +2887,22 @@ def chat_worker():
                 )
                 _queue_wakeup.wait(wait)
                 _queue_wakeup.clear()
+                if item is not None:
+                    try:
+                        # Release the claim once the database is reachable again.
+                        # Keep the existing retry count: infrastructure downtime
+                        # must not consume the message's processing retry budget.
+                        released = db_retry_message(
+                            item["id"], worker_id, int(item.get("attempts", 0)),
+                            "database temporarily unavailable", retry_after=wait,
+                        )
+                        if released:
+                            logger.info("Released interrupted queue claim after database recovery id=%s", item["id"])
+                    except Exception as release_exc:
+                        logger.warning(
+                            "Queue claim remains leased until expiry; database is still unavailable type=%s",
+                            type(release_exc).__name__,
+                        )
                 continue
 
             if isinstance(exc, (TransientAPIError, PermanentAPIError)):

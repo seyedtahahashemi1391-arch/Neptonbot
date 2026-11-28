@@ -2071,7 +2071,10 @@ def call_ai(chat_id, user_text, reply_context=None):
             "overload", "rate limit", "timeout", "temporarily", "unavailable"
         )
         if any(token in model_error for token in transient_markers):
-            raise TransientAPIError("Cloudflare model temporarily unavailable")
+            _cloudflare_circuit_record_failure()
+            if AI_MODE == "cloudflare":
+                raise TransientAPIError("Cloudflare model temporarily unavailable")
+            return _offline_fallback_answer(user_text)
         _cloudflare_circuit_record_failure()
         if AI_MODE == "cloudflare":
             raise UserVisibleError(

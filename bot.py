@@ -3245,7 +3245,11 @@ def chat_worker():
 
             if item is not None:
                 try:
-                    attempts_done = int(item.get("attempts", 0)) + 1
+                    # Explicit rate-limit rejections are not processing failures;
+                    # honor Retry-After without consuming the message retry budget.
+                    attempts_done = int(item.get("attempts", 0)) + (
+                        0 if isinstance(exc, RetryableDeliveryError) else 1
+                    )
                     permanent = isinstance(exc, PermanentAPIError)
                     if permanent or attempts_done > MAX_WORKER_RETRIES:
                         failed = db_dead_letter(item["id"], worker_id, str(exc))

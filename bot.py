@@ -1164,8 +1164,9 @@ def db_requeue_dead_letter(dead_letter_id):
                 lease_until, locked_by, history_user, history_assistant,
                 clear_history, feedback_action
             ) VALUES (NULL, ?, ?, ?, 0, 'pending', 0, NULL, 0, 0, NULL, NULL, NULL, 0, NULL)
+            RETURNING id
         """, (row["chat_id"], row["message_text"], now))
-        new_queue_id = cursor.lastrowid
+        new_queue_id = cursor.fetchone()["id"]
         changed = db.execute("""
             UPDATE dead_letters
             SET status = 'requeued', requeued_at = ?, requeued_queue_id = ?

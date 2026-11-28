@@ -1529,13 +1529,8 @@ def release_runtime_lease_for_process(process_id):
 
 @app.get("/")
 def home():
-    return jsonify({
-        "status": "online",
-        "bot": "Nepton",
-        "version": VERSION,
-        "provider": "Cloudflare Workers AI",
-        "model": MODEL,
-    })
+    """Expose service availability without disclosing implementation details."""
+    return jsonify({"status": "online", "service": "Nepton"})
 
 
 @app.get("/health")

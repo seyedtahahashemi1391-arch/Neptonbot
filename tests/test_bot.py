@@ -384,6 +384,11 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(receipt["status"], "sent")
         self.assertFalse(bot.db_mark_delivery_sending(item["id"], 0))
 
+    def test_uncertain_delivery_error_is_non_retryable(self):
+        error = bot.UncertainDeliveryError("ambiguous send result")
+        self.assertIsInstance(error, bot.PermanentAPIError)
+        self.assertNotIsInstance(error, bot.TransientAPIError)
+
     def test_outbox_interrupted_delivery_is_quarantined_not_resent(self):
         self.assertTrue(bot.db_enqueue_updates([(2005, "chat-outbox", "hello")], 2006))
         item = bot.db_claim_next_message("outbox-worker")

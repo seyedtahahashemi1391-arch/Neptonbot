@@ -114,6 +114,11 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         self.assertEqual(queued["status"], "pending")
         self.assertIsNone(queued["update_id"])
 
+        # Keep this test isolated: the requeued item is verified above, but
+        # must not be claimed by the queue/outbox lifecycle test.
+        with bot.db_connect() as db:
+            db.execute("DELETE FROM message_queue WHERE id = ?", (result["queue_id"],))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

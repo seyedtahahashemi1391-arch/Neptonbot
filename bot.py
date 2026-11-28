@@ -1537,8 +1537,8 @@ def get_live_weather(user_text):
     # This keeps the forecast provider's geocoding focused on a real city.
     def _province_key(value):
         value = normalize_text(value)
-        value = re.sub(r"^استان\\s+", "", value)
-        return re.sub(r"\\s+", "", value)
+        value = re.sub(r"^استان\s+", "", value)
+        return re.sub(r"\s+", "", value)
 
     province_capitals = {
         "آذربایجان شرقی": "تبریز", "آذربایجان غربی": "ارومیه",

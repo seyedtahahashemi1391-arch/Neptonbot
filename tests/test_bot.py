@@ -1,7 +1,9 @@
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
 import os
 import tempfile
 import time
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -477,6 +479,67 @@ class DatabaseWorkflowTests(unittest.TestCase):
         result = bot.db_requeue_dead_letter(bot.db_list_dead_letters()[0]["id"])
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "delivery_ambiguous")
+
+    def test_load_queue_capacity_rejects_overflow_atomically(self):
+        batch = [
+            (50000 + index, f"load-chat-{index}", f"message-{index}")
+            for index in range(600)
+        ]
+        started = time.monotonic()
+        self.assertTrue(bot.db_enqueue_updates(batch, 50600))
+        elapsed = time.monotonic() - started
+        self.assertEqual(bot.db_queue_stats()["queued_messages"], 600)
+        self.assertLess(elapsed, 20.0)
+
+        overflow = [
+            (60000 + index, f"overflow-chat-{index}", f"message-{index}")
+            for index in range(401)
+        ]
+        self.assertFalse(bot.db_enqueue_updates(overflow, 60401))
+        self.assertEqual(bot.db_queue_stats()["queued_messages"], 600)
+        self.assertNotEqual(bot.db_get_offset(), 60401)
+
+    def test_load_concurrent_workers_claim_each_message_once(self):
+        total_messages = 64
+        worker_count = 8
+        batch = [
+            (70000 + index, f"parallel-chat-{index}", f"payload-{index}")
+            for index in range(total_messages)
+        ]
+        self.assertTrue(bot.db_enqueue_updates(batch, 70064))
+
+        barrier = threading.Barrier(worker_count)
+        claimed_ids = []
+        claimed_lock = threading.Lock()
+        previous_sweep = bot._last_lease_sweep
+        bot._last_lease_sweep = time.monotonic()
+
+        def claim_until_empty(worker_number):
+            worker_id = f"load-worker-{worker_number}"
+            local_ids = []
+            barrier.wait(timeout=10)
+            while True:
+                item = bot.db_claim_next_message(worker_id)
+                if item is None:
+                    break
+                local_ids.append(item["id"])
+            with claimed_lock:
+                claimed_ids.extend(local_ids)
+            return len(local_ids)
+
+        started = time.monotonic()
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(claim_until_empty, range(worker_count)))
+        finally:
+            bot._last_lease_sweep = previous_sweep
+
+        elapsed = time.monotonic() - started
+        self.assertEqual(sum(results), total_messages)
+        self.assertEqual(len(claimed_ids), total_messages)
+        self.assertEqual(len(set(claimed_ids)), total_messages)
+        self.assertEqual(bot.db_queue_stats()["processing_messages"], total_messages)
+        self.assertLess(elapsed, 30.0)
 
     def test_queue_deduplication_and_durable_completion(self):
         update = (1001, "chat-1", "سلام")

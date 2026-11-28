@@ -699,6 +699,41 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["status"], "degraded")
 
+    def test_health_endpoint_exposes_operational_alerts_and_capacity(self):
+        stats = {
+            "queued_messages": 850,
+            "pending_messages": 840,
+            "processing_messages": 10,
+            "oldest_queue_age_seconds": 125,
+            "dead_letters": 2,
+            "outbox_pending": 3,
+            "outbox_sent": 20,
+            "outbox_uncertain": 1,
+            "outbox_sending": 0,
+        }
+        with patch.object(bot, "db_queue_stats", return_value=stats), patch.object(
+            bot, "_cloudflare_circuit_status", return_value="موقتاً قطع"
+        ):
+            payload = bot.app.test_client().get("/health").get_json()
+        self.assertEqual(payload["queue_capacity"], bot.MAX_QUEUED_MESSAGES)
+        self.assertEqual(payload["queue_utilization_percent"], 85.0)
+        self.assertIn("queue_capacity_high", payload["alerts"])
+        self.assertIn("dead_letters_open", payload["alerts"])
+        self.assertIn("outbox_delivery_uncertain", payload["alerts"])
+        self.assertIn("ai_provider_circuit_open", payload["alerts"])
+        self.assertIn("ai_mode", payload)
+        self.assertIn("sentry_enabled", payload)
+
+    def test_poll_health_records_sentry_metrics_without_affecting_polling(self):
+        with patch.object(bot, "SENTRY_ENABLED", True), patch.object(
+            bot.sentry_metrics, "count"
+        ) as metric:
+            bot._record_poll_success()
+            bot._record_poll_error(RuntimeError("simulated poll failure"))
+        self.assertEqual(metric.call_count, 2)
+        self.assertEqual(metric.call_args_list[0].args, ("neptonbot.poll.success", 1))
+        self.assertEqual(metric.call_args_list[1].args, ("neptonbot.poll.error", 1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -51,9 +51,7 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
 LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
-VOICE_MEDIA_PREFIX = "__NEPTON_VOICE__:"
 REPLY_CONTEXT_PREFIX = "__NEPTON_REPLY_CONTEXT__:"
-VOICE_MAX_BYTES = 8 * 1024 * 1024
 
 MODEL = os.getenv("NEPTON_MODEL", "@cf/zai-org/glm-4.7-flash").strip()
 VERSION = "3.3.16"
@@ -2152,77 +2150,6 @@ def send_one_message(chat_id, text, reply_markup=None):
     return True
 
 
-def transcribe_soroush_voice(metadata):
-    """Download a Soroush voice/audio attachment and transcribe it with Cloudflare Whisper."""
-    file_id = metadata.get("file_id") if isinstance(metadata, dict) else None
-    if not isinstance(file_id, str) or not file_id:
-        raise UserVisibleError("شناسهٔ فایل صوتی معتبر نیست.")
-    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
-        raise UserVisibleError("پردازش ویس فعلاً پیکربندی نشده است.")
-
-    file_info = soroush_request("getFile", {"file_id": file_id})
-    result = file_info.get("result", file_info) if isinstance(file_info, dict) else {}
-    file_path = result.get("file_path") if isinstance(result, dict) else None
-    if not isinstance(file_path, str) or not file_path or ".." in file_path.split("/"):
-        raise UserVisibleError("سروش مسیر دریافت این فایل صوتی را برنگرداند.")
-
-    file_url = "https://api.splus.ir/file/bot" + BOT_TOKEN + "/" + file_path.lstrip("/")
-    session = get_http_session("soroush_session")
-    try:
-        with session.get(file_url, timeout=SOROUSH_TIMEOUT, stream=True, allow_redirects=False) as response:
-            if response.status_code in (301, 302, 303, 307, 308):
-                raise UserVisibleError("دریافت مستقیم این فایل صوتی از سروش پشتیبانی نشد.")
-            if response.status_code != 200:
-                raise TransientAPIError(f"Soroush file download failed ({response.status_code})")
-            length = response.headers.get("Content-Length")
-            if length:
-                try:
-                    if int(length) > VOICE_MAX_BYTES:
-                        raise UserVisibleError("ویس بیش از حد مجاز است؛ لطفاً یک ویس کوتاه‌تر بفرست.")
-                except ValueError:
-                    pass
-            audio = bytearray()
-            for chunk in response.iter_content(chunk_size=65536):
-                if chunk:
-                    audio.extend(chunk)
-                    if len(audio) > VOICE_MAX_BYTES:
-                        raise UserVisibleError("ویس بیش از حد مجاز است؛ لطفاً یک ویس کوتاه‌تر بفرست.")
-    except UserVisibleError:
-        raise
-    except requests.exceptions.RequestException:
-        raise TransientAPIError("Soroush voice download failed") from None
-
-    if not audio:
-        raise UserVisibleError("فایل صوتی خالی است.")
-
-    endpoint = (
-        "https://api.cloudflare.com/client/v4/accounts/"
-        + CLOUDFLARE_ACCOUNT_ID
-        + "/ai/run/@cf/openai/whisper-large-v3-turbo"
-    )
-    try:
-        response = session.post(
-            endpoint,
-            headers={"Authorization": "Bearer " + CLOUDFLARE_API_TOKEN},
-            json={"audio": __import__("base64").b64encode(audio).decode("ascii"), "task": "transcribe"},
-            timeout=AI_TIMEOUT,
-        )
-    except requests.exceptions.RequestException:
-        raise TransientAPIError("Cloudflare transcription transport failure") from None
-    with response:
-        if response.status_code == 429 or response.status_code >= 500:
-            raise TransientAPIError(f"Cloudflare transcription temporary failure ({response.status_code})")
-        if not 200 <= response.status_code < 300:
-            raise UserVisibleError("سرویس تبدیل ویس به متن درخواست را نپذیرفت.")
-        try:
-            payload = response.json()
-        except ValueError:
-            raise TransientAPIError("Cloudflare transcription returned invalid JSON") from None
-    result = payload.get("result", payload) if isinstance(payload, dict) else {}
-    transcript = result.get("text") if isinstance(result, dict) else None
-    if not isinstance(transcript, str) or not transcript.strip():
-        raise UserVisibleError("صدای قابل‌تشخیصی در ویس پیدا نشد.")
-    return transcript.strip()[:MAX_MESSAGE_LENGTH]
 
 
 # =========================================================
@@ -2309,20 +2236,7 @@ def extract_message(update):
         message_text = message.get("body", message.get("message_text"))
 
     if message_text is None:
-        media = message.get("voice") or message.get("audio")
-        if not isinstance(media, dict):
-            document = message.get("document")
-            if isinstance(document, dict) and str(document.get("mime_type", "")).lower().startswith("audio/"):
-                media = document
-        file_id = media.get("file_id") if isinstance(media, dict) else None
-        if isinstance(file_id, str) and file_id.strip():
-            message_text = VOICE_MEDIA_PREFIX + json.dumps(
-                {"file_id": file_id.strip(), "mime_type": media.get("mime_type")},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        else:
-            return None
+        return None
     if not isinstance(message_text, str):
         message_text = str(message_text)
 
@@ -2525,22 +2439,6 @@ def build_response_plan(chat_id, text):
             logger.warning("Ignoring malformed reply context envelope")
             text = text[len(REPLY_CONTEXT_PREFIX):]
     text = text.strip()
-    if text.startswith(VOICE_MEDIA_PREFIX):
-        try:
-            voice_meta = json.loads(text[len(VOICE_MEDIA_PREFIX):])
-            transcript = transcribe_soroush_voice(voice_meta)
-
-            response_text = f"🎙️ متن تشخیص‌داده‌شده:\n{transcript}"
-        except UserVisibleError as exc:
-            response_text = str(exc)
-        except Exception:
-            logger.exception("Voice transcription failed")
-            response_text = "پردازش ویس ناموفق شد؛ لطفاً دوباره بفرست."
-        return {
-            "responses": [(chat_id, response_text)],
-            "history_user": None, "history_assistant": None,
-            "clear_history": False, "feedback_action": None,
-        }
     if not text:
         return {
             "responses": [], "history_user": None, "history_assistant": None,

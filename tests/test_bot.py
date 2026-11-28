@@ -115,6 +115,40 @@ class ParsingTests(unittest.TestCase):
         ), patch.object(bot, "get_history", side_effect=AssertionError("history should not be read")):
             self.assertIn("اتصال سرویس هوش مصنوعی", bot.call_ai("offline-chat", "یک سؤال ناشناخته"))
 
+    def test_database_error_detection_and_backoff(self):
+        self.assertTrue(bot._is_database_error(bot.sqlite3.OperationalError("database is locked")))
+        self.assertFalse(bot._is_database_error(bot.TransientAPIError("network down")))
+        delays = [bot._database_retry_delay(n) for n in (1, 2, 3, 10)]
+        self.assertTrue(all(0 < delay <= bot.DB_RETRY_BACKOFF_MAX for delay in delays))
+        self.assertEqual(delays, sorted(delays))
+
+    def test_polling_retries_loading_offset_after_database_failure(self):
+        event = bot._polling_stop
+        event.clear()
+        wait_calls = {"count": 0}
+        original_wait = event.wait
+
+        def stop_after_empty_poll(delay):
+            wait_calls["count"] += 1
+            if wait_calls["count"] >= 2:
+                event.set()
+                return True
+            return False
+
+        try:
+            with patch.object(
+                bot, "db_get_offset",
+                side_effect=[bot.sqlite3.OperationalError("db offline"), 42],
+            ) as get_offset, patch.object(
+                bot, "soroush_request", return_value={"ok": True, "result":[]}
+            ), patch.object(bot, "has_update_container", return_value=True), patch.object(
+                bot, "extract_updates", return_value=[]
+            ), patch.object(event, "wait", side_effect=stop_after_empty_poll):
+                bot.polling_loop()
+            self.assertEqual(get_offset.call_count, 2)
+        finally:
+            event.clear()
+
     def test_audio_messages_are_ignored(self):
         update = {
             "message": {

@@ -187,6 +187,57 @@ class ParsingTests(unittest.TestCase):
         finally:
             event.clear()
 
+    def test_message_processing_stops_remaining_sends_after_runtime_lease_loss(self):
+        lease_lost = bot._runtime_lease_lost
+        lease_lost.clear()
+        item = {
+            "id": 987653,
+            "queued_at": time.time(),
+            "response_plan": '[{"chat_id":"lease-chat","text":"first"},'
+                             '{"chat_id":"lease-chat","text":"second"}]',
+            "response_index": 0,
+        }
+
+        def lose_lease_during_send(*_args, **_kwargs):
+            lease_lost.set()
+
+        try:
+            with patch.object(bot, "db_renew_lease", return_value=True), patch.object(
+                bot, "db_get_delivery_state", return_value={"status": "pending"}
+            ), patch.object(
+                bot, "db_mark_delivery_sending", return_value=True
+            ), patch.object(
+                bot, "send_one_message", side_effect=lose_lease_during_send
+            ) as send, patch.object(
+                bot, "db_mark_delivery_sent", return_value=True
+            ) as mark_sent, patch.object(
+                bot, "db_advance_response", return_value=True
+            ) as advance, patch.object(
+                bot, "db_finish_message"
+            ) as finish:
+                bot._process_claimed_item_impl(item, "lease-loss-worker")
+
+            send.assert_called_once_with("lease-chat", "first", reply_markup=None)
+            mark_sent.assert_called_once_with(item["id"], 0)
+            advance.assert_called_once_with(item["id"], "lease-loss-worker", 0)
+            finish.assert_not_called()
+        finally:
+            lease_lost.clear()
+
+    def test_message_processing_does_not_start_after_runtime_lease_loss(self):
+        lease_lost = bot._runtime_lease_lost
+        lease_lost.set()
+        try:
+            item = {"id": 987652, "response_plan": "[]", "response_index": 0}
+            with patch.object(bot, "db_renew_lease") as renew, patch.object(
+                bot, "send_one_message"
+            ) as send:
+                bot._process_claimed_item_impl(item, "stale-worker")
+            renew.assert_not_called()
+            send.assert_not_called()
+        finally:
+            lease_lost.clear()
+
     def test_worker_stops_claiming_after_runtime_lease_loss(self):
         polling_stop = bot._polling_stop
         lease_lost = bot._runtime_lease_lost

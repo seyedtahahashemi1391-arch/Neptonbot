@@ -211,6 +211,42 @@ class ParsingTests(unittest.TestCase):
             polling_stop.clear()
             lease_lost.clear()
 
+    def test_worker_releases_claim_after_database_loss_without_spending_retry(self):
+        polling_stop = bot._polling_stop
+        polling_stop.clear()
+        item = {"id": 987655, "attempts": 2}
+        wait_calls = {"count": 0}
+
+        def stop_after_database_recovery(_delay):
+            wait_calls["count"] += 1
+            polling_stop.set()
+            return True
+
+        try:
+            with patch.object(bot, "_worker_id", return_value="db-loss-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ) as claim, patch.object(
+                bot, "_process_claimed_item",
+                side_effect=bot.sqlite3.OperationalError("database connection lost")
+            ) as process, patch.object(
+                bot, "_database_retry_delay", return_value=0.01
+            ), patch.object(
+                bot._queue_wakeup, "wait", side_effect=stop_after_database_recovery
+            ), patch.object(
+                bot, "db_retry_message", return_value=True
+            ) as release:
+                bot.chat_worker()
+
+            self.assertEqual(claim.call_count, 1)
+            self.assertEqual(process.call_count, 1)
+            release.assert_called_once_with(
+                item["id"], "db-loss-worker", item["attempts"],
+                "database temporarily unavailable", retry_after=0.01
+            )
+            self.assertEqual(wait_calls["count"], 1)
+        finally:
+            polling_stop.clear()
+
     def test_polling_retries_loading_offset_after_database_failure(self):
         event = bot._polling_stop
         event.clear()

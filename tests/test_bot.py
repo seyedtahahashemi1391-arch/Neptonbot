@@ -99,6 +99,39 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot._weather_location("هواشناسی کاشمر"), "کاشمر")
         self.assertEqual(bot._weather_location("هوا در مشهد چطوره؟"), "مشهد")
 
+    def test_weather_province_prefix_is_removed_before_geocoding(self):
+        geocoding = {
+            "results": [{
+                "name": "Mashhad",
+                "country": "Iran",
+                "country_code": "IR",
+                "latitude": 36.2972,
+                "longitude": 59.6067,
+            }]
+        }
+        forecast = {
+            "current": {
+                "temperature_2m": 12,
+                "apparent_temperature": 11,
+                "relative_humidity_2m": 40,
+                "wind_speed_10m": 8,
+                "time": "2026-11-28T14:00",
+            },
+            "daily": {
+                "temperature_2m_min": [7],
+                "temperature_2m_max": [15],
+                "precipitation_probability_max": [10],
+            },
+        }
+        with patch.object(bot, "_get_json", side_effect=[geocoding, forecast]) as provider:
+            result = bot.get_live_weather("هواشناسی استان خراسان رضوی")
+
+        self.assertIn("Mashhad", result)
+        self.assertEqual(
+            provider.call_args_list[0].kwargs["params"]["name"],
+            "مشهد",
+        )
+
     def test_weather_geocoding_retries_without_strict_country_filter(self):
         geo_fallback = {
             "results": [{

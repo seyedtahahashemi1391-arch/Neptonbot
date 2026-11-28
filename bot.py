@@ -1508,16 +1508,20 @@ def get_live_weather(user_text):
 
     geo = _get_json(
         "https://geocoding-api.open-meteo.com/v1/search",
-        params={"name": place, "count": 1, "language": "fa", "format": "json", "countryCode": "IR"},
+        params={"name": place, "count": 100, "language": "fa", "format": "json", "countryCode": "IR"},
     )
     results = geo.get("results") if isinstance(geo, dict) else None
 
     # A strict country-filtered Persian lookup can occasionally miss a valid
     # Iranian city. Retry without the filter, then accept only an Iran result.
-    if not isinstance(results, list) or not results:
+    if not isinstance(results, list) or not any(
+        isinstance(row, dict)
+        and str(row.get("country_code") or "").upper() == "IR"
+        for row in results
+    ):
         fallback = _get_json(
             "https://geocoding-api.open-meteo.com/v1/search",
-            params={"name": place, "count": 10, "language": "en", "format": "json"},
+            params={"name": place, "count": 100, "language": "en", "format": "json"},
         )
         fallback_rows = fallback.get("results") if isinstance(fallback, dict) else None
         if isinstance(fallback_rows, list):
@@ -1527,7 +1531,33 @@ def get_live_weather(user_text):
                 and str(row.get("country_code") or "").upper() == "IR"
             ]
 
-    if not isinstance(results, list) or not results or not isinstance(results[0], dict):
+    if not isinstance(results, list):
+        results = []
+    results = [
+        row for row in results
+        if isinstance(row, dict)
+        and str(row.get("country_code") or "").upper() == "IR"
+        and isinstance(row.get("latitude"), (int, float))
+        and isinstance(row.get("longitude"), (int, float))
+    ]
+
+    def _city_key(value):
+        value = str(value or "").strip().lower()
+        value = value.replace("ي", "ی").replace("ك", "ک")
+        value = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", value)
+        return re.sub(r"[^\w]+", "", value, flags=re.UNICODE)
+
+    requested_city = _city_key(place)
+    # Prefer exact and prefix matches; population breaks ties consistently.
+    results.sort(
+        key=lambda row: (
+            0 if _city_key(row.get("name")) == requested_city else
+            1 if _city_key(row.get("name")).startswith(requested_city) else 2,
+            -(row.get("population") or 0),
+        )
+    )
+
+    if not results:
         logger.info("Weather geocoding returned no Iran match for input=%r", place)
         return f"برای نام «{place}» نتیجهٔ معتبر در سرویس مکان‌یابی پیدا نشد؛ ممکن است سرویس نام شهر را نشناخته باشد."
 
@@ -2466,7 +2496,7 @@ def build_response_plan(chat_id, text):
         expires_at = int(time.time()) + 300
         db_set_state(weather_state_key, str(expires_at))
         return {
-            "responses": [(chat_id, "نام شهر ایران را بفرست؛ مثلاً: مشهد یا کاشمر\nبرای لغو، /cancel را بفرست. این درخواست تا ۵ دقیقه فعال می‌ماند.")],
+            "responses": [(chat_id, "نام شهری که در ایران وجود دارد را بنویسید")],
             "history_user": None, "history_assistant": None,
             "clear_history": False, "feedback_action": None,
         }

@@ -524,6 +524,46 @@ def init_database():
                 ON delivery_outbox(status, updated_at)
             """)
 
+            # Backfill response plans persisted by versions before the durable
+            # outbox existed. Earlier cursor positions are confirmed sent;
+            # the current position is ambiguous and must not be blindly resent.
+            legacy_rows = db.execute("""
+                SELECT id, response_plan, response_index
+                FROM message_queue
+                WHERE response_plan IS NOT NULL AND response_plan != ''
+            """).fetchall()
+            migration_now = time.time()
+            for legacy in legacy_rows:
+                try:
+                    legacy_plan = json.loads(legacy["response_plan"])
+                except (TypeError, ValueError):
+                    logger.error("Skipping invalid legacy response plan during outbox migration id=%s", legacy["id"])
+                    continue
+                if not isinstance(legacy_plan, list):
+                    continue
+                cursor_index = max(0, int(legacy["response_index"] or 0))
+                for index, part in enumerate(legacy_plan):
+                    if not isinstance(part, dict) or not part.get("chat_id") or not isinstance(part.get("text"), str):
+                        continue
+                    status = "sent" if index < cursor_index else (
+                        "uncertain" if index == cursor_index else "pending"
+                    )
+                    db.execute("""
+                        INSERT INTO delivery_outbox(
+                            queue_id, response_index, chat_id, message_text,
+                            reply_markup, status, attempts, created_at, updated_at,
+                            last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+                        ON CONFLICT(queue_id, response_index) DO NOTHING
+                    """, (
+                        legacy["id"], index, str(part["chat_id"]), part["text"],
+                        json.dumps(part.get("reply_markup"), ensure_ascii=False)
+                        if part.get("reply_markup") is not None else None,
+                        status, migration_now, migration_now,
+                        "legacy delivery state ambiguous during outbox migration"
+                        if status == "uncertain" else None,
+                    ))
+
             db.execute("""
                 CREATE TABLE IF NOT EXISTS processed_updates (
                     update_id INTEGER PRIMARY KEY,
@@ -1077,7 +1117,12 @@ def db_cleanup_old_records():
         db.execute("DELETE FROM processed_updates WHERE processed_at < ?", (processed_cutoff,))
         delivery_cutoff = now - PROCESSED_UPDATE_RETENTION_DAYS * 86400
         db.execute(
-            "DELETE FROM delivery_outbox WHERE updated_at < ? AND status IN ('sent', 'uncertain')",
+            """DELETE FROM delivery_outbox
+               WHERE updated_at < ? AND status IN ('sent', 'uncertain')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM message_queue
+                     WHERE message_queue.id = delivery_outbox.queue_id
+                 )""",
             (delivery_cutoff,),
         )
         db.execute("DELETE FROM dead_letters WHERE failed_at < ?", (dead_cutoff,))

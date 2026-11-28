@@ -393,6 +393,40 @@ class ParsingTests(unittest.TestCase):
 
 
 
+    def test_runtime_heartbeat_stops_after_three_consecutive_renewal_failures(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+        bot._queue_wakeup.clear()
+        wait_results = [False, False, False, False, False, True]
+        renew_results = [
+            RuntimeError("temporary database outage"),
+            True,
+            RuntimeError("temporary database outage"),
+            RuntimeError("temporary database outage"),
+            RuntimeError("temporary database outage"),
+        ]
+        try:
+            with patch.object(
+                polling_stop, "wait", side_effect=wait_results
+            ), patch.object(
+                bot, "_renew_runtime_lock", side_effect=renew_results
+            ) as renew, patch.object(
+                bot._queue_wakeup, "set"
+            ) as wake:
+                bot.runtime_lease_heartbeat()
+
+            self.assertEqual(renew.call_count, 5)
+            self.assertTrue(lease_lost.is_set())
+            self.assertTrue(polling_stop.is_set())
+            wake.assert_called_once_with()
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+            bot._queue_wakeup.clear()
+
+
 class GunicornLifecycleTests(unittest.TestCase):
     def test_runtime_starts_only_after_worker_initialization(self):
         worker = SimpleNamespace(pid=123)

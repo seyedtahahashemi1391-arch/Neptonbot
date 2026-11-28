@@ -59,7 +59,7 @@ if AI_MODE not in {"auto", "cloudflare", "rules"}:
     AI_MODE = "auto"
 AI_CIRCUIT_FAILURE_THRESHOLD = _env_int("NEPTON_AI_CIRCUIT_FAILURES", 3, 1, 10)
 AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
-VERSION = "3.3.20"
+VERSION = "3.3.21"
 ADMIN_USERNAME = os.getenv("NEPTON_ADMIN_USERNAME", "t91m62").strip().lstrip("@").lower()
 
 SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
@@ -1266,6 +1266,11 @@ def _record_poll_success():
         _last_poll_success_at = time.time()
         _last_poll_error_at = None
         _last_poll_error_type = None
+    if SENTRY_ENABLED:
+        try:
+            sentry_metrics.count("neptonbot.poll.success", 1)
+        except Exception:
+            logger.debug("Sentry poll-success metric unavailable", exc_info=True)
 
 
 def _record_poll_error(exc):
@@ -1273,6 +1278,11 @@ def _record_poll_error(exc):
     with _poll_health_lock:
         _last_poll_error_at = time.time()
         _last_poll_error_type = type(exc).__name__
+    if SENTRY_ENABLED:
+        try:
+            sentry_metrics.count("neptonbot.poll.error", 1)
+        except Exception:
+            logger.debug("Sentry poll-error metric unavailable", exc_info=True)
 
 
 class UserVisibleError(Exception):
@@ -1537,6 +1547,27 @@ def health():
         poll_fresh = poll_age is not None and poll_age <= max(60, SOROUSH_TIMEOUT[1] * 2)
         runtime_healthy = _runtime_active and polling_running and live_workers >= 1
         fully_healthy = runtime_healthy and poll_fresh and database_connected
+
+        queue_depth = int(stats.get("queued_messages", 0))
+        queue_capacity = MAX_QUEUED_MESSAGES
+        queue_utilization = round((queue_depth / queue_capacity) * 100, 1)
+        ai_circuit = _cloudflare_circuit_status()
+        alerts = []
+        if not database_connected:
+            alerts.append("database_unavailable")
+        if not runtime_healthy:
+            alerts.append("runtime_not_healthy")
+        if not poll_fresh:
+            alerts.append("polling_stale")
+        if queue_utilization >= 80:
+            alerts.append("queue_capacity_high")
+        if int(stats.get("dead_letters", 0)) > 0:
+            alerts.append("dead_letters_open")
+        if int(stats.get("outbox_uncertain", 0)) > 0:
+            alerts.append("outbox_delivery_uncertain")
+        if "موقتاً قطع" in ai_circuit:
+            alerts.append("ai_provider_circuit_open")
+
         payload = {
             "status": "healthy" if fully_healthy else "degraded",
             "database_connected": database_connected,
@@ -1551,6 +1582,12 @@ def health():
             "last_poll_error_seconds_ago": (
                 round(time.time() - last_error_at, 1) if last_error_at is not None else None
             ),
+            "ai_mode": AI_MODE,
+            "ai_circuit": ai_circuit,
+            "sentry_enabled": SENTRY_ENABLED,
+            "queue_capacity": queue_capacity,
+            "queue_utilization_percent": queue_utilization,
+            "alerts": alerts,
             "version": VERSION,
             "model": MODEL,
         }

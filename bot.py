@@ -76,9 +76,9 @@ SOROUSH_TIMEOUT = (
 )
 MAX_HISTORY_MESSAGES = 10
 MAX_CONTEXT_CHARS = _env_int("NEPTON_MAX_CONTEXT_CHARS", 6000, 1500, 20000)
-MAX_COMPLETION_TOKENS = _env_int("NEPTON_MAX_COMPLETION_TOKENS", 768, 256, 2048)
+MAX_COMPLETION_TOKENS = _env_int("NEPTON_MAX_COMPLETION_TOKENS", 512, 256, 2048)
 LONG_COMPLETION_TOKENS = _env_int(
-    "NEPTON_LONG_COMPLETION_TOKENS", 1536, MAX_COMPLETION_TOKENS, 2048
+    "NEPTON_LONG_COMPLETION_TOKENS", 1024, MAX_COMPLETION_TOKENS, 2048
 )
 MAX_CONVERSATIONS = 500
 HISTORY_RETENTION_DAYS = 30
@@ -124,6 +124,7 @@ START_MESSAGE = (
     "│ 🔎 /search عبارت — جست‌وجوی وب\n"
     "│ 🧹 /reset — پاک‌کردن تاریخچه گفتگو\n"
     "│ 💡 /feedback — ارسال نظر یا پیشنهاد\n"
+    "│ ❔ راهنما: نمایش همین راهنما\n"
     "│ ❔ /help — نمایش راهنما\n"
     "└━━━━━━━━━━━━━━━━━━\n"
     "آماده‌ام؛ از چی شروع کنیم؟"
@@ -139,6 +140,8 @@ HELP_MESSAGE = (
     "✖ /cancel — لغو ارسال نظر یا هواشناسی\n"
     "🌦 /weather — دریافت هواشناسی با واردکردن نام شهر\n"
     "💰 /market — دریافت قیمت‌های بازار ایران\n"
+    "💡 ارسال نظر — ثبت بازخورد با دکمهٔ منو\n"
+    "❔ راهنما — نمایش این راهنما\n"
     "ℹ️ /start — نمایش منوی شروع"
 )
 
@@ -2318,7 +2321,9 @@ def process_feedback_message(chat_id, text):
             "responses": [(chat_id, "در حال حاضر در مرحلهٔ ارسال نظر نیستی.")],
             "feedback_action": None,
         }
-    if command == FEEDBACK_COMMAND or normalized == normalize_text(FEEDBACK_TRIGGER_TEXT):
+    if command == FEEDBACK_COMMAND or normalized in {
+        normalize_text(FEEDBACK_TRIGGER_TEXT), normalize_text("💡 ارسال نظر")
+    }:
         return {
             "responses": [(
                 chat_id,
@@ -2407,7 +2412,10 @@ def build_response_plan(chat_id, text):
     if (
         (command.startswith("/") and command not in {"/weather", "/cancel"})
         or text.strip() == "💰 قیمت بازار"
-        or normalize_text(text) == normalize_text(FEEDBACK_TRIGGER_TEXT)
+        or normalize_text(text) in {
+            normalize_text(FEEDBACK_TRIGGER_TEXT), normalize_text("💡 ارسال نظر"),
+            normalize_text("❔ راهنما"),
+        }
     ):
         if weather_pending_until is not None:
             db_delete_state(weather_state_key)
@@ -2514,13 +2522,17 @@ def build_response_plan(chat_id, text):
             }
 
         db_delete_state(weather_state_key)
-    if command in {"/start", "/help"}:
+    is_help_button = normalize_text(text) == normalize_text("❔ راهنما")
+    if command in {"/start", "/help"} or is_help_button:
         message = START_MESSAGE if command == "/start" else HELP_MESSAGE
         return {
             "responses": [(chat_id, message)], "history_user": None,
             "history_assistant": None, "clear_history": False, "feedback_action": None,
             "reply_markup": {
-                "keyboard": [[{"text": "🌦 هواشناسی"}, {"text": "💰 قیمت بازار"}]],
+                "keyboard": [
+                    [{"text": "🌦 هواشناسی"}, {"text": "💰 قیمت بازار"}],
+                    [{"text": "💡 ارسال نظر"}, {"text": "❔ راهنما"}],
+                ],
                 "resize_keyboard": True,
                 "one_time_keyboard": False,
             } if command == "/start" else None,

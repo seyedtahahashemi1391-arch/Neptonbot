@@ -34,7 +34,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("تعداد خط یا کلمه", bot.SYSTEM_PROMPT)
         self.assertIn("ترتیب رویدادها", bot.SYSTEM_PROMPT)
         self.assertIn("متن تکراری", bot.SYSTEM_PROMPT)
-        self.assertEqual(bot.MAX_COMPLETION_TOKENS, 768)
+        self.assertEqual(bot.MAX_COMPLETION_TOKENS, 512)
 
     def test_chamran_40_line_essay_uses_reviewed_historical_facts(self):
         request = "یه انشا ۴۰ خطی درباره شهید چمران بنویس"
@@ -267,10 +267,18 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertIn("NEPTON", start_result["responses"][0][1])
         self.assertIsNotNone(start_result.get("reply_markup"))
         self.assertTrue(bot.db_feedback_is_pending("feedback-user"))
+        keyboard = start_result["reply_markup"]["keyboard"]
+        self.assertEqual(len(keyboard), 2)
+        self.assertEqual(keyboard[1], [{"text": "💡 ارسال نظر"}, {"text": "❔ راهنما"}])
 
         help_result = bot.build_response_plan("feedback-user", "/help")
         self.assertIn("راهنمای NeptonBot", help_result["responses"][0][1])
         self.assertTrue(bot.db_feedback_is_pending("feedback-user"))
+
+        help_button = bot.build_response_plan("feedback-user", "❔ راهنما")
+        self.assertIn("راهنمای NeptonBot", help_button["responses"][0][1])
+        feedback_button = bot.build_response_plan("feedback-user", "💡 ارسال نظر")
+        self.assertEqual(feedback_button["feedback_action"], "set")
 
     def test_queue_preserves_fifo_order_within_each_chat(self):
         updates = [

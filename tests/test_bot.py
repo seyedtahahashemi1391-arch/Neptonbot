@@ -66,6 +66,25 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot.extract_message(update), ("123", "سلام"))
         self.assertEqual(bot.get_update_id(update), 12)
 
+    def test_reply_context_is_preserved_for_ai(self):
+        update = {
+            "message": {
+                "chat": {"id": 123, "type": "private"},
+                "from": {"id": 123, "username": "regular_user"},
+                "text": "منظورت چیه؟",
+                "reply_to_message": {"text": "این پیام اصلی ربات است"},
+            }
+        }
+        chat_id, encoded = bot.extract_message(update)
+        self.assertEqual(chat_id, "123")
+        with patch.object(bot, "call_ai", return_value="پاسخ آزمایشی") as ai:
+            result = bot.build_response_plan(chat_id, encoded)
+        ai.assert_called_once_with(
+            "123", "منظورت چیه؟", reply_context="این پیام اصلی ربات است"
+        )
+        self.assertEqual(result["history_user"], "منظورت چیه؟")
+        self.assertEqual(result["responses"][0][0], "123")
+
     def test_weather_location_parsing(self):
         self.assertEqual(bot._weather_location("هواشناسی کاشمر"), "کاشمر")
         self.assertEqual(bot._weather_location("هوا در مشهد چطوره؟"), "مشهد")

@@ -393,6 +393,32 @@ class ParsingTests(unittest.TestCase):
 
 
 
+    def test_polling_discards_response_if_runtime_lease_is_lost_during_request(self):
+        polling_stop = bot._polling_stop
+        lease_lost = bot._runtime_lease_lost
+        polling_stop.clear()
+        lease_lost.clear()
+
+        def lose_lease_during_request(*_args, **_kwargs):
+            lease_lost.set()
+            return {"ok": True, "result": [{"update_id": 123, "message": {}}]}
+
+        try:
+            with patch.object(bot, "db_get_offset", return_value=None), patch.object(
+                bot, "soroush_request", side_effect=lose_lease_during_request
+            ) as request, patch.object(
+                bot, "db_enqueue_updates"
+            ) as enqueue:
+                bot.polling_loop()
+
+            request.assert_called_once()
+            enqueue.assert_not_called()
+            self.assertTrue(lease_lost.is_set())
+        finally:
+            polling_stop.clear()
+            lease_lost.clear()
+
+
     def test_runtime_heartbeat_stops_after_three_consecutive_renewal_failures(self):
         polling_stop = bot._polling_stop
         lease_lost = bot._runtime_lease_lost

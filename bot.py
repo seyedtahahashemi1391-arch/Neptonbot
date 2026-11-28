@@ -1514,7 +1514,11 @@ def get_live_weather(user_text):
 
     # A strict country-filtered Persian lookup can occasionally miss a valid
     # Iranian city. Retry without the filter, then accept only an Iran result.
-    if not isinstance(results, list) or not results:
+    if not isinstance(results, list) or not any(
+        isinstance(row, dict)
+        and str(row.get("country_code") or "").upper() == "IR"
+        for row in results
+    ):
         fallback = _get_json(
             "https://geocoding-api.open-meteo.com/v1/search",
             params={"name": place, "count": 100, "language": "en", "format": "json"},

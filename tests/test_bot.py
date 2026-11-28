@@ -334,6 +334,117 @@ class DatabaseWorkflowTests(unittest.TestCase):
             ):
                 db.execute(f"DELETE FROM {table}")
 
+    def test_chaos_polling_recovers_after_transient_api_outage(self):
+        event = bot._polling_stop
+        event.clear()
+        bot._runtime_lease_lost.clear()
+        waits = {"count": 0}
+
+        def stop_after_recovery(delay):
+            waits["count"] += 1
+            if waits["count"] >= 2:
+                event.set()
+                return True
+            return False
+
+        try:
+            with patch.object(bot, "db_get_offset", return_value=77), patch.object(
+                bot, "soroush_request",
+                side_effect=[
+                    bot.TransientAPIError("simulated network partition"),
+                    {"ok": True, "result": []},
+                ],
+            ) as request, patch.object(
+                bot, "has_update_container", return_value=True
+            ), patch.object(bot, "extract_updates", return_value=[]), patch.object(
+                event, "wait", side_effect=stop_after_recovery
+            ):
+                bot.polling_loop()
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_args_list[0].args[1], {"offset": 77})
+            self.assertEqual(request.call_args_list[1].args[1], {"offset": 77})
+        finally:
+            event.clear()
+            bot._runtime_lease_lost.clear()
+
+    def test_chaos_polling_does_not_advance_offset_when_inbox_persist_fails(self):
+        event = bot._polling_stop
+        event.clear()
+        bot._runtime_lease_lost.clear()
+        waits = {"count": 0}
+
+        def stop_after_second_poll(delay):
+            waits["count"] += 1
+            if waits["count"] >= 2:
+                event.set()
+                return True
+            return False
+
+        try:
+            with patch.object(bot, "db_get_offset", return_value=10), patch.object(
+                bot, "soroush_request",
+                return_value={"ok": True, "result": [{"update_id": 11}]},
+            ) as request, patch.object(
+                bot, "has_update_container", return_value=True
+            ), patch.object(
+                bot, "extract_updates",
+                side_effect=[[{"update_id": 11}], []],
+            ), patch.object(
+                bot, "prepare_update_batch", return_value=([(11, "chat-chaos", "hello")], 11)
+            ), patch.object(
+                bot, "db_enqueue_updates", return_value=False
+            ) as enqueue, patch.object(
+                event, "wait", side_effect=stop_after_second_poll
+            ):
+                bot.polling_loop()
+            self.assertEqual(enqueue.call_count, 1)
+            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_args_list[0].args[1], {"offset": 10})
+            self.assertEqual(request.call_args_list[1].args[1], {"offset": 10})
+        finally:
+            event.clear()
+            bot._runtime_lease_lost.clear()
+
+    def test_chaos_outbox_timeout_is_quarantined_without_second_send(self):
+        self.assertTrue(bot.db_enqueue_updates([(3201, "chat-chaos", "hello")], 3202))
+        item = bot.db_claim_next_message("chaos-worker")
+        plan = [{"chat_id": "chat-chaos", "text": "response"}]
+        with patch.object(bot, "build_response_plan", return_value={
+            "responses": [("chat-chaos", "response")],
+            "reply_markup": None,
+        }), patch.object(
+            bot, "send_one_message",
+            side_effect=bot.TransientAPIError("simulated send timeout"),
+        ) as send:
+            with self.assertRaises(bot.UncertainDeliveryError):
+                bot._process_claimed_item_impl(item, "chaos-worker")
+            item["response_plan"] = bot.json.dumps(plan)
+            item["response_index"] = 0
+            with self.assertRaises(bot.UncertainDeliveryError):
+                bot._process_claimed_item_impl(item, "chaos-worker")
+            self.assertEqual(send.call_count, 1)
+        receipt = bot.db_get_delivery_state(item["id"], 0)
+        self.assertEqual(receipt["status"], "uncertain")
+
+    def test_chaos_sent_receipt_survives_cursor_write_failure(self):
+        self.assertTrue(bot.db_enqueue_updates([(3203, "chat-chaos", "hello")], 3204))
+        item = bot.db_claim_next_message("chaos-worker")
+        plan = [{"chat_id": "chat-chaos", "text": "response"}]
+        with patch.object(bot, "build_response_plan", return_value={
+            "responses": [("chat-chaos", "response")],
+            "reply_markup": None,
+        }), patch.object(bot, "send_one_message") as send, patch.object(
+            bot, "db_advance_response", return_value=False
+        ):
+            with self.assertRaises(RuntimeError):
+                bot._process_claimed_item_impl(item, "chaos-worker")
+            item["response_plan"] = bot.json.dumps(plan)
+            item["response_index"] = 0
+            bot._process_claimed_item_impl(item, "chaos-worker")
+            self.assertEqual(send.call_count, 1)
+        self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "sent")
+        self.assertEqual(bot.db_queue_stats()["queued_messages"], 0)
+
     def test_dead_letter_can_be_listed_and_safely_requeued(self):
         self.assertTrue(bot.db_enqueue_updates([(3101, "chat-dead", "retry me")], 3102))
         item = bot.db_claim_next_message("dead-worker")

@@ -122,6 +122,31 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(all(0 < delay <= bot.DB_RETRY_BACKOFF_MAX for delay in delays))
         self.assertEqual(delays, sorted(delays))
 
+    def test_worker_retries_database_claim_without_busy_loop(self):
+        event = bot._polling_stop
+        event.clear()
+        wait_calls = {"count": 0}
+
+        def stop_after_idle(delay):
+            wait_calls["count"] += 1
+            if wait_calls["count"] >= 2:
+                event.set()
+                return True
+            return False
+
+        try:
+            with patch.object(bot, "_worker_id", return_value="test-worker"), patch.object(
+                bot, "db_claim_next_message",
+                side_effect=[bot.sqlite3.OperationalError("db offline"), None],
+            ) as claim, patch.object(
+                bot._queue_wakeup, "wait", side_effect=stop_after_idle
+            ):
+                bot.chat_worker()
+            self.assertEqual(claim.call_count, 2)
+            self.assertGreaterEqual(wait_calls["count"], 2)
+        finally:
+            event.clear()
+
     def test_polling_retries_loading_offset_after_database_failure(self):
         event = bot._polling_stop
         event.clear()

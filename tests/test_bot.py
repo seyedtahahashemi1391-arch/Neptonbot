@@ -541,6 +541,58 @@ class DatabaseWorkflowTests(unittest.TestCase):
         self.assertEqual(bot.db_queue_stats()["processing_messages"], total_messages)
         self.assertLess(elapsed, 30.0)
 
+    def test_database_diagnostics_are_aggregated_and_history_index_is_used(self):
+        self.assertTrue(bot.db_enqueue_updates([
+            (81001, "stats-chat-a", "first"),
+            (81002, "stats-chat-b", "second"),
+        ], 81003))
+        claimed = bot.db_claim_next_message("stats-worker")
+        self.assertIsNotNone(claimed)
+        self.assertTrue(bot.db_prepare_response_plan(
+            claimed["id"],
+            "stats-worker",
+            [
+                {"chat_id": "stats-chat-a", "text": "pending"},
+                {"chat_id": "stats-chat-a", "text": "sent"},
+                {"chat_id": "stats-chat-a", "text": "uncertain"},
+                {"chat_id": "stats-chat-a", "text": "sending"},
+            ],
+        ))
+        with bot.db_connect() as db:
+            db.execute("""
+                UPDATE delivery_outbox
+                SET status = CASE response_index
+                    WHEN 1 THEN 'sent'
+                    WHEN 2 THEN 'uncertain'
+                    WHEN 3 THEN 'sending'
+                    ELSE 'pending'
+                END
+                WHERE queue_id = ?
+            """, (claimed["id"],))
+            db.execute("""
+                INSERT INTO dead_letters(
+                    original_queue_id, update_id, chat_id, message_text,
+                    attempts, last_error, failed_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (claimed["id"], 81001, "stats-chat-a", "failed", 1, "test", time.time(), "open"))
+
+            plan = db.execute("""
+                EXPLAIN QUERY PLAN
+                SELECT role, content FROM conversation_history
+                WHERE chat_id = ? ORDER BY id DESC LIMIT ?
+            """, ("stats-chat-a", bot.MAX_HISTORY_MESSAGES)).fetchall()
+
+        stats = bot.db_queue_stats()
+        self.assertEqual(stats["queued_messages"], 2)
+        self.assertEqual(stats["pending_messages"], 1)
+        self.assertEqual(stats["processing_messages"], 1)
+        self.assertEqual(stats["dead_letters"], 1)
+        self.assertEqual(stats["outbox_pending"], 1)
+        self.assertEqual(stats["outbox_sent"], 1)
+        self.assertEqual(stats["outbox_uncertain"], 1)
+        self.assertEqual(stats["outbox_sending"], 1)
+        self.assertTrue(any("idx_history_chat_id" in row["detail"] for row in plan))
+
     def test_queue_deduplication_and_durable_completion(self):
         update = (1001, "chat-1", "سلام")
         self.assertTrue(bot.db_enqueue_updates([update], 1002))

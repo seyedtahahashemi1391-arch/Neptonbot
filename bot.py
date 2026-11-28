@@ -49,6 +49,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+AI_PROVIDER = os.getenv("NEPTON_AI_PROVIDER", "cloudflare").strip().lower()
+if AI_PROVIDER not in {"cloudflare", "openai-compatible"}:
+    AI_PROVIDER = "cloudflare"
+AI_PROVIDER_BASE_URL = os.getenv("NEPTON_AI_BASE_URL", "").strip().rstrip("/")
+AI_PROVIDER_API_KEY = os.getenv("NEPTON_AI_API_KEY", "").strip()
+LIVE_DATA_MODE = os.getenv("NEPTON_LIVE_DATA_MODE", "auto").strip().lower()
+if LIVE_DATA_MODE not in {"auto", "off"}:
+    LIVE_DATA_MODE = "auto"
 LIVE_INFO_TIMEOUT = (5, 12)
 LIVE_INFO_MAX_RESULTS = 5
 REPLY_CONTEXT_PREFIX = "__NEPTON_REPLY_CONTEXT__:"
@@ -62,11 +70,20 @@ AI_CIRCUIT_COOLDOWN = _env_int("NEPTON_AI_CIRCUIT_COOLDOWN", 60, 15, 600)
 VERSION = "3.3.23"
 ADMIN_CHAT_ID = os.getenv("NEPTON_ADMIN_CHAT_ID", "").strip()
 
-SOROUSH_API = f"https://api.splus.ir/bot{BOT_TOKEN}"
+SOROUSH_API_BASE = os.getenv(
+    "NEPTON_SOROUSH_API_BASE", "https://api.splus.ir"
+).strip().rstrip("/")
+SOROUSH_API = f"{SOROUSH_API_BASE}/bot{BOT_TOKEN}"
 CLOUDFLARE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/"
     f"{CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions"
 )
+if AI_PROVIDER == "openai-compatible":
+    AI_PROVIDER_URL = AI_PROVIDER_BASE_URL
+    AI_PROVIDER_KEY = AI_PROVIDER_API_KEY
+else:
+    AI_PROVIDER_URL = CLOUDFLARE_URL
+    AI_PROVIDER_KEY = CLOUDFLARE_API_TOKEN
 
 DB_PATH = os.path.expanduser(os.getenv("NEPTON_DB_PATH", "nepton_state.sqlite3").strip())
 
@@ -235,7 +252,10 @@ if SENTRY_ENABLED:
 else:
     logger.info("Sentry telemetry disabled; SENTRY_DSN is not configured")
 
-logger.info("Starting NeptonBot version=%s model=%s", VERSION, MODEL)
+logger.info(
+    "Starting NeptonBot version=%s provider=%s model=%s live_data=%s",
+    VERSION, AI_PROVIDER, MODEL, LIVE_DATA_MODE
+)
 
 
 # =========================================================
@@ -1597,33 +1617,35 @@ def reset_history(chat_id):
 # =========================================================
 # Cloudflare Workers AI
 # =========================================================
-_cloudflare_headers = {
-    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-}
+def _ai_provider_headers():
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if AI_PROVIDER_KEY:
+        headers["Authorization"] = f"Bearer {AI_PROVIDER_KEY}"
+    return headers
 
 
 def cloudflare_post_with_retry(session, payload):
-    """Make one provider request; transient failures are retried by the durable queue."""
+    """Backward-compatible function name; sends to the configured OpenAI-compatible provider."""
     try:
         return session.post(
-            CLOUDFLARE_URL,
-            headers=_cloudflare_headers,
+            AI_PROVIDER_URL,
+            headers=_ai_provider_headers(),
             json=payload,
             timeout=AI_TIMEOUT,
             allow_redirects=False,
         )
     except requests.exceptions.Timeout:
-        # Do not keep a user message stuck through repeated long provider timeouts.
         raise UserVisibleError(
             "پاسخ سرویس هوش مصنوعی این بار بیش از حد طول کشید. "
             "لطفاً کمی بعد دوباره پیام بده."
         ) from None
     except requests.exceptions.ConnectionError:
-        raise TransientAPIError("Cloudflare connection failure") from None
+        raise TransientAPIError(f"{AI_PROVIDER} connection failure") from None
     except requests.exceptions.RequestException:
-        raise TransientAPIError("Cloudflare request failure") from None
+        raise TransientAPIError(f"{AI_PROVIDER} request failure") from None
 
 
 def _extract_ai_text(data):
@@ -1797,6 +1819,8 @@ def _get_wttr_fallback_weather(place):
 
 def get_live_weather(user_text):
     """Return a concise weather summary; malformed provider data never poisons the queue."""
+    if LIVE_DATA_MODE == "off":
+        return "هواشناسی زنده در حالت شبکهٔ داخلی غیرفعال است."
     place = _weather_location(user_text)
     if not place:
         return "نام شهر یا استان را بفرست تا وضعیت هوا را بگویم."
@@ -1956,6 +1980,8 @@ def get_live_weather(user_text):
 
 def get_live_web_results(query):
     """Use Brave Search API when configured; never fabricate search results."""
+    if LIVE_DATA_MODE == "off":
+        return "جست‌وجوی زنده در حالت شبکهٔ داخلی غیرفعال است."
     if not BRAVE_SEARCH_API_KEY:
         return (
             "جست‌وجوی وب زنده هنوز برای ربات فعال نشده است؛ مدیر باید کلید BRAVE_SEARCH_API_KEY را در تنظیمات محیطی سرویس ثبت کند."
@@ -2012,6 +2038,8 @@ def _fa_number(value):
 
 def get_live_market_prices():
     """Fetch published Iranian market snapshots and show their actual update time."""
+    if LIVE_DATA_MODE == "off":
+        return "داده‌های زندهٔ بازار در حالت شبکهٔ داخلی غیرفعال‌اند؛ قیمت حدسی نمایش داده نمی‌شود."
     payload = _get_json(MARKET_DATA_URL)
     rows = payload.get("data", []) if isinstance(payload, dict) else []
     if not isinstance(rows, list):
@@ -2046,6 +2074,8 @@ def get_live_market_prices():
 
 
 def get_live_context(user_text):
+    if LIVE_DATA_MODE == "off":
+        return ""
     try:
         if _needs_weather(user_text):
             return get_live_weather(user_text)
@@ -2138,7 +2168,11 @@ def completion_token_budget(user_text):
 
 
 def _cloudflare_is_configured():
-    return bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN and MODEL)
+    if not MODEL or not AI_PROVIDER_URL:
+        return False
+    if AI_PROVIDER == "openai-compatible":
+        return bool(AI_PROVIDER_BASE_URL)
+    return bool(CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN)
 
 
 def _cloudflare_circuit_allows_request():

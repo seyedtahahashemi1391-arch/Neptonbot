@@ -238,6 +238,8 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         bot._runtime_owner_id = test_owner
         bot._runtime_lock_acquired = False
         try:
+            # The production acquisition path owns creation of this table.
+            self.assertTrue(bot.acquire_runtime_lock())
             now = time.time()
             with bot.db_connect() as db:
                 db.execute("""

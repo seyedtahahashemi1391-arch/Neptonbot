@@ -151,7 +151,6 @@ class ParsingTests(unittest.TestCase):
         event = bot._polling_stop
         event.clear()
         wait_calls = {"count": 0}
-        original_wait = event.wait
 
         def stop_after_empty_poll(delay):
             wait_calls["count"] += 1

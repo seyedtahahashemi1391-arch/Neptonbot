@@ -68,6 +68,25 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(bot.extract_message(update), ("123", "سلام"))
         self.assertEqual(bot.get_update_id(update), 12)
 
+    def test_admin_environment_id_takes_precedence_over_persisted_id(self):
+        with patch.object(bot, "ADMIN_CHAT_ID", "env-admin"), patch.object(
+            bot, "db_get_admin_chat_id", return_value="stored-admin"
+        ):
+            bot.load_persistent_runtime_state()
+        self.assertEqual(bot.get_admin_chat_id(), "env-admin")
+
+    def test_persisted_admin_id_is_preserved_without_environment_override(self):
+        with patch.object(bot, "ADMIN_CHAT_ID", ""), patch.object(
+            bot, "db_get_admin_chat_id", return_value="stored-admin"
+        ):
+            bot.load_persistent_runtime_state()
+        self.assertEqual(bot.get_admin_chat_id(), "stored-admin")
+
+    def test_missing_admin_identity_fails_closed(self):
+        with patch.object(bot, "get_admin_chat_id", return_value=None):
+            plan = bot.build_response_plan("any-chat", "/admin")
+        self.assertIn("فقط برای مدیر", plan["responses"][0][1])
+
     def test_public_username_cannot_claim_admin_privileges(self):
         update = {
             "message": {

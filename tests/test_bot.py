@@ -101,6 +101,7 @@ class ParsingTests(unittest.TestCase):
         self.assertIn("25°C", result)
         self.assertEqual(provider.call_count, 3)
         self.assertNotIn("countryCode", provider.call_args_list[1].kwargs.get("params", {}))
+        self.assertEqual(provider.call_args_list[1].kwargs["params"]["name"], "Bushehr")
 
     def test_split_message_preserves_content_and_limit(self):
         source = "آزمون پیام " * 500

@@ -72,6 +72,10 @@ class PostgreSQLIntegrationTests(unittest.TestCase):
         self.assertTrue(bot.db_finish_message(item["id"], "postgres-ci-worker"))
 
         self.assertEqual(bot.db_get_delivery_state(item["id"], 0)["status"], "sent")
+        stats = bot.db_queue_stats()
+        self.assertGreaterEqual(stats["outbox_sent"], 1)
+        self.assertEqual(stats["outbox_pending"], 0)
+        self.assertEqual(stats["processing_messages"], 0)
         history = bot.get_history(chat_id)
         self.assertEqual([entry["role"] for entry in history], ["user", "assistant"])
         self.assertEqual(bot.db_get_offset(), update_id + 1)

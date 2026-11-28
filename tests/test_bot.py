@@ -567,6 +567,39 @@ class DatabaseWorkflowTests(unittest.TestCase):
         receipt = bot.db_get_delivery_state(item["id"], 0)
         self.assertEqual(receipt["status"], "uncertain")
 
+    def test_worker_rate_limit_does_not_consume_processing_retry_budget(self):
+        event = bot._polling_stop
+        event.clear()
+        item = {
+            "id": 987654,
+            "attempts": 3,
+            "chat_id": "chat-rate-limit-worker",
+            "message_text": "hello",
+        }
+
+        def stop_after_retry(delay):
+            event.set()
+            return True
+
+        try:
+            with patch.object(bot, "_worker_id", return_value="rate-limit-worker"), patch.object(
+                bot, "db_claim_next_message", return_value=item
+            ), patch.object(
+                bot, "_process_claimed_item",
+                side_effect=bot.RetryableDeliveryError("rate limited", retry_after=9),
+            ), patch.object(
+                bot, "db_retry_message", return_value=True
+            ) as retry, patch.object(
+                event, "wait", side_effect=stop_after_retry
+            ):
+                bot.chat_worker()
+
+            self.assertEqual(retry.call_count, 1)
+            self.assertEqual(retry.call_args.args[2], 3)
+            self.assertEqual(retry.call_args.kwargs["retry_after"], 9)
+        finally:
+            event.clear()
+
     def test_chaos_rate_limited_send_returns_outbox_to_pending_for_retry(self):
         self.assertTrue(bot.db_enqueue_updates([(3202, "chat-rate-limit", "hello")], 3203))
         item = bot.db_claim_next_message("rate-limit-worker")
